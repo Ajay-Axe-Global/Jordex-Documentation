@@ -1,0 +1,10 @@
+# Jordex-Documentation requirements
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+playwright>=1.44.0
+google-generativeai>=0.7.0
+python-dotenv>=1.0.0
+pdfplumber>=0.11.0
+PyPDF2>=3.0.0
+python-dateutil>=2.9.0
+filelock>=3.14.0

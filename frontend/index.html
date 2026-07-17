@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jordex Documentation — Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg:      #0a0e1a;
+      --surface: #111827;
+      --surface2:#1a2236;
+      --border:  #1e2d45;
+      --accent:  #3b82f6;
+      --accent2: #6366f1;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger:  #ef4444;
+      --idle:    #4b5563;
+      --text:    #f1f5f9;
+      --text2:   #94a3b8;
+      --glow:    0 0 20px rgba(59,130,246,0.15);
+      --sidebar: 300px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ─────────────────────────────────────────── */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      height: 56px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .topbar-brand { display: flex; align-items: center; gap: 10px; }
+    .brand-icon {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+    .brand-title { font-size: 15px; font-weight: 700; }
+    .brand-sub   { font-size: 11px; color: var(--text2); }
+
+    /* ── Tab bar ─────────────────────────────────────────── */
+    .tabbar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+    .tabbar .tab-btn {
+      padding: 6px 18px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      color: var(--text2);
+      font-family: 'Inter', sans-serif;
+      transition: all 0.2s;
+    }
+    .tabbar .tab-btn:hover { color: var(--text); background: var(--surface2); }
+    .tabbar .tab-btn.active { background: var(--accent); color: #fff; }
+
+    .server-dot { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text2); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success);
+           box-shadow: 0 0 6px var(--success); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    /* ── Tab panels ──────────────────────────────────────── */
+    .tab-panel { display: none; flex: 1; overflow: hidden; }
+    .tab-panel.active { display: flex; }
+
+    /* ════════════════════════════════════════════════════════
+       DASHBOARD TAB
+    ═══════════════════════════════════════════════════════════ */
+    #tab-dashboard {
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 24px;
+      gap: 20px;
+    }
+
+    /* Global controls */
+    .global-controls { display: flex; gap: 10px; align-items: center; }
+    .btn {
+      padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 600;
+      cursor: pointer; border: none; font-family: 'Inter', sans-serif; transition: all 0.2s;
+    }
+    .btn-primary { background: linear-gradient(135deg,var(--accent),var(--accent2)); color:#fff; }
+    .btn-primary:hover { opacity:.85; transform:translateY(-1px); }
+    .btn-danger  { background:rgba(239,68,68,.15); color:#f87171; border:1px solid rgba(239,68,68,.3); }
+    .btn-danger:hover  { background:rgba(239,68,68,.25); }
+    .btn-outline { background:transparent; color:var(--text2); border:1px solid var(--border); }
+    .btn-outline:hover { border-color:var(--accent); color:var(--text); }
+
+    /* Summary stats bar */
+    .summary-bar { display: flex; gap: 12px; }
+    .sum-card {
+      flex: 1; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 14px 18px;
+    }
+    .sum-val { font-size: 26px; font-weight: 700; }
+    .sum-lbl { font-size: 11px; color: var(--text2); margin-top: 2px; text-transform: uppercase; letter-spacing: .5px; }
+    .sum-card.c1 .sum-val { color: var(--accent); }
+    .sum-card.c2 .sum-val { color: var(--success); }
+    .sum-card.c3 .sum-val { color: var(--warning); }
+    .sum-card.c4 .sum-val { color: var(--danger); }
+
+    /* Service cards grid */
+    .services-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 14px;
+    }
+    .service-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 14px; padding: 18px; transition: border-color .2s, box-shadow .2s;
+      position: relative; overflow: hidden;
+    }
+    .service-card::before {
+      content: ''; position: absolute; top:0; left:0; right:0; height: 2px;
+      background: linear-gradient(90deg,var(--accent),var(--accent2)); opacity:0; transition: opacity .3s;
+    }
+    .service-card.running { border-color: var(--accent); box-shadow: var(--glow); }
+    .service-card.running::before { opacity: 1; }
+    .service-card.error   { border-color: var(--danger); }
+
+    .card-top { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
+    .card-info .card-label { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+    .card-info .card-key   { font-size: 11px; color: var(--text2); font-family: monospace; }
+
+    /* Toggle */
+    .toggle-wrap { display: flex; align-items: center; gap: 8px; }
+    .toggle-label { font-size: 11px; color: var(--text2); }
+    .toggle {
+      width: 46px; height: 24px; background: var(--idle); border-radius: 12px;
+      cursor: pointer; position: relative; transition: background .3s; border: none; outline: none; flex-shrink: 0;
+    }
+    .toggle.on { background: var(--accent); box-shadow: 0 0 10px rgba(59,130,246,.4); }
+    .toggle.error-state { background: var(--danger); }
+    .toggle::after {
+      content: ''; position: absolute; top: 2px; left: 2px;
+      width: 20px; height: 20px; background: white; border-radius: 50%;
+      transition: transform .3s; box-shadow: 0 1px 4px rgba(0,0,0,.3);
+    }
+    .toggle.on::after { transform: translateX(22px); }
+    .toggle:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* Status badge */
+    .status-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 9px; border-radius: 20px; font-size: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .5px; margin-bottom: 12px;
+    }
+    .badge-idle     { background:rgba(75,85,99,.3);    color:var(--text2); border:1px solid #374151; }
+    .badge-running  { background:rgba(59,130,246,.15); color:#60a5fa;      border:1px solid rgba(59,130,246,.3); }
+    .badge-stopping { background:rgba(245,158,11,.15); color:#fbbf24;      border:1px solid rgba(245,158,11,.3); }
+    .badge-error    { background:rgba(239,68,68,.15);  color:#f87171;      border:1px solid rgba(239,68,68,.3); }
+    .badge-dot { width:5px; height:5px; border-radius:50%; }
+    .badge-idle .badge-dot     { background:var(--text2); }
+    .badge-running .badge-dot  { background:#60a5fa; animation:pulse 1.5s infinite; }
+    .badge-stopping .badge-dot { background:#fbbf24; }
+    .badge-error .badge-dot    { background:#f87171; }
+
+    /* Stats row */
+    .stats-row { display: flex; gap: 10px; margin-bottom: 12px; }
+    .stat-item { flex: 1; }
+    .stat-val { font-size: 18px; font-weight: 700; line-height: 1; }
+    .stat-lbl { font-size: 10px; color: var(--text2); margin-top: 2px; text-transform: uppercase; letter-spacing: .4px; }
+    .stat-item.processed .stat-val { color: var(--accent); }
+    .stat-item.uploaded  .stat-val { color: var(--success); }
+    .stat-item.pending   .stat-val { color: var(--warning); }
+    .stat-item.failed    .stat-val { color: var(--danger); }
+
+    .progress-bg   { height: 3px; background: var(--border); border-radius: 2px; }
+    .progress-fill { height: 3px; border-radius: 2px; background: linear-gradient(90deg,var(--accent),var(--accent2)); transition: width .5s; }
+    .error-msg { font-size: 11px; color:#f87171; margin-top:8px; background:rgba(239,68,68,.1); border-radius:6px; padding:5px 8px; }
+
+    /* Activity */
+    .section-title { font-size: 12px; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 10px; }
+    .activity-table { width:100%; border-collapse:collapse; background:var(--surface); border-radius:12px; overflow:hidden; border:1px solid var(--border); }
+    .activity-table th { padding:9px 12px; font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--text2); background:var(--surface2); text-align:left; }
+    .activity-table td { padding:9px 12px; font-size:12px; border-top:1px solid var(--border); }
+    .activity-table tr:hover td { background: var(--surface2); }
+    .status-pill { display:inline-block; padding:2px 7px; border-radius:10px; font-size:10px; font-weight:600; text-transform:uppercase; }
+    .pill-downloaded    { background:rgba(59,130,246,.2);  color:#60a5fa; }
+    .pill-uploaded      { background:rgba(34,197,94,.2);   color:#4ade80; }
+    .pill-failed        { background:rgba(239,68,68,.2);   color:#f87171; }
+    .pill-no_attachment { background:rgba(245,158,11,.2);  color:#fbbf24; }
+    .pill-Skipped       { background:rgba(156,163,175,.2); color:#9ca3af; }
+    .mbl-code { font-family:monospace; font-size:11px; color:var(--accent); }
+    .cat-tag  { font-size:10px; background:var(--surface2); border-radius:4px; padding:2px 5px; color:var(--text2); }
+    .tree-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; vertical-align: middle; box-shadow: 0 0 4px rgba(0,0,0,0.2); flex-shrink: 0; }
+
+    /* ════════════════════════════════════════════════════════
+       DOCUMENTS TAB
+    ═══════════════════════════════════════════════════════════ */
+    #tab-documents {
+      flex-direction: row;
+      height: 100%;
+    }
+
+    /* Sidebar tree */
+    .doc-sidebar {
+      width: var(--sidebar);
+      min-width: var(--sidebar);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .doc-sidebar-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text2);
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      flex-shrink: 0;
+    }
+    .doc-sidebar-search {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .doc-sidebar-search input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      outline: none;
+    }
+    .doc-sidebar-search input:focus { border-color: var(--accent); }
+    .doc-sidebar-search input::placeholder { color: var(--text2); }
+    .tree-scroll { flex: 1; overflow-y: auto; }
+
+    /* Tree items */
+    .tree-item {
+      padding: 8px 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      border-bottom: 1px solid rgba(30,45,69,.5);
+      transition: background .15s;
+      user-select: none;
+    }
+    .tree-item:hover { background: var(--surface2); }
+    .tree-item.active { background: rgba(59,130,246,.15); border-left: 2px solid var(--accent); }
+    .tree-arrow { font-size: 9px; color: var(--text2); width: 10px; transition: transform .2s; flex-shrink:0; }
+    .tree-item.expanded .tree-arrow { transform: rotate(90deg); }
+    .tree-icon { font-size: 14px; flex-shrink: 0; }
+    .tree-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .tree-size { font-size: 10px; color: var(--text2); flex-shrink:0; }
+    .folder-children { padding-left: 14px; display: none; }
+    .folder-children.expanded { display: block; }
+
+    /* Loading spinner */
+    .tree-loading { padding:10px 16px; font-size:11px; color:var(--text2); }
+
+    /* Main viewer area */
+    .doc-viewer {
+      flex: 1;
+      display: flex;
+      flex-direction: row;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    .viewer-placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      color: var(--text2);
+      font-size: 14px;
+      gap: 8px;
+    }
+    .viewer-placeholder .ph-icon { font-size: 48px; opacity: .3; }
+
+    /* PDF pane */
+    .pdf-pane {
+      flex: 1;
+      display: none;
+      border-right: 1px solid var(--border);
+    }
+    .pdf-pane iframe { width:100%; height:100%; border:none; background:#fff; }
+
+    /* JSON pane */
+    .json-pane {
+      width: 340px;
+      min-width: 280px;
+      display: none;
+      overflow-y: auto;
+      background: var(--surface);
+      padding: 20px;
+      border-left: 1px solid var(--border);
+    }
+    .json-pane h2 { font-size: 15px; font-weight: 700; margin-bottom: 16px; }
+    .json-card {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px; margin-bottom: 12px;
+    }
+    .json-card h3 {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+      color: var(--text2); margin-bottom: 10px;
+      border-bottom: 1px solid var(--border); padding-bottom: 6px;
+    }
+    .json-row { display: flex; margin-bottom: 7px; font-size: 12px; gap: 8px; }
+    .json-row.stacked { flex-direction: column; gap: 4px; }
+    .json-row:last-child { margin-bottom: 0; }
+    .json-key { width: 130px; font-weight: 600; color: var(--text2); flex-shrink: 0; font-size: 11px; }
+    .json-row.stacked .json-key { width: auto; margin-bottom: 0; }
+    .json-val { flex: 1; word-break: break-word; color: var(--text); }
+    .json-null { color: var(--text2); font-style: italic; }
+
+    /* Breadcrumb in viewer */
+    .viewer-breadcrumb {
+      padding: 8px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text2);
+      flex-shrink: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Refresh button top right */
+    .doc-refresh-btn {
+      padding: 5px 12px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 11px;
+      color: var(--text2);
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      margin-left: auto;
+    }
+    .doc-refresh-btn:hover { border-color: var(--accent); color: var(--text); }
+
+    /* Scrollbar styling */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #2d3f5a; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Top bar ───────────────────────────────────────────────── -->
+  <div class="topbar">
+    <div class="topbar-brand">
+      <div class="brand-icon">&#128674;</div>
+      <div>
+        <div class="brand-title">Jordex Documentation</div>
+        <div class="brand-sub">Transport Import Automation</div>
+      </div>
+    </div>
+    <div class="tabbar">
+      <button class="tab-btn active" id="btn-dashboard" onclick="switchTab('dashboard')">&#9681; Dashboard</button>
+      <button class="tab-btn"        id="btn-documents" onclick="switchTab('documents')">&#128193; Documents</button>
+    </div>
+    <div class="server-dot"><div class="dot"></div><span id="last-updated">Online</span></div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       DASHBOARD TAB
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="tab-dashboard" class="tab-panel active" style="flex-direction:column;overflow-y:auto;padding:22px;gap:18px;">
+
+    <!-- Controls + summary bar -->
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+      <div class="global-controls">
+        <button class="btn btn-primary" onclick="startAll()">&#9654; Start All</button>
+        <button class="btn btn-danger"  onclick="stopAll()">&#9632; Stop All</button>
+        <button class="btn btn-outline" onclick="loadStatus()">&#8635; Refresh</button>
+      </div>
+      <div class="summary-bar" style="flex:1;min-width:300px;" id="summaryBar"></div>
+    </div>
+
+    <!-- 6 Service cards -->
+    <div class="services-grid" id="servicesGrid"></div>
+
+    <!-- Recent activity -->
+    <div>
+      <div class="section-title">Recent Activity</div>
+      <table class="activity-table">
+        <thead>
+          <tr>
+            <th>Category</th><th>Subject / Folder</th><th>MBL</th><th>Files</th><th>Status</th><th>Time</th>
+          </tr>
+        </thead>
+        <tbody id="activityBody"><tr><td colspan="6" style="padding:20px;text-align:center;color:var(--text2)">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       DOCUMENTS TAB
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="tab-documents" class="tab-panel" style="flex-direction:row;">
+
+    <!-- Sidebar -->
+    <div class="doc-sidebar">
+      <div class="doc-sidebar-header">
+        &#128193; Output Files
+        <button class="doc-refresh-btn" onclick="loadTreeRoot()">&#8635;</button>
+      </div>
+      <div class="doc-sidebar-search">
+        <input type="text" id="treeSearch" placeholder="Filter folders..." oninput="filterTree(this.value)" />
+      </div>
+      <div class="tree-scroll" id="treeItems"><div class="tree-loading">Loading...</div></div>
+    </div>
+
+    <!-- Main viewer -->
+    <div class="doc-viewer" id="docViewer">
+      <div class="viewer-placeholder" id="viewerPlaceholder">
+        <div class="ph-icon">&#128196;</div>
+        <span>Select a file from the sidebar to preview</span>
+        <span style="font-size:11px;margin-top:4px;">PDF files also show their extracted data</span>
+      </div>
+
+      <!-- PDF + JSON side-by-side -->
+      <div style="display:none;flex:1;flex-direction:column;" id="viewerContainer">
+        <div class="viewer-breadcrumb" id="viewerBreadcrumb"></div>
+        <div style="display:flex;flex:1;overflow:hidden;">
+          <div class="pdf-pane" id="pdfPane">
+            <iframe id="viewerFrame"></iframe>
+          </div>
+          <div class="json-pane" id="jsonPane"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ═══════════════════════════════════════════════════
+  //  DASHBOARD
+  // ═══════════════════════════════════════════════════
+
+  const SERVICES = [
+    { key: "customs_docs",    label: "01. Customs Docs",         icon: "📋" },
+    { key: "delivery_order",  label: "02. Delivery Order",       icon: "📦" },
+    { key: "arrival_notice",  label: "03. Arrival Notice",       icon: "🛳️"  },
+    { key: "customer_docs",   label: "04. Customer Docs",        icon: "📁" },
+    { key: "invoice_carrier", label: "05. Invoice Carrier",      icon: "🧾" },
+    { key: "booking",         label: "06. Booking Confirmation", icon: "📅" },
+  ];
+
+  let statusData = {};
+
+  function buildCards() {
+    document.getElementById("servicesGrid").innerHTML = SERVICES.map(s => `
+      <div class="service-card" id="card-${s.key}">
+        <div class="card-top">
+          <div class="card-info">
+            <div class="card-label">${s.icon} ${s.label}</div>
+            <div class="card-key">${s.key}</div>
+          </div>
+          <div class="toggle-wrap">
+            <span class="toggle-label" id="tlbl-${s.key}">OFF</span>
+            <button class="toggle" id="tgl-${s.key}" onclick="toggleService('${s.key}')"></button>
+          </div>
+        </div>
+        <div class="status-badge badge-idle" id="badge-${s.key}"><div class="badge-dot"></div> Idle</div>
+        <div class="stats-row">
+          <div class="stat-item processed"><div class="stat-val" id="sp-${s.key}">—</div><div class="stat-lbl">Processed</div></div>
+          <div class="stat-item uploaded"><div class="stat-val" id="su-${s.key}">—</div><div class="stat-lbl">Uploaded</div></div>
+          <div class="stat-item pending"><div class="stat-val" id="sd-${s.key}">—</div><div class="stat-lbl">Downloaded</div></div>
+          <div class="stat-item failed"><div class="stat-val" id="sf-${s.key}">—</div><div class="stat-lbl">Failed</div></div>
+        </div>
+        <div class="progress-bg"><div class="progress-fill" id="prg-${s.key}" style="width:0%"></div></div>
+        <div class="error-msg" id="err-${s.key}" style="display:none"></div>
+      </div>`).join('');
+  }
+
+  function updateCards(data) {
+    statusData = data;
+    let totProc=0, totUp=0, totFail=0, totFiles=0;
+
+    for (const [key, svc] of Object.entries(data)) {
+      const card  = document.getElementById(`card-${key}`);
+      const tgl   = document.getElementById(`tgl-${key}`);
+      const tlbl  = document.getElementById(`tlbl-${key}`);
+      const badge = document.getElementById(`badge-${key}`);
+      const errD  = document.getElementById(`err-${key}`);
+      if (!card) continue;
+
+      const st = svc.status, running = st === "running";
+      card.className  = "service-card " + (running ? "running" : st === "error" ? "error" : "");
+      tgl.className   = "toggle " + (running ? "on" : st === "error" ? "error-state" : "");
+      tgl.disabled    = st === "stopping";
+      tlbl.textContent = running ? "ON" : st === "stopping" ? "…" : "OFF";
+      badge.className = `status-badge badge-${st}`;
+      badge.innerHTML = `<div class="badge-dot"></div> ${st}`;
+
+      const stats = svc.stats || {};
+      document.getElementById(`sp-${key}`).textContent = svc.processed ?? stats.total ?? 0;
+      document.getElementById(`su-${key}`).textContent = svc.uploaded  ?? stats.uploaded ?? 0;
+      document.getElementById(`sd-${key}`).textContent = stats.downloaded ?? 0;
+      document.getElementById(`sf-${key}`).textContent = stats.failed ?? 0;
+
+      const total  = Math.max(stats.total || 1, 1);
+      const uplPct = Math.round(((stats.uploaded || 0) / total) * 100);
+      document.getElementById(`prg-${key}`).style.width = uplPct + "%";
+
+      if (svc.error) { errD.textContent = "⚠ " + svc.error; errD.style.display = "block"; }
+      else            { errD.style.display = "none"; }
+
+      totProc  += (svc.processed || 0);
+      totUp    += (svc.uploaded  || 0);
+      totFail  += (stats.failed  || 0);
+      totFiles += (stats.total   || 0);
+    }
+
+    document.getElementById("summaryBar").innerHTML = `
+      <div class="sum-card c1"><div class="sum-val">${totFiles}</div><div class="sum-lbl">Total Emails</div></div>
+      <div class="sum-card c2"><div class="sum-val">${totUp}</div><div class="sum-lbl">Uploaded</div></div>
+      <div class="sum-card c3"><div class="sum-val">${totProc}</div><div class="sum-lbl">Processed</div></div>
+      <div class="sum-card c4"><div class="sum-val">${totFail}</div><div class="sum-lbl">Failed</div></div>`;
+  }
+
+  async function toggleService(key) {
+    const svc = statusData[key]; if (!svc) return;
+    const ep  = svc.status === "running" ? "stop" : "start";
+    await fetch(`/api/services/${key}/${ep}`, { method: "POST" });
+    setTimeout(loadStatus, 600);
+  }
+
+  async function startAll() {
+    for (const s of SERVICES) {
+      if (statusData[s.key]?.status !== "running") {
+        await fetch(`/api/services/${s.key}/start`, { method: "POST" });
+        await new Promise(r => setTimeout(r, 250));
+      }
+    }
+    setTimeout(loadStatus, 800);
+  }
+
+  async function stopAll() {
+    for (const s of SERVICES)
+      if (statusData[s.key]?.status === "running")
+        await fetch(`/api/services/${s.key}/stop`, { method: "POST" });
+    setTimeout(loadStatus, 800);
+  }
+
+  async function loadStatus() {
+    try {
+      const [sRes, tRes] = await Promise.all([
+        fetch("/api/services/status"),
+        fetch("/api/tracker"),
+      ]);
+      const sData = await sRes.json();
+      const tData = await tRes.json();
+      window.fullTrackerData = tData;
+      updateCards(sData);
+      updateActivity(tData.recent || []);
+      document.getElementById("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+    } catch(e) { console.error(e); }
+  }
+
+  function updateActivity(recent) {
+    const tbody = document.getElementById("activityBody");
+    if (!recent.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--text2)">No activity yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = recent.slice(0, 25).map(r => {
+      const pill  = `<span class="status-pill pill-${r.status}">${r.status}</span>`;
+      const mbl   = r.mbl ? `<span class="mbl-code">${esc(r.mbl)}</span>` : "—";
+      const subj  = esc((r.folder || r.subject || "").substring(0, 50));
+      const cat   = `<span class="cat-tag">${esc(r.category)}</span>`;
+      const time  = r.time ? new Date(r.time).toLocaleTimeString() : "";
+      return `<tr><td>${cat}</td><td>${subj}</td><td>${mbl}</td><td>${r.files ? r.files.length : 0}</td><td>${pill}</td><td>${time}</td></tr>`;
+    }).join('');
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  DOCUMENTS TAB
+  // ═══════════════════════════════════════════════════
+
+  let _treeCache = {};   // path → entries
+  let _allTreeItems = []; // flat list for filter
+
+  async function loadTreeRoot() {
+    const el = document.getElementById("treeItems");
+    el.innerHTML = '<div class="tree-loading">Loading…</div>';
+    _treeCache = {};
+    _allTreeItems = [];
+    try {
+      const r = await fetch("/api/output/?t=" + Date.now());
+      const d = await r.json();
+      el.innerHTML = "";
+      renderTreeLevel(d.entries, "", el);
+    } catch(e) {
+      el.innerHTML = '<div class="tree-loading" style="color:var(--danger)">Failed to load</div>';
+    }
+  }
+
+  function renderTreeLevel(entries, parentPath, container) {
+    if (!entries || entries.length === 0) {
+      const msg = document.createElement("div");
+      msg.className = "tree-loading";
+      msg.textContent = "Empty";
+      container.appendChild(msg);
+      return;
+    }
+
+    const dirs  = entries.filter(e => e.is_dir);
+    const files = entries.filter(e => {
+      if (e.is_dir) return false;
+      if (e.name.toLowerCase().endsWith("_classification.json")) return false;
+      return true;
+    });
+
+    dirs.forEach(e => {
+      const wrap = document.createElement("div");
+
+      let statusIndicator = "";
+      if (window.fullTrackerData && window.fullTrackerData.tracking) {
+        let status = null;
+        const tracking = window.fullTrackerData.tracking;
+        for (const cat of Object.keys(tracking)) {
+          for (const msgKey of Object.keys(tracking[cat])) {
+             const data = tracking[cat][msgKey];
+             if (data && (data.folder_name === e.name || data.mbl === e.name)) {
+                 status = data.status;
+                 break;
+             }
+          }
+          if (status) break;
+        }
+        
+        if (status === "uploaded") {
+            statusIndicator = `<span class="tree-status-dot" style="background:#4ade80;" title="Uploaded"></span>`;
+        } else if (status === "downloaded" || status === "processed") {
+            statusIndicator = `<span class="tree-status-dot" style="background:#60a5fa;" title="Downloaded/Processed"></span>`;
+        } else if (status === "error" || status === "failed") {
+            statusIndicator = `<span class="tree-status-dot" style="background:#f87171;" title="Failed"></span>`;
+        }
+      }
+
+      const item = document.createElement("div");
+      item.className = "tree-item";
+      item.innerHTML = `<span class="tree-arrow">▶</span><span class="tree-icon">📁</span><span class="tree-name" style="flex:1;">${esc(e.name)}</span>${statusIndicator}`;
+      item.dataset.name = e.name.toLowerCase();
+      _allTreeItems.push({ el: item, name: e.name.toLowerCase() });
+
+      const children = document.createElement("div");
+      children.className = "folder-children";
+
+      item.onclick = async (ev) => {
+        ev.stopPropagation();
+        item.classList.toggle("expanded");
+        children.classList.toggle("expanded");
+        if (children.classList.contains("expanded") && children.innerHTML === "") {
+          children.innerHTML = '<div class="tree-loading">Loading…</div>';
+          try {
+            const path = e.path;
+            const r    = await fetch("/api/output/" + path + "?t=" + Date.now());
+            const d    = await r.json();
+            children.innerHTML = "";
+            renderTreeLevel(d.entries, path, children);
+          } catch (err) {
+            children.innerHTML = '<div class="tree-loading" style="color:var(--danger)">Error</div>';
+          }
+        }
+      };
+
+      wrap.appendChild(item);
+      wrap.appendChild(children);
+      container.appendChild(wrap);
+    });
+
+    files.forEach(e => {
+      const kb   = (e.size / 1024).toFixed(0);
+      const icon = e.name.toLowerCase().endsWith(".pdf")  ? "📄" :
+                   e.name.toLowerCase().endsWith(".json") ? "📋" : "📄";
+      const item = document.createElement("div");
+      item.className = "tree-item";
+      item.innerHTML = `<span style="width:10px;flex-shrink:0;"></span><span class="tree-icon">${icon}</span><span class="tree-name">${esc(e.name)}</span><span class="tree-size">${kb} KB</span>`;
+      item.dataset.name = e.name.toLowerCase();
+      _allTreeItems.push({ el: item, name: e.name.toLowerCase() });
+
+      item.onclick = (ev) => {
+        ev.stopPropagation();
+        viewFile(e.path, item, e.name);
+      };
+      container.appendChild(item);
+    });
+  }
+
+  function filterTree(q) {
+    q = (q || "").toLowerCase().trim();
+    _allTreeItems.forEach(({ el, name }) => {
+      const parent = el.closest(".tree-folder-group") || el.parentElement;
+      el.style.display = (!q || name.includes(q)) ? "" : "none";
+    });
+  }
+
+  async function viewFile(path, el, filename) {
+    // Highlight
+    document.querySelectorAll(".tree-item.active").forEach(e => e.classList.remove("active"));
+    if (el) el.classList.add("active");
+
+    const placeholder  = document.getElementById("viewerPlaceholder");
+    const container    = document.getElementById("viewerContainer");
+    const pdfPane      = document.getElementById("pdfPane");
+    const jsonPane     = document.getElementById("jsonPane");
+    const breadcrumb   = document.getElementById("viewerBreadcrumb");
+
+    // Show container
+    placeholder.style.display  = "none";
+    container.style.display    = "flex";
+    breadcrumb.textContent     = "📁 output / " + path.replace(/\//g, " / ");
+
+    const isPDF  = filename.toLowerCase().endsWith(".pdf");
+    const isJSON = filename.toLowerCase().endsWith(".json");
+
+    if (isPDF || isJSON) {
+      pdfPane.style.display = "flex";
+      document.getElementById("viewerFrame").src = "/files/" + path;
+
+      if (isPDF) {
+        // Try to load associated JSON
+        jsonPane.style.display = "block";
+        jsonPane.innerHTML = '<div style="color:var(--text2);padding:16px;font-size:12px;">Loading extraction data…</div>';
+
+        const parts = path.split("/");
+        const filenameOnly = parts.pop();
+        const stem = filenameOnly.substring(0, filenameOnly.lastIndexOf('.'));
+        const jsonNames = [`${stem}_classification.json`, "result.json", "arrival_notice.json", "customs_result.json"];
+        let found = null;
+        for (const jn of jsonNames) {
+          const jp = [...parts, jn].join("/");
+          try {
+            const r = await fetch("/files/" + jp);
+            if (r.ok) { found = await r.json(); break; }
+          } catch(e) {}
+        }
+        if (found)  renderJSONPane(found, jsonPane);
+        else        jsonPane.innerHTML = '<div style="color:var(--text2);padding:16px;font-size:12px;">No extraction data found for this file.</div>';
+      } else {
+        jsonPane.style.display = "none";
+      }
+
+    } else {
+      // Non-viewable file
+      pdfPane.style.display  = "flex";
+      jsonPane.style.display = "none";
+      document.getElementById("viewerFrame").src = "/files/" + path;
+    }
+  }
+
+  function renderJSONPane(data, container) {
+    const specialKeys = ["pickup", "return", "classifications"];
+    let html = '<h2>Extraction Results</h2>';
+
+    // General info card
+    let genHtml = '<div class="json-card"><h3>General Info</h3>';
+    let hasGen  = false;
+    for (const [k, v] of Object.entries(data)) {
+      if (specialKeys.includes(k) || k === "classifications") continue;
+      hasGen = true;
+      const isComplex = v !== null && typeof v === 'object';
+      genHtml += `<div class="json-row ${isComplex ? 'stacked' : ''}"><div class="json-key">${esc(k)}</div><div class="json-val">${fmtVal(v)}</div></div>`;
+    }
+    genHtml += '</div>';
+    if (hasGen) html += genHtml;
+
+    // Pickup / Return sub-cards (Delivery Order)
+    for (const sk of ["pickup", "return"]) {
+      if (data[sk] && typeof data[sk] === "object") {
+        html += `<div class="json-card"><h3>${sk.charAt(0).toUpperCase() + sk.slice(1)}</h3>`;
+        for (const [k, v] of Object.entries(data[sk])) {
+          const isComplex = v !== null && typeof v === 'object';
+          html += `<div class="json-row ${isComplex ? 'stacked' : ''}"><div class="json-key">${esc(k)}</div><div class="json-val">${fmtVal(v)}</div></div>`;
+        }
+        html += '</div>';
+      }
+    }
+
+    // Classifications (Customer Docs)
+    if (Array.isArray(data.classifications)) {
+      data.classifications.forEach((cls, i) => {
+        html += `<div class="json-card"><h3>Doc ${i+1} — ${esc(cls.doc_type || "unknown")}</h3>`;
+        for (const [k, v] of Object.entries(cls)) {
+          const isComplex = v !== null && typeof v === 'object';
+          html += `<div class="json-row ${isComplex ? 'stacked' : ''}"><div class="json-key">${esc(k)}</div><div class="json-val">${fmtVal(v)}</div></div>`;
+        }
+        html += '</div>';
+      });
+    }
+
+    container.innerHTML = html;
+  }
+
+  function fmtVal(val) {
+    if (val === null || val === undefined) return '<span class="json-null">null</span>';
+    if (Array.isArray(val)) return val.map(v => fmtVal(v)).join("<br>");
+    if (typeof val === "object") {
+      let s = '<div style="font-size:11px;">';
+      for (const [k,v] of Object.entries(val))
+        s += `<div style="margin-bottom:6px;"><strong style="color:var(--text2);display:block;margin-bottom:2px;">${esc(k)}</strong><div style="padding-left:8px;">${fmtVal(v)}</div></div>`;
+      return s + '</div>';
+    }
+    return esc(String(val)).replace(/\n/g, "<br>");
+  }
+
+  function esc(s) {
+    return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  TAB SWITCHING
+  // ═══════════════════════════════════════════════════
+
+  function switchTab(name) {
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+    document.getElementById("tab-" + name).classList.add("active");
+    document.getElementById("btn-" + name).classList.add("active");
+    if (name === "documents") loadTreeRoot();
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  INIT
+  // ═══════════════════════════════════════════════════
+
+  buildCards();
+  loadStatus();
+  setInterval(loadStatus, 6000);
+</script>
+</body>
+</html>

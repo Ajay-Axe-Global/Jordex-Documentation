@@ -1,0 +1,39 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Security and Auth
+*.pem
+*.key
+*.cert
+*.crt
+credentials.json
+token.json
+client_secret.json
+auth.json
+
+# Output and State Directories
+output/
+profiles/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Project specific files (assuming this tracks session/state)
+tracking.json

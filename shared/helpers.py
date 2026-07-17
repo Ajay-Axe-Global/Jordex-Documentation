@@ -1,0 +1,419 @@
+"""
+shared/helpers.py — Outlook Automation Helpers (Shared)
+========================================================
+All Playwright-based helpers for navigating Outlook, collecting unread
+emails, downloading attachments, and file management.
+
+Used by every service's main label file (arrival_notice.py, invoice_carrier.py, etc.)
+These functions accept a `page` argument — each service passes its OWN page.
+"""
+import hashlib, json, os, re, shutil, tempfile, logging
+from datetime import datetime
+from playwright.sync_api import Page, TimeoutError as PwTimeout
+from config import ELEMENT_TIMEOUT, SHORT_WAIT, OUTPUT_DIR
+
+log = logging.getLogger("helpers")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Navigation
+# ══════════════════════════════════════════════════════════════════════
+
+def navigate_to_folder(page: Page, label: str):
+    log.info(f"Opening folder: {label}")
+    el = page.locator(f"text='{label}'").first
+    el.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
+    el.click()
+    page.wait_for_timeout(SHORT_WAIT)
+    page.wait_for_selector("#MailList", state="attached", timeout=ELEMENT_TIMEOUT)
+    page.wait_for_timeout(SHORT_WAIT)
+
+
+def _scroll(page: Page):
+    try:
+        page.locator("#MailList div[data-virtuoso-scroller='true']").first.evaluate(
+            "el=>el.scrollBy(0,500)", timeout=2000
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(1500)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Collect unread emails
+# ══════════════════════════════════════════════════════════════════════
+
+def collect_unread(page: Page, tracker, cat: str, limit: int, max_scrolls=50) -> list[dict]:
+    seen, results = set(), []
+    for _ in range(max_scrolls):
+        rows = page.locator("#MailList div[role='option']")
+        for i in range(rows.count()):
+            if len(results) >= limit:
+                return results
+            r = rows.nth(i)
+            if r.locator("div.DLvHz").count() == 0:
+                continue
+            try:
+                cid = r.get_attribute("data-convid", timeout=2000)
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                if tracker.is_done(cat, cid):
+                    continue
+                results.append({"conv_id": cid})
+            except Exception:
+                continue
+        if len(results) >= limit:
+            return results
+        if rows.count() == 0:
+            log.info("    No messages found in folder.")
+            break
+        _scroll(page)
+        new_rows = page.locator("#MailList div[role='option']")
+        new_ids = set()
+        for i in range(new_rows.count()):
+            try:
+                new_ids.add(new_rows.nth(i).get_attribute("data-convid", timeout=1000))
+            except Exception:
+                pass
+        if not (new_ids - seen):
+            break
+    log.info(f"Collected {len(results)} unread in {cat}")
+    return results
+
+
+def click_row(page: Page, conv_id: str) -> bool:
+    sel = f"#MailList div[role='option'][data-convid='{conv_id}']"
+    try:
+        r = page.locator(sel).first
+        r.wait_for(state="visible", timeout=3000)
+        r.click()
+        page.wait_for_timeout(SHORT_WAIT)
+        return True
+    except Exception:
+        pass
+    page.locator("#MailList div[data-virtuoso-scroller='true']").first.evaluate("el=>el.scrollTo(0,0)")
+    page.wait_for_timeout(1000)
+    for _ in range(60):
+        try:
+            r = page.locator(sel).first
+            if r.is_visible(timeout=500):
+                r.click()
+                page.wait_for_timeout(SHORT_WAIT)
+                return True
+        except Exception:
+            pass
+        _scroll(page)
+    return False
+
+
+def get_subject(page: Page) -> str:
+    try:
+        el = page.locator("#ReadingPaneContainerId span.JdFsz").first
+        el.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
+        return (el.get_attribute("title", timeout=3000) or el.inner_text(timeout=3000)).strip()
+    except Exception:
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Attachment downloading
+# ══════════════════════════════════════════════════════════════════════
+
+def download_attachments_to_temp(page: Page) -> list[str]:
+    """Download all attachments to a temp directory. Returns list of temp file paths."""
+    ctr = page.locator(
+        "#ReadingPaneContainerId div[role='listbox'][aria-label='file attachments']"
+    ).first
+    try:
+        ctr.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
+    except Exception:
+        return []
+
+    atts = ctr.locator("div[role='option']")
+    temp_dir = tempfile.mkdtemp(prefix="outlook_dl_")
+    saved = []
+
+    for i in range(atts.count()):
+        att = atts.nth(i)
+        fname = _att_name(att)
+        log.info(f"  Downloading: {fname}")
+        try:
+            att.locator("button[aria-label='More actions']").first.click()
+            page.wait_for_timeout(1000)
+            dl_btn = page.locator(
+                "div[role='menu'] button:has-text('Download'),"
+                "div[role='menu'] div[role='menuitem']:has-text('Download'),"
+                "ul[role='menu'] button:has-text('Download'),"
+                "div[role='menu'] button:has-text('Downloaden'),"
+                "div[role='menu'] div[role='menuitem']:has-text('Downloaden'),"
+                "button[name='Download'],button[name='Downloaden'],"
+                "span:text-is('Download'),span:text-is('Downloaden')"
+            ).first
+            with page.expect_download(timeout=30000) as di:
+                dl_btn.click()
+            path = os.path.join(temp_dir, fname)
+            b, e = os.path.splitext(fname)
+            c = 1
+            while os.path.exists(path):
+                path = os.path.join(temp_dir, f"{b}_{c}{e}")
+                c += 1
+            di.value.save_as(path)
+            saved.append(path)
+            log.info(f"  Temp saved: {path}")
+        except Exception as exc:
+            log.warning(f"  Failed: {fname} - {exc}")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+    return saved
+
+
+def _att_name(att) -> str:
+    try:
+        return att.locator("div.VlyYV").first.get_attribute("title", timeout=3000) or "unknown"
+    except Exception:
+        pass
+    try:
+        a = att.get_attribute("aria-label", timeout=3000) or ""
+        m = re.match(r"^(.+?)\s+Open\s+", a)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  File management
+# ══════════════════════════════════════════════════════════════════════
+
+def _file_md5(filepath: str) -> str:
+    h = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def move_file_to_folder(tmp_path: str, dest_dir: str) -> str | None:
+    """
+    Move a temp file to dest_dir with MD5 duplicate detection.
+    Returns saved filename, or None if skipped as exact duplicate.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    tmp_md5 = _file_md5(tmp_path)
+    for existing in os.listdir(dest_dir):
+        ep = os.path.join(dest_dir, existing)
+        if os.path.isfile(ep) and _file_md5(ep) == tmp_md5:
+            log.info("    Skipped (duplicate of %s): %s", existing, os.path.basename(tmp_path))
+            return None
+
+    fname = os.path.basename(tmp_path)
+    dest = os.path.join(dest_dir, fname)
+    if os.path.exists(dest):
+        b, e = os.path.splitext(fname)
+        c = 1
+        while os.path.exists(dest):
+            dest = os.path.join(dest_dir, f"{b}_{c}{e}")
+            c += 1
+    shutil.move(tmp_path, dest)
+    log.info("    Saved: %s", dest)
+    return os.path.basename(dest)
+
+
+def cleanup_temp(temp_files: list[str]):
+    """Remove temp files and their directory."""
+    for f in temp_files:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+    if temp_files:
+        try:
+            os.rmdir(os.path.dirname(temp_files[0]))
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Subject folder fallback
+# ══════════════════════════════════════════════════════════════════════
+
+def _sanitize(name: str) -> str:
+    c = re.sub(r'[<>:"/\\|?*]', '_', name)
+    return re.sub(r'[_\s]+', '_', c).strip('_. ')[:80]
+
+
+def subject_folder_fallback(subject: str) -> str:
+    """Derive a folder name from the email subject when MBL extraction fails."""
+    m = re.search(r'(OI\d{4,})', subject)
+    if m: return m.group(1)
+    m = re.search(r'Instant DO.*?(\d{6,12})\s*-\s*([A-Z0-9]{8,})', subject)
+    if m: return f"{m.group(1)}_{m.group(2)}"
+    m = re.search(r'Release.*?-\s*([A-Z0-9]{8,})', subject)
+    if m: return m.group(1)
+    m = re.search(r'([A-Z0-9]{8,})\s+Delivery Order Request.*?(\d{6,12})', subject)
+    if m: return f"{m.group(2)}_{m.group(1)}"
+    m = re.search(r'dossiernr\.?\s*(\d{4,})', subject)
+    if m: return f"dossier_{m.group(1)}"
+    m = re.search(r'(JI-\d{4}-\d{5,})', subject)
+    if m: return m.group(1)
+    return _sanitize(subject)
+
+
+def normalize_oi_reference(raw: str) -> str:
+    """
+    Fix common OCR/LLM misreads in OI references.
+ 
+    Problem:
+      Gemini sometimes reads "OI2619032" as "012619032" (letter O → digit 0).
+      Jordex search fails because "012619032" doesn't match "OI2619032".
+ 
+    Rules:
+      - If it starts with "0I" (zero + I) → replace with "OI"
+      - If it starts with "01" (zero + one) followed by 5+ digits → likely "OI"
+      - If it starts with "0i" → replace with "OI"
+      - Preserve anything that already starts with "OI" or "OE"
+      - Strip whitespace and hyphens
+ 
+    Examples:
+      "012619032"  → "OI2619032"
+      "0I2619032"  → "OI2619032"
+      "OI2619032"  → "OI2619032"  (no change)
+      "OE2614817"  → "OE2614817"  (no change)
+      " 012619039" → "OI2619039"
+      "0i2619034"  → "OI2619034"
+    """
+    if not raw:
+        return raw
+ 
+    cleaned = raw.strip().replace("-", "").replace(" ", "")
+ 
+    # Already correct
+    if re.match(r'^O[IE]\d', cleaned, re.IGNORECASE):
+        return cleaned[:2].upper() + cleaned[2:]
+ 
+    # Starts with "0I" or "0i" (zero then letter I) → clearly OI
+    if re.match(r'^0[Ii]\d', cleaned):
+        fixed = "OI" + cleaned[2:]
+        log.info("  OI normalized: '%s' → '%s'", raw, fixed)
+        return fixed
+ 
+    # Starts with "01" followed by 5+ digits → very likely OI (not a real number)
+    if re.match(r'^01\d{5,}$', cleaned):
+        fixed = "OI" + cleaned[2:]
+        log.info("  OI normalized: '%s' → '%s'", raw, fixed)
+        return fixed
+ 
+    # Starts with just "0" followed by 6+ digits and no other letters
+    # This catches "02619032" → "OI2619032" patterns (dropped the I entirely)
+    # BUT only if length matches typical OI format (OI + 7 digits = 9 chars)
+    if re.match(r'^0\d{7}$', cleaned):
+        fixed = "OI" + cleaned[1:]
+        log.info("  OI normalized (single zero prefix): '%s' → '%s'", raw, fixed)
+        return fixed
+ 
+    return cleaned
+ 
+ 
+# ══════════════════════════════════════════════════════════════════════
+#  2. MULTI-ATTACHMENT SKIP CHECK
+# ══════════════════════════════════════════════════════════════════════
+  
+def should_skip_multi_attachment(page, max_allowed: int = 1) -> bool:
+    """
+    Check if the currently open email has more than `max_allowed` PDF attachments.
+    If yes, return True → caller should skip this email entirely.
+ 
+    Uses two strategies:
+      1. Playwright locator on attachment listbox
+      2. JS DOM fallback counting all attachment items
+    """
+    try:
+        # ── Strategy 1: Playwright locator ───────────────────────────
+        container = None
+        for selector in [
+            "#ReadingPaneContainerId div[role='listbox'][aria-label='file attachments']",
+            "#ReadingPaneContainerId div[role='listbox'][aria-label='bestandsbijlagen']",  # Dutch
+            "#ReadingPaneContainerId div[role='listbox']",  # generic fallback
+        ]:
+            try:
+                loc = page.locator(selector).first
+                if loc.is_visible(timeout=3000):
+                    container = loc
+                    break
+            except Exception:
+                continue
+ 
+        if container:
+            attachments = container.locator("div[role='option']")
+            total_count = attachments.count()
+            log.info("  Attachment check: found %d attachment(s) via locator", total_count)
+ 
+            if total_count > max_allowed:
+                # Count PDFs specifically
+                pdf_count = 0
+                for i in range(total_count):
+                    att = attachments.nth(i)
+                    try:
+                        name = att.locator("div.VlyYV").first.get_attribute("title", timeout=2000) or ""
+                    except Exception:
+                        try:
+                            aria = att.get_attribute("aria-label", timeout=2000) or ""
+                            name = aria.split(" Open ")[0] if " Open " in aria else aria
+                        except Exception:
+                            name = ""
+ 
+                    if name.lower().endswith(".pdf"):
+                        pdf_count += 1
+ 
+                log.info("  Attachment check: %d PDF(s) out of %d total", pdf_count, total_count)
+ 
+                if pdf_count > max_allowed:
+                    log.info("  SKIPPING: %d PDFs > max_allowed=%d", pdf_count, max_allowed)
+                    return True
+                else:
+                    log.info("  NOT skipping: only %d PDF(s)", pdf_count)
+                    return False
+            else:
+                log.info("  NOT skipping: total attachments %d <= %d", total_count, max_allowed)
+                return False
+ 
+        # ── Strategy 2: JS DOM fallback ──────────────────────────────
+        log.info("  Attachment check: locator failed, trying JS fallback")
+        js_count = page.evaluate("""() => {
+            const pane = document.getElementById('ReadingPaneContainerId');
+            if (!pane) return -1;
+ 
+            // Try listbox first
+            const listbox = pane.querySelector('div[role="listbox"]');
+            if (listbox) {
+                return listbox.querySelectorAll('div[role="option"]').length;
+            }
+ 
+            // Fallback: count any attachment-like elements
+            const attachments = pane.querySelectorAll(
+                '[data-testid="AttachmentCard"], ' +
+                '.attachments-area div[role="option"], ' +
+                '.attachment-item'
+            );
+            return attachments.length;
+        }""")
+ 
+        log.info("  Attachment check (JS): found %d attachment(s)", js_count)
+ 
+        if js_count > max_allowed:
+            log.info("  SKIPPING (JS): %d attachments > max_allowed=%d", js_count, max_allowed)
+            return True
+        elif js_count == -1:
+            log.warning("  Attachment check: ReadingPane not found — NOT skipping")
+            return False
+        else:
+            log.info("  NOT skipping (JS): %d attachments", js_count)
+            return False
+ 
+    except Exception as e:
+        log.warning("  Attachment check FAILED: %s — NOT skipping (fail-open)", e)
+        return False

@@ -15,7 +15,8 @@ from shared.tracker import Tracker
 from shared.helpers import (
     navigate_to_folder, collect_unread, click_row, get_subject,
     download_attachments_to_temp, move_file_to_folder, cleanup_temp,
-    subject_folder_fallback,
+    subject_folder_fallback, normalize_oi_reference,
+    mark_as_unread, search_jordex_with_fallback,
 )
 from extractor import extract_oi_from_subject
 from outlook.session import OutlookSession
@@ -85,7 +86,7 @@ class InvoiceCarrierService:
                 self.last_run = datetime.now().isoformat()
                 items = self._process_batch(outlook_page, tracker)
                 if items:
-                    self._upload_to_jordex(jordex_page, tracker, items)
+                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -135,8 +136,15 @@ class InvoiceCarrierService:
             for pdf_path in pdf_files:
                 extraction  = extract_invoice_carrier(pdf_path, gemini_model=gemini_model)
                 folder_name = extraction.get("reference")
+
+                # Normalize OI reference (fix 0/O confusion from LLM)
+                if folder_name:
+                    folder_name = normalize_oi_reference(folder_name)
+                    extraction["reference"] = folder_name
+
                 if not folder_name:
                     oi = extract_oi_from_subject(subject)
+                    folder_name = normalize_oi_reference(oi) if oi else subject_folder_fallback(subject)
                     folder_name = oi if oi else subject_folder_fallback(subject)
 
                 inv_no = extraction.get("invoice_no")
@@ -187,21 +195,24 @@ class InvoiceCarrierService:
 
                 if saved_files:
                     mbl_val = folder_name
+                    # Grab container_no from the last extraction for fallback search
+                    last_ext = extractions[-1] if extractions else {}
                     tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", mbl=mbl_val)
                     self._processed += 1
                     processed_items.append({
-                        "conv_id":     cid,
-                        "cat":         CAT,
-                        "folder_path": final_dir,
-                        "folder_name": folder_name,
-                        "mbl":         mbl_val,
+                        "conv_id":       cid,
+                        "cat":           CAT,
+                        "folder_path":   final_dir,
+                        "folder_name":   folder_name,
+                        "mbl":           mbl_val,
+                        "secondary_ref": last_ext.get("container_no"),
                     })
 
             cleanup_temp(temp_files)
 
         return processed_items
 
-    def _upload_to_jordex(self, jordex_page, tracker: Tracker, items: list):
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
         doc_type, display_name = JORDEX_MAPPING[CAT]
         normalize_dashboard_filters(jordex_page)
 
@@ -210,13 +221,28 @@ class InvoiceCarrierService:
             query = item.get("mbl") or item.get("folder_name")
             if not query: continue
             if query.startswith("OE"):
+                query = normalize_oi_reference(query)
                 tracker.update_status(CAT, item["conv_id"], "Skipped")
+                continue
+
+            success, used_ref, rows_found = search_jordex_with_fallback(
+                jordex_page=jordex_page,
+                outlook_page=outlook_page,
+                primary_ref=query,
+                secondary_ref=item.get("secondary_ref"),
+                conv_id=item["conv_id"],
+                tracker=tracker,
+                cat=CAT,
+                service_key=SERVICE_KEY,
+                search_fn=search_and_open,
+            )
+            if not success:
                 continue
 
             row_index = 0
             uploaded  = False
             while row_index < 10:
-                success, rows_found = search_and_open(jordex_page, query, row_index=row_index)
+                success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
                 if not success: break
                 inv_file_map = build_invoice_carrier_file_map(item["folder_path"])
                 upload_attachments(jordex_page, item["folder_path"], doc_type, display_name, file_map=inv_file_map)

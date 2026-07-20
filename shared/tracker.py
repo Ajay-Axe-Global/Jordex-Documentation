@@ -65,11 +65,13 @@ class Tracker:
         }
         data.update(kwargs)
         with _LOCK:
+            self.reload()
             self.data.setdefault(cat, {})[conv_id] = data
             self.save()
 
     def update_status(self, cat: str, conv_id: str, status: str):
         with _LOCK:
+            self.reload()
             if conv_id in self.data.get(cat, {}):
                 self.data[cat][conv_id]["status"] = status
                 self.save()

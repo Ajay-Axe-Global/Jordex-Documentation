@@ -21,9 +21,9 @@ from shared.tracker import Tracker
 from shared.helpers import (
     navigate_to_folder, collect_unread, click_row, get_subject,
     download_attachments_to_temp, move_file_to_folder, cleanup_temp,
-    subject_folder_fallback,
-    normalize_oi_reference,         # ← NEW
-    should_skip_multi_attachment,   # ← NEW
+    subject_folder_fallback, normalize_oi_reference,
+    should_skip_multi_attachment,
+    mark_as_unread, search_jordex_with_fallback,
 )
 from outlook.session import OutlookSession
 from jordex.login import JordexSession
@@ -111,7 +111,7 @@ class ArrivalNoticeService:
                 items = self._process_batch(outlook_page, tracker)
 
                 if items:
-                    self._upload_to_jordex(jordex_page, tracker, items)
+                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
 
                 if self._stop_evt.is_set():
                     break
@@ -237,16 +237,17 @@ class ArrivalNoticeService:
             self._processed += 1
 
             processed_items.append({
-                "conv_id":     cid,
-                "cat":         CAT,
-                "folder_path": final_dir,
-                "folder_name": folder_name,
-                "mbl":         mbl_val,
+                "conv_id":        cid,
+                "cat":            CAT,
+                "folder_path":    final_dir,
+                "folder_name":    folder_name,
+                "mbl":            mbl_val,
+                "secondary_ref":  (extraction.get("container_no") if extraction else None),
             })
 
         return processed_items
 
-    def _upload_to_jordex(self, jordex_page, tracker: Tracker, items: list):
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
         """Upload downloaded files to Jordex for each processed item."""
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
@@ -271,11 +272,25 @@ class ArrivalNoticeService:
                 tracker.update_status(CAT, item["conv_id"], "Skipped")
                 continue
 
+            success, used_ref, rows_found = search_jordex_with_fallback(
+                jordex_page=jordex_page,
+                outlook_page=outlook_page,
+                primary_ref=query,
+                secondary_ref=item.get("secondary_ref"),
+                conv_id=item["conv_id"],
+                tracker=tracker,
+                cat=CAT,
+                service_key=SERVICE_KEY,
+                search_fn=search_and_open,
+            )
+            if not success:
+                continue
+
             row_index = 0
             uploaded  = False
 
             while row_index < 10:  # max 10 rows per shipment
-                success, rows_found = search_and_open(jordex_page, query, row_index=row_index)
+                success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
                 if not success:
                     break
 

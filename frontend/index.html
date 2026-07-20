@@ -316,8 +316,8 @@
 
     /* JSON pane */
     .json-pane {
-      width: 340px;
-      min-width: 280px;
+      width: 480px;
+      min-width: 350px;
       display: none;
       overflow-y: auto;
       background: var(--surface);
@@ -414,7 +414,21 @@
 
     <!-- Recent activity -->
     <div>
-      <div class="section-title">Recent Activity</div>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+        <div class="section-title" style="margin-bottom: 0;">Recent Activity</div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <input type="text" id="activitySearch" placeholder="Search OI, REF..." style="padding: 6px 10px; border-radius: 4px; border: 1px solid #2d3748; background: var(--surface); color: var(--text); outline: none; font-size: 0.9rem;" oninput="applyActivityFilter()" />
+          <select id="activityFilter" style="padding: 6px 10px; border-radius: 4px; border: 1px solid #2d3748; background: var(--surface); color: var(--text); outline: none; font-size: 0.9rem;" onchange="applyActivityFilter()">
+            <option value="">All Categories</option>
+            <option value="Customs_Docs">01.Customs docs</option>
+            <option value="Delivery_Order">02.Delivery Order</option>
+            <option value="Arrival_Notice">03.Arrival Notice</option>
+            <option value="Customer_Docs">04.Customer Docs</option>
+            <option value="Invoice_Carrier">05.Invoice Carrier</option>
+            <option value="Booking_Confirmation">06.Booking confirmation</option>
+          </select>
+        </div>
+      </div>
       <table class="activity-table">
         <thead>
           <tr>
@@ -590,13 +604,38 @@
     } catch(e) { console.error(e); }
   }
 
+  let _lastRecent = [];
+
   function updateActivity(recent) {
+    _lastRecent = recent;
+    applyActivityFilter();
+  }
+
+  function applyActivityFilter() {
     const tbody = document.getElementById("activityBody");
-    if (!recent.length) {
-      tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--text2)">No activity yet</td></tr>';
+    const searchStr = document.getElementById("activitySearch")?.value.toLowerCase() || "";
+    const filterCat = document.getElementById("activityFilter")?.value || "";
+    
+    let filtered = _lastRecent;
+    
+    if (filterCat) {
+      filtered = filtered.filter(r => r.category === filterCat);
+    }
+    
+    if (searchStr) {
+      filtered = filtered.filter(r => {
+        const mbl = (r.mbl || "").toLowerCase();
+        const subj = (r.folder || r.subject || "").toLowerCase();
+        return mbl.includes(searchStr) || subj.includes(searchStr);
+      });
+    }
+
+    if (!filtered.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--text2)">No activity found</td></tr>';
       return;
     }
-    tbody.innerHTML = recent.slice(0, 25).map(r => {
+    
+    tbody.innerHTML = filtered.slice(0, 25).map(r => {
       const pill  = `<span class="status-pill pill-${r.status}">${r.status}</span>`;
       const mbl   = r.mbl ? `<span class="mbl-code">${esc(r.mbl)}</span>` : "—";
       const subj  = esc((r.folder || r.subject || "").substring(0, 50));
@@ -828,7 +867,16 @@
 
   function fmtVal(val) {
     if (val === null || val === undefined) return '<span class="json-null">null</span>';
-    if (Array.isArray(val)) return val.map(v => fmtVal(v)).join("<br>");
+    if (Array.isArray(val)) {
+      return '<div style="display:flex; flex-direction:column; gap:8px; margin-top:4px;">' + 
+             val.map(v => {
+               if (v !== null && typeof v === "object") {
+                 return `<div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:10px;">${fmtVal(v)}</div>`;
+               }
+               return `<div>${fmtVal(v)}</div>`;
+             }).join("") + 
+             '</div>';
+    }
     if (typeof val === "object") {
       let s = '<div style="font-size:11px;">';
       for (const [k,v] of Object.entries(val))

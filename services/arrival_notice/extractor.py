@@ -15,6 +15,107 @@ from datetime import datetime
 
 log = logging.getLogger("arrival_notice.extractor")
 
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  KNOWN SCAC PREFIXES — used to verify B/L prefix is a real carrier
+# ══════════════════════════════════════════════════════════════════════
+
+_KNOWN_SCAC_PREFIXES = {
+    "HLCU", "MAEU", "MRKU", "MSCU", "MEDU", "ONEY", "YMLU", "EGLV",
+    "COSU", "OOLU", "ZIMU", "CMDU", "HDMU", "PCIU", "WHLC", "SUDU",
+    "COEU", "PNKG", "ANNU", "APLU", "CHNJ", "SMLM", "SNKO",
+}
+
+# Carrier name → SCAC fallback (when Gemini misses carrier_code)
+_CARRIER_NAME_TO_SCAC = {
+    "ONE":                  "ONEY",
+    "OCEAN NETWORK EXPRESS": "ONEY",
+    "CMA CGM":              "CMDU",
+    "HAPAG-LLOYD":          "HLCU",
+    "HAPAG LLOYD":          "HLCU",
+    "MAERSK":               "MAEU",
+    "MSC":                  "MEDU",
+    "OOCL":                 "OOLU",
+    "EVERGREEN":            "EGLV",
+    "ZIM":                  "ZIMU",
+    "YANG MING":            "YMLU",
+    "HMM":                  "HDMU",
+    "HYUNDAI":              "HDMU",
+    "COSCO":                "COSU",
+    "PIL":                  "PCIU",
+    "WAN HAI":              "WHLC",
+    "HAMBURG SUD":          "SUDU",
+    "HAMBURG SÜD":          "SUDU",
+    "PANDA":                "PNKG",
+}
+
+
+def _resolve_carrier_code(carrier_name: str, carrier_code: str) -> str | None:
+    """Resolve carrier_code from Gemini output or fall back to carrier_name lookup."""
+    # If Gemini returned a valid code, use it
+    if carrier_code and carrier_code.upper() in _KNOWN_SCAC_PREFIXES:
+        return carrier_code.upper()
+    # Fallback: match carrier_name against known mappings
+    if carrier_name:
+        name_upper = carrier_name.upper().strip()
+        for key, scac in _CARRIER_NAME_TO_SCAC.items():
+            if key in name_upper:
+                return scac
+    return (carrier_code or "").upper() or None
+
+
+# Known carrier B/L prefixes that are NOT the SCAC but DO indicate
+# the carrier identity is already embedded in the reference number.
+_CARRIER_BL_PREFIXES = {
+    "YM":   "YMLU",   # Yang Ming: YMJAN..., YMLUW...
+    "ONE":  "ONEY",   # ONE: ONEY already caught, but ONE prefix too
+    "HD":   "HDMU",   # HMM/Hyundai: HDMU caught, but HDJS... etc
+    "CM":   "CMDU",   # CMA CGM: CMDU caught, but CMAJ... etc
+    "ZI":   "ZIMU",   # ZIM
+    "SU":   "SUDU",   # Hamburg Süd
+    "WH":   "WHLC",   # Wan Hai
+  
+}
+
+def _ensure_scac_prefix(reference: str, carrier_code: str) -> str:
+    """
+    Ensure reference has a carrier prefix for Jordex search.
+
+    Logic:
+      1. Starts with a known SCAC (HLCU, MAEU, ONEY...) → already good, skip.
+      2. Starts with a known carrier BL prefix (YM for Yang Ming) that maps
+         to the SAME carrier_code → carrier identity already embedded, skip.
+      3. First 2 chars of reference match first 2 chars of carrier_code
+         → carrier identity likely embedded, skip.
+      4. Otherwise → prepend carrier_code.
+    """
+    if not reference or not carrier_code:
+        return reference
+
+    ref_upper = reference.upper()
+    code_upper = carrier_code.upper()
+
+    # Check 1: starts with a known 4-letter SCAC
+    if ref_upper[:4] in _KNOWN_SCAC_PREFIXES:
+        log.info("  AN ref '%s' already has known SCAC prefix — no prepend", reference)
+        return reference
+
+    # Check 2: starts with a known carrier BL prefix for this carrier
+    for bl_prefix, scac in _CARRIER_BL_PREFIXES.items():
+        if ref_upper.startswith(bl_prefix) and scac == code_upper:
+            log.info("  AN ref '%s' has carrier BL prefix '%s' for %s — no prepend",
+                     reference, bl_prefix, code_upper)
+            return reference
+
+    # Check 3: first 2 chars match carrier_code's first 2 chars
+    if len(ref_upper) >= 2 and len(code_upper) >= 2 and ref_upper[:2] == code_upper[:2]:
+        log.info("  AN ref '%s' shares prefix with %s — no prepend", reference, code_upper)
+        return reference
+
+    # Otherwise: prepend the SCAC
+    log.info("  AN prepending SCAC %s to ref '%s'", code_upper, reference)
+    return code_upper + reference
 # ══════════════════════════════════════════════════════════════════════
 #  PROMPT
 # ══════════════════════════════════════════════════════════════════════
@@ -39,7 +140,16 @@ RULES FOR reference (B/L Number):
 3. Do NOT confuse it with Customs Reference Number, MRN, Vessel Customs ID, or Vessel/Voyage number.
 4. CRITICAL: Clean the extracted B/L Number. Strip parentheticals or extra text (e.g. "(SW)"). Return only the core alphanumeric reference.
 5. If no B/L Number field/value is found anywhere in the document, set reference to null.
-
+6. SCAC PREFIX CHECK: After extracting the B/L number, check if it already starts with the
+   carrier's 4-letter SCAC code. If it does NOT, prepend the SCAC code.
+   Examples:
+     - Carrier: ONE (ONEY), BL printed as "MNLG23355900" → return "ONEYMNLG23355900"
+     - Carrier: ONE (ONEY), BL printed as "ONEYDVOG00797900" → already has ONEY, return as-is
+     - Carrier: Hapag-Lloyd (HLCU), BL printed as "HLCUSZX2605APPZ0" → already has HLCU, return as-is
+   EXCEPTION: If the B/L number clearly starts with the carrier's identity in a different format
+   (e.g. Yang Ming BLs start with "YM" like "YMJAN405110783"), do NOT prepend.
+   Only prepend when the B/L number has NO recognizable carrier prefix at all.
+   **For All MBl ref Validate first it has carrier code or not if there place as it is else add prefix then place in result.
 RULES FOR arrival_date_raw:
 1. Search ALL pages for the arrival date. Labels: "ETA", "ETA AT POD", "Est. Arrival Date", "Estimated Time of Arrival", "POD ETA", "Arrival Date".
 2. It may appear WITHOUT a label — e.g. "ETA AT POD: Rotterdam ON: Tuesday, 07 Jul, 2026". Still extract it.
@@ -50,7 +160,24 @@ RULES FOR arrival_date_raw:
 RULES FOR carrier_name and carrier_code:
 1. Extract the name of the shipping carrier or line.
 2. If the document has a prominent logo like "CMA CGM" at the top, extract "CMA CGM" even without an explicit SCAC code.
-3. Infer the 4-letter SCAC code (e.g., CMAU for CMA CGM, HLCU for Hapag-Lloyd, MAEU for Maersk, MSCU for MSC, PNKG for Panda Logistics) and return as carrier_code.
+3. Infer the 4-letter SCAC code from the carrier name or logo. Common mappings:
+   - ONE / Ocean Network Express → ONEY
+   - CMA CGM → CMDU
+   - Hapag-Lloyd → HLCU
+   - Maersk → MAEU (or MRKU for Maersk Line)
+   - MSC → MEDU (or MSCU / MRKU)
+   - OOCL → OOLU
+   - Evergreen → EGLV
+   - ZIM → ZIMU
+   - Yang Ming → YMLU
+   - HMM / Hyundai → HDMU
+   - COSCO → COSU
+   - Panda Logistics → PNKG
+   - PIL / Pacific International Lines → PCIU
+   - Wan Hai → WHLC
+   - Hamburg Süd → SUDU
+   CRITICAL: ALWAYS return carrier_code. If you see a carrier logo or name, you MUST map it.
+   Never return carrier_code as null if carrier_name is identified.
 """
 
 
@@ -208,16 +335,19 @@ def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> 
         result["carrier_code"] = (parsed.get("carrier_code") or "").strip() or None
 
         # Hardcode MAEU for Maersk
-        if result["carrier_name"] and "MAERSK" in result["carrier_name"].upper():
-            result["carrier_code"] = "MAEU"
+        # ── Resolve carrier_code (Gemini output + name-based fallback) ──
+        result["carrier_code"] = _resolve_carrier_code(
+            result["carrier_name"], result["carrier_code"]
+        )
 
-        # Prepend carrier_code to reference if reference lacks 4-letter prefix
-        if result["carrier_code"] and result["reference"]:
-            if not re.match(r'^[A-Za-z]{4}', result["reference"]):
-                log.info("  AN Prepended carrier_code %s to %s", result["carrier_code"], result["reference"])
-                result["reference"] = result["carrier_code"] + result["reference"]
+        # ── Ensure reference has a known SCAC prefix ────────────────
+        if result["reference"] and result["carrier_code"]:
+            old_ref = result["reference"]
+            result["reference"] = _ensure_scac_prefix(result["reference"], result["carrier_code"])
+            if result["reference"] != old_ref:
+                log.info("  AN Prepended SCAC %s: %s → %s", result["carrier_code"], old_ref, result["reference"])
 
-        # Fallback reference → container_no
+        # ── Fallback reference → container_no ────────────────────────
         if not result["reference"] and result["container_no"]:
             log.info("  AN reference missing, using container_no: %s", result["container_no"])
             result["reference"] = result["container_no"]

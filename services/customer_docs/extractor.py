@@ -117,7 +117,19 @@ If the header says "WEIGHT CERTIFICATE", "INSPECTION CERTIFICATE",
   → classify as: "ADDITIONAL FILES"
   doc_title: use the exact header text.
 
+── LOPERSOPDRACHT (COURIER ASSIGNMENT) ──
+If the header/title says "LOPERSOPDRACHT" or "LOPERS OPDRACHT":
+  This is a Jordex internal courier/runner assignment form.
+  → classify as: "ADDITIONAL FILES"
+  reference_number: Extract the "Referentienummer" field value (always an OI number
+    like OI2619414). This is the PRIMARY reference — do NOT use the B/L number.
+  doc_title: "Lopersopdracht"  (always this exact word, nothing else)
+  CRITICAL: The OI number from "Referentienummer" takes absolute priority over
+  any B/L number on this document.
+
 IF ANY of the above non-BL indicators are found, do NOT proceed to Step 2.
+
+
 
 =====================================================================
 STEP 2 — BL DOCUMENT: CLASSIFY AS MBL OR HBL
@@ -233,7 +245,14 @@ def _keyword_fallback(pdf_path: str) -> dict:
                 break
 
         # Non-BL checks
-        if re.search(r'\bDEBIT\s+(?:NOTE|ADVICE)\b|(?:^|\s)D/N\b', text_upper):
+        if re.search(r'\bLOPERSOPDRACHT\b|\bLOPERS\s+OPDRACHT\b', text_upper):
+            doc_type = "ADDITIONAL FILES"
+            doc_title = "Lopersopdracht"
+            # OI from Referentienummer is primary ref
+            oi_match = re.search(r'(?:Referentienummer|Referentie)\s*[:\s]*(OI\d{4,})', text, re.IGNORECASE)
+            if oi_match:
+                reference_number = oi_match.group(1).upper()
+        elif re.search(r'\bDEBIT\s+(?:NOTE|ADVICE)\b|(?:^|\s)D/N\b', text_upper):
             doc_type = "DEBIT NOTE"
             doc_title = "Debit Note"
         elif re.search(r'\bPACKING\s+LIST\b', text_upper):
@@ -308,6 +327,8 @@ _VALID_TYPES = {
 }
 
 _NORMALISE = {
+    "LOPERSOPDRACHT": "ADDITIONAL FILES",
+    "LOPERS OPDRACHT": "ADDITIONAL FILES",
     "HBL": "HOUSE BILL OF LADING",
     "MBL": "MASTER BILL OF LADING",
     "HOUSE BL": "HOUSE BILL OF LADING",
@@ -329,6 +350,16 @@ _NORMALISE = {
     "UNKNOWN": "ADDITIONAL FILES",
 }
 
+def _simplify_doc_title(title: str) -> str:
+    """Strip reference numbers, long suffixes from doc_title for cleaner Jordex comments."""
+    if not title:
+        return title
+    # Remove trailing reference numbers / codes (e.g. "Gas Insurance Certificate No 56G654")
+    cleaned = re.sub(r'\s*(?:No\.?|Nr\.?|Ref\.?|#)\s*[A-Z0-9\-/]{3,}.*$', '', title, flags=re.IGNORECASE).strip()
+    # Cap length at 60 chars
+    if len(cleaned) > 60:
+        cleaned = cleaned[:60].rsplit(' ', 1)[0]
+    return cleaned or title
 
 # ══════════════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
@@ -414,6 +445,18 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
         confidence = "low"
 
     # ── Normalise doc_type ───────────────────────────────────────────
+    # ── Lopersopdracht: force OI as reference, strip verbose title ───
+    if doc_title and re.search(r'\bLOPERSOPDRACHT\b', (doc_title or '').upper()):
+        doc_type = "ADDITIONAL FILES"
+        doc_title = "Lopersopdracht"
+        # If Gemini returned B/L as reference but OI exists, prefer OI
+        if reference_number and not reference_number.startswith("OI"):
+            text = _extract_text(pdf_path)
+            oi_m = re.search(r'(?:Referentienummer|Referentie)\s*[:\s]*(OI\d{4,})', text, re.IGNORECASE)
+            if oi_m:
+                reference_number = oi_m.group(1).upper()
+
+    # ── Normalise doc_type ───────────────────────────────────────────
     doc_type = _NORMALISE.get(doc_type, doc_type)
     if doc_type not in _VALID_TYPES:
         log.warning("  Unrecognised doc_type '%s' → ADDITIONAL FILES", doc_type)
@@ -430,7 +473,7 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
     result["doc_type"] = doc_type
     result["reference_number"] = reference_number
     result["container_no"] = container_no
-    result["doc_title"] = doc_title
+    result["doc_title"] = _simplify_doc_title(doc_title)
     result["folder_name"] = _resolve_folder_name(doc_type, reference_number, container_no)
 
     if confidence == "low":

@@ -417,3 +417,99 @@ def should_skip_multi_attachment(page, max_allowed: int = 1) -> bool:
     except Exception as e:
         log.warning("  Attachment check FAILED: %s — NOT skipping (fail-open)", e)
         return False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Mark email as UNREAD
+# ══════════════════════════════════════════════════════════════════════
+
+def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
+    """
+    Mark an email as unread in Outlook using Ctrl+U.
+
+    Assumes the email is already in the currently open folder (which it
+    always is, since we process emails from the folder we navigated to).
+
+    Args:
+        outlook_page: The Outlook Playwright page
+        conv_id:      The data-convid of the email to mark unread
+
+    Returns:
+        True if successfully marked unread, False otherwise
+    """
+    try:
+        if not click_row(outlook_page, conv_id):
+            log.warning("  mark_as_unread: could not select email %s", conv_id)
+            return False
+        outlook_page.wait_for_timeout(500)
+        outlook_page.keyboard.press("Control+u")
+        outlook_page.wait_for_timeout(500)
+        log.info("  Marked as UNREAD: %s", conv_id)
+        return True
+    except Exception as e:
+        log.warning("  mark_as_unread FAILED for %s: %s", conv_id, e)
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Jordex search with fallback
+# ══════════════════════════════════════════════════════════════════════
+
+def search_jordex_with_fallback(
+    jordex_page,
+    outlook_page: Page,
+    primary_ref: str,
+    secondary_ref: str = None,
+    conv_id: str = None,
+    tracker=None,
+    cat: str = "",
+    service_key: str = "",
+    search_fn=None,
+) -> tuple:
+    """
+    Search Jordex with primary_ref first. If not found, try secondary_ref.
+    If both fail → mark the email unread in Outlook + set tracker status
+    to 'jordex_not_found' (email stays unread for manual handling).
+
+    Args:
+        jordex_page:    The Jordex Playwright page
+        outlook_page:   The Outlook Playwright page (for marking unread)
+        primary_ref:    Primary search term (MBL / OI / folder_name)
+        secondary_ref:  Fallback search term (container_no / alt ref)
+        conv_id:        Email conv_id (for marking unread on failure)
+        tracker:        Tracker instance (to record jordex_not_found)
+        cat:            Service category key (e.g. 'Arrival_Notice')
+        service_key:    Service name for logging
+        search_fn:      The search_and_open callable from jordex.browser
+
+    Returns:
+        (success: bool, used_ref: str | None, rows_found: int)
+    """
+    # ── Try primary ref ──────────────────────────────────────────────
+    if primary_ref:
+        log.info("[%s] Jordex search PRIMARY: '%s'", service_key, primary_ref)
+        success, rows_found = search_fn(jordex_page, primary_ref, row_index=0)
+        if success and rows_found > 0:
+            return True, primary_ref, rows_found
+        log.warning("[%s] PRIMARY not found: '%s'", service_key, primary_ref)
+
+    # ── Try secondary ref ────────────────────────────────────────────
+    if secondary_ref and secondary_ref != primary_ref:
+        log.info("[%s] Jordex search SECONDARY: '%s'", service_key, secondary_ref)
+        success, rows_found = search_fn(jordex_page, secondary_ref, row_index=0)
+        if success and rows_found > 0:
+            log.info("[%s] SECONDARY found: '%s'", service_key, secondary_ref)
+            return True, secondary_ref, rows_found
+        log.warning("[%s] SECONDARY not found: '%s'", service_key, secondary_ref)
+
+    # ── Both failed ──────────────────────────────────────────────────
+    tried = " / ".join(filter(None, [primary_ref, secondary_ref]))
+    log.warning("[%s] NOT FOUND in Jordex (%s) → marking email unread", service_key, tried)
+
+    if conv_id and outlook_page:
+        mark_as_unread(outlook_page, conv_id)
+
+    if tracker and conv_id and cat:
+        tracker.update_status(cat, conv_id, "jordex_not_found")
+
+    return False, None, 0

@@ -62,4 +62,4 @@ async def favicon():
 if __name__ == "__main__":
     import uvicorn
     log.info("Starting Jordex Documentation server at http://localhost:5050")
-    uvicorn.run("main:app", host="0.0.0.0", port=5050, reload=False, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=5050, reload=False, log_level="info", access_log=False)

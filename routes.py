@@ -99,7 +99,7 @@ async def get_tracker():
             })
     recent.sort(key=lambda x: x["time"], reverse=True)
 
-    return JSONResponse({"labels": labels_info, "recent": recent[:30], "tracking": tracking})
+    return JSONResponse({"labels": labels_info, "recent": recent, "tracking": tracking})
 
 
 @router.get("/api/output")

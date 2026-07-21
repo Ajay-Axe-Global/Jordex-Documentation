@@ -377,10 +377,12 @@ class DeliveryOrderService:
                 if multi_items:
                     all_mbls  = [it["mbl"] for it in multi_items if it.get("mbl")]
                     all_files = [f for it in multi_items for f in it.get("files", [])]
+                    all_secs  = [it.get("secondary_ref") for it in multi_items if it.get("secondary_ref")]
                     tracker.mark(
                         CAT, cid, subject,
                         multi_items[0]["folder_name"], all_files, "downloaded",
                         mbl=all_mbls[0] if all_mbls else None,
+                        secondary_ref=all_secs[0] if all_secs else None,
                     )
                     for it in multi_items:
                         it["conv_id"] = cid

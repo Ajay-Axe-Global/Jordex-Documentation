@@ -186,7 +186,8 @@ class CustomsDocsService:
             save_result(extraction, final_dir, "customs_result.json")
             cleanup_temp(temp_files)
 
-            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded")
+            sec_ref = folder_name if oi and folder_name != oi else None
+            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", secondary_ref=sec_ref)
             self._processed += 1
             processed_items.append({
                 "conv_id":       cid,
@@ -198,7 +199,7 @@ class CustomsDocsService:
                 "has_tax":       has_tax,
                 "has_ttw":       has_ttw,
                 "forward_flags": forward_flags,
-                "secondary_ref": folder_name if oi and folder_name != oi else None,
+                "secondary_ref": sec_ref,
             })
 
         return processed_items
@@ -670,13 +671,15 @@ class CustomsDocsService:
                     return
                 page.wait_for_timeout(1500)
 
-            # Step 4: Close the panel
+            # Step 4: Click SAVE to commit the status change
             try:
-                page.get_by_role("button", name="Close").click()
-                page.wait_for_timeout(1000)
-            except Exception:
+                page.get_by_role("button", name="Save").click()
+                page.wait_for_timeout(3500)
+                log.info(f"[{SERVICE_KEY}] Task saved (Save button clicked)")
+            except Exception as e:
+                log.warning(f"[{SERVICE_KEY}] Save button click failed: {e} — trying Escape")
                 page.keyboard.press("Escape")
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(1500)
 
             log.info(f"[{SERVICE_KEY}] Task completion done")
 

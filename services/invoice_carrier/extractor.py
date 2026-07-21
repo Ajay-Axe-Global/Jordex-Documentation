@@ -11,6 +11,7 @@ Called by invoice_carrier.py (this service's main file).
 
 import base64, json, os, re, logging
 from datetime import datetime
+from shared.helpers import resolve_carrier_code, ensure_scac_prefix
 
 log = logging.getLogger("invoice_carrier.extractor")
 
@@ -24,18 +25,23 @@ Return ONLY a valid JSON object (no markdown, no backticks, no extra text):
 
 {
   "reference": "the primary reference number (B/L, Container, or OI number), or null",
+  "secondary_ref": "the secondary reference. For Hapag-Lloyd, extract SHIPMENT no (e.g. 13089204) else Container. For others, extract Container. Or null.",
   "invoice_no": "the invoice number printed on the document, or null",
-  "carrier_name": "the name of the shipping line or carrier (e.g. CMA CGM), or null"
+  "carrier_name": "the name of the shipping line or carrier (e.g. CMA CGM), or null",
+  "carrier_code": "the 4-letter SCAC carrier code inferred from carrier name or logo (e.g. HLCU, MSKU, CMAU, PNKG), or null"
 }
 
 RULES FOR reference:
-1. PRIORITY 1 (HIGHEST) — OI or OE Number. Look for fields labeled "Your-Reference", "Our Ref", "Reference", or anywhere
-   for a string starting with "OI" or "OE" followed by 5+ digits (e.g., OI2615762, OE12345). If found, MUST use it.
+1. PRIORITY 1 (HIGHEST) — OI or OE Number. Look for fields labeled "Your-Reference", "Our Ref", "Reference", or anywhere for a string starting with "OI" or "OE" followed by 5+ digits (e.g., OI2615762). If found, MUST use it.
 2. PRIORITY 2 — B/L Number / Bill of Lading No. Only if NO OI/OE number exists. Usually has carrier prefix + digits.
 3. PRIORITY 3 — Container Number. Exactly 4 uppercase letters + 7 digits.
 4. If the document is from CMA CGM and the B/L number is exactly 10 letters/digits (e.g., VLN0150979), prepend 'CMDU'.
 5. Extract exactly as printed, removing spaces.
-6. Do NOT extract short internal carrier references (like '23461314') as the reference.
+6. Do NOT extract short internal carrier references (like '23461314') as the reference, EXCEPT for Hapag-Lloyd SHIPMENT numbers which go to secondary_ref.
+
+RULES FOR secondary_ref:
+1. If carrier is Hapag-Lloyd: Extract the "SHIPMENT" number (e.g. 13089204) if it exists. If not, extract a Container Number.
+2. For all other carriers: Extract a Container Number.
 
 RULES FOR invoice_no:
 1. Look for fields labeled "Invoice No", "Invoice Number", "Document No", "Inv. No.", "Factuur", "Rechnung", etc.
@@ -114,6 +120,7 @@ def extract_invoice_carrier(pdf_path: str, gemini_model=None) -> dict:
     result = {
         "doc_type":     "invoice_carrier",
         "reference":    None,
+        "secondary_ref": None,
         "invoice_no":   None,
         "carrier_name": None,
         "source_file":  os.path.basename(pdf_path),
@@ -140,24 +147,33 @@ def extract_invoice_carrier(pdf_path: str, gemini_model=None) -> dict:
             parsed = json.loads(raw)
 
             reference    = (parsed.get("reference") or "").strip().upper() or None
+            secondary_ref = (parsed.get("secondary_ref") or "").strip().upper() or None
             invoice_no   = (parsed.get("invoice_no") or "").strip() or None
-            carrier_name = (parsed.get("carrier_name") or "").strip().upper()
+            carrier_name = (parsed.get("carrier_name") or "").strip() or None
+            carrier_code = (parsed.get("carrier_code") or "").strip() or None
 
-            # Python-level CMA CGM enforcement
-            if reference and len(reference) == 10 and not reference.startswith("CMDU"):
-                is_cma = "CMA CGM" in carrier_name or "CMA-CGM" in carrier_name
-                if not is_cma:
-                    raw_text = _extract_text(pdf_path).upper()
-                    if "CMA CGM" in raw_text or "CMA-CGM" in raw_text:
-                        is_cma = True
-                if is_cma:
-                    log.info(f"  Enforcing CMDU prefix for CMA CGM B/L: {reference}")
-                    reference = "CMDU" + reference
+            # OCR Correction for OI numbers (e.g. 012618725 -> OI2618725)
+            if reference and re.match(r'^(01|0I|O1)\d{5,}$', reference):
+                old_ref = reference
+                reference = "OI" + reference[2:]
+                log.info(f"  Invoice OCR Correction: {old_ref} -> {reference}")
+
+            # Resolve carrier code
+            resolved_scac = resolve_carrier_code(carrier_name, carrier_code)
+
+            # Prepend SCAC if reference is a B/L (not an OI/OE number)
+            if reference and resolved_scac and not reference.startswith("OI") and not reference.startswith("OE"):
+                old_ref = reference
+                reference = ensure_scac_prefix(reference, resolved_scac)
+                if reference != old_ref:
+                    log.info("  Invoice Prepended SCAC %s: %s → %s", resolved_scac, old_ref, reference)
 
             result["reference"]    = reference
+            result["secondary_ref"] = secondary_ref
             result["invoice_no"]   = invoice_no
             result["carrier_name"] = carrier_name
-            log.info(f"  Invoice Gemini: ref={reference} invoice={invoice_no}")
+            result["carrier_code"] = carrier_code
+            log.info(f"  Invoice Gemini: ref={reference} sec={secondary_ref} invoice={invoice_no} scac={resolved_scac}")
 
         except Exception as e:
             log.warning(f"  Invoice Gemini failed: {e}. Keyword fallback.")

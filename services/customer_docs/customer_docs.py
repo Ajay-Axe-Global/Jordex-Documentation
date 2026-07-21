@@ -175,8 +175,6 @@ class CustomerDocsService:
 
             cleanup_temp(temp_files)
 
-            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded")
-            self._processed += 1
             # secondary_ref: try reference_number from classification, then container_no
             sec_ref = None
             if cust_results:
@@ -184,6 +182,10 @@ class CustomerDocsService:
                     sec_ref = r.get("reference_number") or r.get("container_no")
                     if sec_ref:
                         break
+            
+            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", secondary_ref=sec_ref)
+            self._processed += 1
+            
             processed_items.append({
                 "conv_id":       cid,
                 "cat":           CAT,

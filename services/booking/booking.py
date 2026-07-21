@@ -148,7 +148,7 @@ class BookingService:
             save_result(extraction, final_dir)
             cleanup_temp(temp_files)
 
-            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded")
+            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", secondary_ref=None)
             self._processed += 1
             processed_items.append({
                 "conv_id":       cid,

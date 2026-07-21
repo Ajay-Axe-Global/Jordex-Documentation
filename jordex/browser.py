@@ -268,6 +268,9 @@ def search_and_open(page, query, row_index=0):
 
 def go_back(page):
     log.info("Going back to shipment list...")
+    # Wait for any prior UI transitions (like closing sidebars/saving) to finish
+    page.wait_for_timeout(1500)
+
     try:
         page.evaluate("""() => {
             const btn = [...document.querySelectorAll('button')].find(btn => btn.innerText.includes('Back'));
@@ -277,7 +280,9 @@ def go_back(page):
         _wait_loading(page)
     except: pass
     
-    if not page.url.endswith("ocean"):
+    # Verification and fallback
+    if "ocean" not in page.url.lower():
+        log.warning("Did not return to ocean list via Back button. Force navigating...")
         try: page.goto(JORDEX_OCEAN_URL, wait_until="load"); page.wait_for_timeout(3000)
         except: pass
     

@@ -16,106 +16,7 @@ from datetime import datetime
 log = logging.getLogger("arrival_notice.extractor")
 
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  KNOWN SCAC PREFIXES — used to verify B/L prefix is a real carrier
-# ══════════════════════════════════════════════════════════════════════
-
-_KNOWN_SCAC_PREFIXES = {
-    "HLCU", "MAEU", "MRKU", "MSCU", "MEDU", "ONEY", "YMLU", "EGLV",
-    "COSU", "OOLU", "ZIMU", "CMDU", "HDMU", "PCIU", "WHLC", "SUDU",
-    "COEU", "PNKG", "ANNU", "APLU", "CHNJ", "SMLM", "SNKO",
-}
-
-# Carrier name → SCAC fallback (when Gemini misses carrier_code)
-_CARRIER_NAME_TO_SCAC = {
-    "ONE":                  "ONEY",
-    "OCEAN NETWORK EXPRESS": "ONEY",
-    "CMA CGM":              "CMDU",
-    "HAPAG-LLOYD":          "HLCU",
-    "HAPAG LLOYD":          "HLCU",
-    "MAERSK":               "MAEU",
-    "MSC":                  "MEDU",
-    "OOCL":                 "OOLU",
-    "EVERGREEN":            "EGLV",
-    "ZIM":                  "ZIMU",
-    "YANG MING":            "YMLU",
-    "HMM":                  "HDMU",
-    "HYUNDAI":              "HDMU",
-    "COSCO":                "COSU",
-    "PIL":                  "PCIU",
-    "WAN HAI":              "WHLC",
-    "HAMBURG SUD":          "SUDU",
-    "HAMBURG SÜD":          "SUDU",
-    "PANDA":                "PNKG",
-}
-
-
-def _resolve_carrier_code(carrier_name: str, carrier_code: str) -> str | None:
-    """Resolve carrier_code from Gemini output or fall back to carrier_name lookup."""
-    # If Gemini returned a valid code, use it
-    if carrier_code and carrier_code.upper() in _KNOWN_SCAC_PREFIXES:
-        return carrier_code.upper()
-    # Fallback: match carrier_name against known mappings
-    if carrier_name:
-        name_upper = carrier_name.upper().strip()
-        for key, scac in _CARRIER_NAME_TO_SCAC.items():
-            if key in name_upper:
-                return scac
-    return (carrier_code or "").upper() or None
-
-
-# Known carrier B/L prefixes that are NOT the SCAC but DO indicate
-# the carrier identity is already embedded in the reference number.
-_CARRIER_BL_PREFIXES = {
-    "YM":   "YMLU",   # Yang Ming: YMJAN..., YMLUW...
-    "ONE":  "ONEY",   # ONE: ONEY already caught, but ONE prefix too
-    "HD":   "HDMU",   # HMM/Hyundai: HDMU caught, but HDJS... etc
-    "CM":   "CMDU",   # CMA CGM: CMDU caught, but CMAJ... etc
-    "ZI":   "ZIMU",   # ZIM
-    "SU":   "SUDU",   # Hamburg Süd
-    "WH":   "WHLC",   # Wan Hai
-  
-}
-
-def _ensure_scac_prefix(reference: str, carrier_code: str) -> str:
-    """
-    Ensure reference has a carrier prefix for Jordex search.
-
-    Logic:
-      1. Starts with a known SCAC (HLCU, MAEU, ONEY...) → already good, skip.
-      2. Starts with a known carrier BL prefix (YM for Yang Ming) that maps
-         to the SAME carrier_code → carrier identity already embedded, skip.
-      3. First 2 chars of reference match first 2 chars of carrier_code
-         → carrier identity likely embedded, skip.
-      4. Otherwise → prepend carrier_code.
-    """
-    if not reference or not carrier_code:
-        return reference
-
-    ref_upper = reference.upper()
-    code_upper = carrier_code.upper()
-
-    # Check 1: starts with a known 4-letter SCAC
-    if ref_upper[:4] in _KNOWN_SCAC_PREFIXES:
-        log.info("  AN ref '%s' already has known SCAC prefix — no prepend", reference)
-        return reference
-
-    # Check 2: starts with a known carrier BL prefix for this carrier
-    for bl_prefix, scac in _CARRIER_BL_PREFIXES.items():
-        if ref_upper.startswith(bl_prefix) and scac == code_upper:
-            log.info("  AN ref '%s' has carrier BL prefix '%s' for %s — no prepend",
-                     reference, bl_prefix, code_upper)
-            return reference
-
-    # Check 3: first 2 chars match carrier_code's first 2 chars
-    if len(ref_upper) >= 2 and len(code_upper) >= 2 and ref_upper[:2] == code_upper[:2]:
-        log.info("  AN ref '%s' shares prefix with %s — no prepend", reference, code_upper)
-        return reference
-
-    # Otherwise: prepend the SCAC
-    log.info("  AN prepending SCAC %s to ref '%s'", code_upper, reference)
-    return code_upper + reference
+from shared.helpers import resolve_carrier_code, ensure_scac_prefix
 # ══════════════════════════════════════════════════════════════════════
 #  PROMPT
 # ══════════════════════════════════════════════════════════════════════
@@ -334,16 +235,15 @@ def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> 
         result["carrier_name"] = (parsed.get("carrier_name") or "").strip() or None
         result["carrier_code"] = (parsed.get("carrier_code") or "").strip() or None
 
-        # Hardcode MAEU for Maersk
         # ── Resolve carrier_code (Gemini output + name-based fallback) ──
-        result["carrier_code"] = _resolve_carrier_code(
+        result["carrier_code"] = resolve_carrier_code(
             result["carrier_name"], result["carrier_code"]
         )
 
         # ── Ensure reference has a known SCAC prefix ────────────────
         if result["reference"] and result["carrier_code"]:
             old_ref = result["reference"]
-            result["reference"] = _ensure_scac_prefix(result["reference"], result["carrier_code"])
+            result["reference"] = ensure_scac_prefix(result["reference"], result["carrier_code"])
             if result["reference"] != old_ref:
                 log.info("  AN Prepended SCAC %s: %s → %s", result["carrier_code"], old_ref, result["reference"])
 

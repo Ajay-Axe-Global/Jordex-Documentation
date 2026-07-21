@@ -54,12 +54,13 @@ class Tracker:
         return conv_id in self.data.get(cat, {})
 
     def mark(self, cat: str, conv_id: str, subject: str, folder_name: str,
-             files: list, status: str, mbl: str = None, **kwargs):
+             files: list, status: str, mbl: str = None, secondary_ref: str = None, **kwargs):
         data = {
             "subject": subject,
             "folder_name": folder_name,
             "files": files,
             "mbl": mbl,
+            "secondary_ref": secondary_ref,
             "processed_at": datetime.now().isoformat(),
             "status": status,
         }

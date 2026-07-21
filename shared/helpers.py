@@ -301,6 +301,12 @@ def normalize_oi_reference(raw: str) -> str:
         log.info("  OI normalized: '%s' → '%s'", raw, fixed)
         return fixed
  
+    # Fix 'O1' or 'o1' (Letter O then Number 1) → misread of OI
+    if re.match(r'^[oO]1\d', cleaned):
+        fixed = "OI" + cleaned[2:]
+        log.info("  OI normalized (O1 fix): '%s' → '%s'", raw, fixed)
+        return fixed
+ 
     # Starts with "01" followed by 5+ digits → very likely OI (not a real number)
     if re.match(r'^01\d{5,}$', cleaned):
         fixed = "OI" + cleaned[2:]
@@ -513,3 +519,113 @@ def search_jordex_with_fallback(
         tracker.update_status(cat, conv_id, "jordex_not_found")
 
     return False, None, 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SCAC AND CARRIER CODE HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+KNOWN_SCAC_PREFIXES = {
+    "HLCU", "MAEU", "MRKU", "MSCU", "MEDU", "ONEY", "YMLU", "EGLV",
+    "COSU", "OOLU", "ZIMU", "CMDU", "HDMU", "PCIU", "WHLC", "SUDU",
+    "COEU", "PNKG", "ANNU", "APLU", "CHNJ", "SMLM", "SNKO",
+}
+
+# Carrier name → SCAC fallback (when Gemini misses carrier_code)
+CARRIER_NAME_TO_SCAC = {
+    "ONE":                  "ONEY",
+    "OCEAN NETWORK EXPRESS": "ONEY",
+    "CMA CGM":              "CMDU",
+    "HAPAG-LLOYD":          "HLCU",
+    "HAPAG LLOYD":          "HLCU",
+    "MAERSK":               "MAEU",
+    "MSC":                  "MEDU",
+    "OOCL":                 "OOLU",
+    "EVERGREEN":            "EGLV",
+    "ZIM":                  "ZIMU",
+    "YANG MING":            "YMLU",
+    "HMM":                  "HDMU",
+    "HYUNDAI":              "HDMU",
+    "COSCO":                "COSU",
+    "PIL":                  "PCIU",
+    "WAN HAI":              "WHLC",
+    "HAMBURG SUD":          "SUDU",
+    "HAMBURG SÜD":          "SUDU",
+    "PANDA":                "PNKG",
+}
+
+def resolve_carrier_code(carrier_name: str, carrier_code: str) -> str | None:
+    """Resolve carrier_code from Gemini output or fall back to carrier_name lookup."""
+    # If Gemini returned a valid code, use it
+    if carrier_code and carrier_code.upper() in KNOWN_SCAC_PREFIXES:
+        return carrier_code.upper()
+    # Fallback: match carrier_name against known mappings
+    if carrier_name:
+        name_upper = carrier_name.upper().strip()
+        for key, scac in CARRIER_NAME_TO_SCAC.items():
+            if key in name_upper:
+                return scac
+    return (carrier_code or "").upper() or None
+
+# Known carrier B/L prefixes that are NOT the SCAC but DO indicate
+# the carrier identity is already embedded in the reference number.
+CARRIER_BL_PREFIXES = {
+    "YM":   "YMLU",   # Yang Ming: YMJAN..., YMLUW...
+    "ONE":  "ONEY",   # ONE: ONEY already caught, but ONE prefix too
+    "HD":   "HDMU",   # HMM/Hyundai: HDMU caught, but HDJS... etc
+    "CM":   "CMDU",   # CMA CGM: CMDU caught, but CMAJ... etc
+    "ZI":   "ZIMU",   # ZIM
+    "SU":   "SUDU",   # Hamburg Süd
+    "WH":   "WHLC",   # Wan Hai
+}
+
+def ensure_scac_prefix(reference: str, carrier_code: str) -> str:
+    """
+    Ensure reference has a carrier prefix for Jordex search.
+
+    Logic:
+      1. Starts with a known SCAC (HLCU, MAEU, ONEY...) → already good, skip.
+      2. Starts with a known carrier BL prefix (YM for Yang Ming) that maps
+         to the SAME carrier_code → carrier identity already embedded, skip.
+      3. First 2 chars of reference match first 2 chars of carrier_code
+         → carrier identity likely embedded, skip.
+      4. Otherwise → prepend carrier_code.
+    """
+    if not reference or not carrier_code:
+        return reference
+
+    # 0. Global OCR Correction for OI numbers (e.g., 012618725 -> OI2618725)
+    import re
+    if re.match(r'^(01|0I|O1)\d{5,}$', reference.upper()):
+        old_ref = reference
+        reference = "OI" + reference[2:]
+        log.info("  Global OCR Correction in SCAC applier: %s -> %s", old_ref, reference)
+
+    ref_upper = reference.upper()
+    code_upper = carrier_code.upper()
+
+    # Check 0.5: Is it an OI or OE internal order number? Never prepend SCAC to these.
+    if ref_upper.startswith("OI") or ref_upper.startswith("OE"):
+        log.info("  Ref '%s' is an internal order number (OI/OE) — no prepend", reference)
+        return reference
+
+    # Check 1: starts with a known 4-letter SCAC
+    if ref_upper[:4] in KNOWN_SCAC_PREFIXES:
+        log.info("  Ref '%s' already has known SCAC prefix — no prepend", reference)
+        return reference
+
+    # Check 2: starts with a known carrier BL prefix for this carrier
+    for bl_prefix, scac in CARRIER_BL_PREFIXES.items():
+        if ref_upper.startswith(bl_prefix) and scac == code_upper:
+            log.info("  Ref '%s' has carrier BL prefix '%s' for %s — no prepend",
+                     reference, bl_prefix, code_upper)
+            return reference
+
+    # Check 3: first 2 chars match carrier_code's first 2 chars
+    if len(ref_upper) >= 2 and len(code_upper) >= 2 and ref_upper[:2] == code_upper[:2]:
+        log.info("  Ref '%s' shares prefix with %s — no prepend", reference, code_upper)
+        return reference
+
+    # Otherwise: prepend the SCAC
+    log.info("  Prepending SCAC %s to ref '%s'", code_upper, reference)
+    return code_upper + reference

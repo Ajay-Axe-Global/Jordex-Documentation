@@ -145,7 +145,6 @@ class InvoiceCarrierService:
                 if not folder_name:
                     oi = extract_oi_from_subject(subject)
                     folder_name = normalize_oi_reference(oi) if oi else subject_folder_fallback(subject)
-                    folder_name = oi if oi else subject_folder_fallback(subject)
 
                 inv_no = extraction.get("invoice_no")
 
@@ -195,9 +194,9 @@ class InvoiceCarrierService:
 
                 if saved_files:
                     mbl_val = folder_name
-                    # Grab container_no from the last extraction for fallback search
                     last_ext = extractions[-1] if extractions else {}
-                    tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", mbl=mbl_val)
+                    sec_ref = last_ext.get("secondary_ref")
+                    tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", mbl=mbl_val, secondary_ref=sec_ref)
                     self._processed += 1
                     processed_items.append({
                         "conv_id":       cid,
@@ -205,7 +204,7 @@ class InvoiceCarrierService:
                         "folder_path":   final_dir,
                         "folder_name":   folder_name,
                         "mbl":           mbl_val,
-                        "secondary_ref": last_ext.get("container_no"),
+                        "secondary_ref": sec_ref,
                     })
 
             cleanup_temp(temp_files)

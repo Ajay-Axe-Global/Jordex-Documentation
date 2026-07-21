@@ -233,7 +233,8 @@ class ArrivalNoticeService:
             cleanup_temp(temp_files)
 
             mbl_val = extraction.get("reference") if extraction else None
-            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", mbl=mbl_val)
+            sec_ref = extraction.get("container_no") if extraction else None
+            tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", mbl=mbl_val, secondary_ref=sec_ref)
             self._processed += 1
 
             processed_items.append({
@@ -242,7 +243,7 @@ class ArrivalNoticeService:
                 "folder_path":    final_dir,
                 "folder_name":    folder_name,
                 "mbl":            mbl_val,
-                "secondary_ref":  (extraction.get("container_no") if extraction else None),
+                "secondary_ref":  sec_ref,
             })
 
         return processed_items

@@ -304,7 +304,7 @@ def _resolve_folder_name(doc_type: str, reference_number: str, container_no: str
         ref = re.sub(r'\s+', '', reference_number).upper()
         if len(ref) >= 6:
             if doc_type in ("ADDITIONAL FILES", "BOOKING CONFIRMATION"):
-                if re.match(r'^[A-Z]{4}', ref) and not ref.isdigit():
+                if (re.match(r'^[A-Z]{4}', ref) and not ref.isdigit()) or re.match(r'^OI\d{4,}', ref):
                     return ref
             else:
                 return ref

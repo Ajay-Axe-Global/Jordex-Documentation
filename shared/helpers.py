@@ -44,6 +44,13 @@ def _scroll(page: Page):
 # ══════════════════════════════════════════════════════════════════════
 
 def collect_unread(page: Page, tracker, cat: str, limit: int, max_scrolls=50) -> list[dict]:
+    try:
+        page.locator("#MailList div[data-virtuoso-scroller='true']").first.evaluate(
+            "el=>el.scrollTo(0,0)", timeout=2000
+        )
+        page.wait_for_timeout(1000)
+    except Exception:
+        pass
     seen, results = set(), []
     for _ in range(max_scrolls):
         rows = page.locator("#MailList div[role='option']")

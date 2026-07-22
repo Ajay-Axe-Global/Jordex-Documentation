@@ -3,6 +3,7 @@ services/arrival_notice/extractor.py — Arrival Notice Extraction Logic
 =======================================================================
 Contains:
   - ARRIVAL_NOTICE_PROMPT  (AN-specific Gemini prompt)
+  - FCS_EXTRA_PROMPT       (additional extraction for FCS/FPS carriers)
   - Date normalisation helpers
   - extract_arrival_notice(pdf_path, gemini_model, subject) → dict
 
@@ -17,6 +18,8 @@ log = logging.getLogger("arrival_notice.extractor")
 
 
 from shared.helpers import resolve_carrier_code, ensure_scac_prefix
+from services.arrival_notice.fcs_handler import is_fcs_carrier
+
 # ══════════════════════════════════════════════════════════════════════
 #  PROMPT
 # ══════════════════════════════════════════════════════════════════════
@@ -45,10 +48,8 @@ RULES FOR reference (B/L Number):
    carrier's 4-letter SCAC code. If it does NOT, prepend the SCAC code.
    Examples:
      - Carrier: ONE (ONEY), BL printed as "MNLG23355900" → return "ONEYMNLG23355900"
-     - Carrier: ONE (ONEY), BL printed as "ONEYDVOG00797900" → already has ONEY, return as-is
      - Carrier: Hapag-Lloyd (HLCU), BL printed as "HLCUSZX2605APPZ0" → already has HLCU, return as-is
-   EXCEPTION: If the B/L number clearly starts with the carrier's identity in a different format
-   (e.g. Yang Ming BLs start with "YM" like "YMJAN405110783"), do NOT prepend.
+   EXCEPTION: Do NOT prepend if the B/L clearly starts with the carrier's identity in a different format or a very similar prefix (e.g. Yang Ming BLs start with "YM" like "YMJAN405110783"; HMM/HDMU BLs might start with "HDMN"). In these cases, return the BL exactly as printed, do NOT prepend the SCAC (e.g. do not return "HDMUHDMN...").
    Only prepend when the B/L number has NO recognizable carrier prefix at all.
    **For All MBl ref Validate first it has carrier code or not if there place as it is else add prefix then place in result.
 RULES FOR arrival_date_raw:
@@ -79,6 +80,44 @@ RULES FOR carrier_name and carrier_code:
    - Hamburg Süd → SUDU
    CRITICAL: ALWAYS return carrier_code. If you see a carrier logo or name, you MUST map it.
    Never return carrier_code as null if carrier_name is identified.
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  FCS/FPS EXTRA PROMPT — appended only when FCS carrier is detected
+# ══════════════════════════════════════════════════════════════════════
+
+FCS_EXTRA_PROMPT = """
+ADDITIONAL EXTRACTION for FCS / FPS (Famous Pacific Shipping) documents:
+
+This is an FPS/FCS arrival notice. In ADDITION to the standard fields above,
+also extract these fields and include them in the SAME JSON object:
+
+{
+  ... (all standard fields above) ...
+  "vessel_name": "the vessel name from the document (e.g. 'COSCO SHIPPING VIRGO'), or null",
+  "devanning_date_raw": "the Expected Devanning date exactly as printed (e.g. '17-02-2026'), or null",
+  "warehouse_name": "the warehouse company name (e.g. 'POD LOGISTICS & WAREHOUSING BV'), or null",
+  "address_line_1": "the warehouse street address (e.g. 'SHANNONWEG 72'), or null",
+  "postal_code": "the warehouse postal/zip code (e.g. '3197 LH'), or null",
+  "city": "the warehouse city (e.g. 'BOTLEK ROTTERDAM'), or null",
+  "country": "the warehouse country (e.g. 'NETHERLANDS'), or null"
+}
+
+RULES FOR vessel_name:
+1. Look for field labeled "Vessel name" or similar.
+2. Return the full vessel name (e.g. "COSCO SHIPPING VIRGO").
+
+RULES FOR devanning_date_raw:
+1. Look for "Expected Devanning date" or "Devanning date".
+2. Copy the date EXACTLY as printed.
+
+RULES FOR warehouse address:
+1. Look for the "Warehouse:" section in the document.
+2. Extract the warehouse company name, street, postal code, city, and country SEPARATELY.
+3. The postal code is typically a pattern like "3197 LH" (Dutch format).
+4. The city may include district info like "BOTLEK ROTTERDAM".
+5. Country is typically "NETHERLANDS" for Dutch warehouses.
 """
 
 
@@ -192,26 +231,40 @@ def _regex_fallback(pdf_path: str, result: dict) -> dict:
 def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> dict:
     """
     Extract reference (B/L Number) + arrival_date from an Arrival Notice PDF.
+    For FCS carriers, also extracts vessel_name, devanning_date, and warehouse address.
+
     Returns: reference, arrival_date_raw, arrival_date, carrier_name, flag,
-             doc_type, source_file, extracted_at.
+             doc_type, source_file, extracted_at, and FCS-specific fields.
     """
     result = {
-        "doc_type":         "arrival_notice",
-        "reference":        None,
-        "container_no":     None,
-        "arrival_date_raw": None,
-        "arrival_date":     None,
-        "carrier_name":     None,
-        "carrier_code":     None,
-        "source_file":      os.path.basename(pdf_path),
-        "extracted_at":     datetime.now().isoformat(),
-        "flag":             None,
+        "doc_type":            "arrival_notice",
+        "reference":           None,
+        "container_no":        None,
+        "arrival_date_raw":    None,
+        "arrival_date":        None,
+        "carrier_name":        None,
+        "carrier_code":        None,
+        # FCS-specific fields (populated only for FCS carriers)
+        "is_fcs":              False,
+        "vessel_name":         None,
+        "devanning_date_raw":  None,
+        "devanning_date":      None,
+        "warehouse_name":      None,
+        "address_line_1":      None,
+        "postal_code":         None,
+        "city":                None,
+        "country":             None,
+        # Metadata
+        "source_file":         os.path.basename(pdf_path),
+        "extracted_at":        datetime.now().isoformat(),
+        "flag":                None,
     }
 
     try:
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
 
+        # ── First pass: standard extraction ──────────────────────────
         prompt_parts = [
             {"mime_type": "application/pdf", "data": base64.b64encode(pdf_bytes).decode()}
         ]
@@ -262,6 +315,66 @@ def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> 
                 result["flag"] = "needs_manual_review"
         else:
             result["flag"] = "needs_manual_review"
+
+        # ══════════════════════════════════════════════════════════════
+        #  FCS / FPS CARRIER — SECOND PASS with extra fields
+        # ══════════════════════════════════════════════════════════════
+        if is_fcs_carrier(result["carrier_name"], result["source_file"]):
+            log.info("  AN FCS carrier detected — running extra extraction")
+            result["is_fcs"] = True
+
+            try:
+                fcs_prompt_parts = [
+                    {"mime_type": "application/pdf",
+                     "data": base64.b64encode(pdf_bytes).decode()}
+                ]
+                if subject:
+                    fcs_prompt_parts.append(f"Email Subject: {subject}")
+                fcs_prompt_parts.append(ARRIVAL_NOTICE_PROMPT + FCS_EXTRA_PROMPT)
+
+                fcs_resp = gemini_model.generate_content(
+                    fcs_prompt_parts,
+                    generation_config={"temperature": 0.0, "max_output_tokens": 600},
+                )
+
+                fcs_raw = fcs_resp.text.strip()
+                fcs_raw = re.sub(r'^```(?:json)?\s*', '', fcs_raw)
+                fcs_raw = re.sub(r'\s*```$', '', fcs_raw)
+                fcs_parsed = json.loads(fcs_raw)
+                log.info("  AN FCS Gemini raw: %s", fcs_parsed)
+
+                # Populate FCS-specific fields
+                result["vessel_name"] = (
+                    fcs_parsed.get("vessel_name") or ""
+                ).strip() or None
+                result["warehouse_name"] = (
+                    fcs_parsed.get("warehouse_name") or ""
+                ).strip() or None
+                result["address_line_1"] = (
+                    fcs_parsed.get("address_line_1") or ""
+                ).strip() or None
+                result["postal_code"] = (
+                    fcs_parsed.get("postal_code") or ""
+                ).strip() or None
+                result["city"] = (
+                    fcs_parsed.get("city") or ""
+                ).strip() or None
+                result["country"] = (
+                    fcs_parsed.get("country") or ""
+                ).strip() or None
+
+                # Devanning date
+                dev_raw = (
+                    fcs_parsed.get("devanning_date_raw") or ""
+                ).strip() or None
+                result["devanning_date_raw"] = dev_raw
+                if dev_raw:
+                    result["devanning_date"] = _normalize_date(dev_raw)
+
+            except Exception as e:
+                log.warning("  AN FCS extra extraction failed: %s", e)
+                # FCS extra fields remain None — non-fatal, standard fields are intact
+        # ══════════════════════════════════════════════════════════════
 
     except json.JSONDecodeError as e:
         log.warning("  AN JSON parse failed: %s", e)

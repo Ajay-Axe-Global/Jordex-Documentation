@@ -9,9 +9,18 @@ ArrivalNoticeService owns:
 This file is the main entry point for the Arrival Notice service.
 Extraction logic lives in extractor.py (same folder).
 Shared Gemini engine lives in root extractor.py.
+
+FCS CARRIER EDGE CASE:
+  When carrier is FCS / Famous Pacific Shipping, additional post-upload
+  steps are performed:
+    - Upload with doc_type "Arrival Notice" renamed as "AN"
+    - Update Vessel Name on Carrier tab
+    - Add Warehouse Address on Destination tab
+    - Update Arrival Date on Lane tab
+  See fcs_handler.py for the Jordex UI automation.
 """
 
-import os, json, logging, threading
+import os, json, logging, threading, time
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
@@ -30,6 +39,7 @@ from jordex.login import JordexSession
 from jordex.browser import normalize_dashboard_filters, search_and_open, go_back
 from jordex.documents import upload_attachments
 from services.arrival_notice.extractor import extract_arrival_notice
+from services.arrival_notice.fcs_handler import is_fcs_carrier, handle_fcs_post_upload
 
 log = logging.getLogger("service.arrival_notice")
 
@@ -37,6 +47,10 @@ SERVICE_KEY   = "arrival_notice"
 OUTLOOK_LABEL = "03.Arrival Notice"
 CAT           = "Arrival_Notice"
 MODE          = "mbl"
+
+# FCS-specific upload config
+FCS_DOC_TYPE     = "Arrival Notice"   # doc_type selector value in Jordex
+FCS_DISPLAY_NAME = "AN"               # rename the uploaded file
 
 
 class ArrivalNoticeService:
@@ -120,7 +134,7 @@ class ArrivalNoticeService:
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set():
                         break
-                    import time; time.sleep(1)
+                    time.sleep(1)
 
         except Exception as e:
             log.error(f"[{SERVICE_KEY}] Fatal error: {e}", exc_info=True)
@@ -166,7 +180,7 @@ class ArrivalNoticeService:
             subject = get_subject(page) or cid[:40]
 
             # ══════════════════════════════════════════════════════════
-            #  NEW: Skip emails with multiple PDF attachments
+            #  Skip emails with multiple PDF attachments
             #  (bulk emails are duplicates of individual ones)
             # ══════════════════════════════════════════════════════════
             if should_skip_multi_attachment(page, max_allowed=1):
@@ -181,6 +195,16 @@ class ArrivalNoticeService:
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "no_attachment")
                 continue
 
+            # ══════════════════════════════════════════════════════════
+            #  Skip emails with Excel attachments
+            # ══════════════════════════════════════════════════════════
+            if any(f.lower().endswith(('.xls', '.xlsx')) for f in temp_files):
+                log.info(f"[{SERVICE_KEY}] Skipping email with Excel attachment: {subject}")
+                cleanup_temp(temp_files)
+                tracker.mark(CAT, cid, subject, "", [], "skipped_excel")
+                continue
+            # ══════════════════════════════════════════════════════════
+
             pdf_files = [f for f in temp_files if f.lower().endswith(".pdf")]
 
             if pdf_files and gemini_model:
@@ -188,7 +212,7 @@ class ArrivalNoticeService:
                 folder_name = extraction.get("reference") or subject_folder_fallback(subject)
 
                 # ══════════════════════════════════════════════════════
-                #  NEW: Normalize OI/MBL reference (fix 0/O confusion)
+                #  Normalize OI/MBL reference (fix 0/O confusion)
                 # ══════════════════════════════════════════════════════
                 folder_name = normalize_oi_reference(folder_name)
                 if extraction.get("reference"):
@@ -212,7 +236,7 @@ class ArrivalNoticeService:
                 extraction  = None
                 folder_name = subject_folder_fallback(subject)
                 # ══════════════════════════════════════════════════════
-                #  NEW: Also normalize fallback folder names
+                #  Also normalize fallback folder names
                 # ══════════════════════════════════════════════════════
                 folder_name = normalize_oi_reference(folder_name)
                 # ══════════════════════════════════════════════════════
@@ -244,6 +268,10 @@ class ArrivalNoticeService:
                 "folder_name":    folder_name,
                 "mbl":            mbl_val,
                 "secondary_ref":  sec_ref,
+                # ══════════════════════════════════════════════════════
+                #  Carry the full extraction dict for FCS post-upload
+                # ══════════════════════════════════════════════════════
+                "extraction":     extraction,
             })
 
         return processed_items
@@ -263,7 +291,7 @@ class ArrivalNoticeService:
                 continue
 
             # ══════════════════════════════════════════════════════════
-            #  NEW: Normalize query before Jordex search
+            #  Normalize query before Jordex search
             # ══════════════════════════════════════════════════════════
             query = normalize_oi_reference(query)
             # ══════════════════════════════════════════════════════════
@@ -287,33 +315,65 @@ class ArrivalNoticeService:
             if not success:
                 continue
 
+            # ══════════════════════════════════════════════════════════
+            #  Determine if this is an FCS carrier
+            # ══════════════════════════════════════════════════════════
+            extraction = item.get("extraction") or {}
+            fcs_mode = extraction.get("is_fcs", False)
+            if fcs_mode:
+                log.info(f"[{SERVICE_KEY}] FCS carrier detected — using Arrival Notice doc type")
+                upload_doc_type = FCS_DOC_TYPE
+                upload_display  = FCS_DISPLAY_NAME
+            else:
+                upload_doc_type = doc_type
+                upload_display  = display_name
+            # ══════════════════════════════════════════════════════════
+
             row_index = 0
             uploaded  = False
 
-            while row_index < 10:  # max 10 rows per shipment
-                success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
-                if not success:
-                    break
+            try:
+                while row_index < 10:  # max 10 rows per shipment
+                    success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                    if not success:
+                        break
 
-                # Arrival date guard — skip if Jordex date differs > 5 days
-                skip_an = self._check_arrival_date_mismatch(jordex_page, item)
-                if skip_an:
+                    # Arrival date guard — skip if Jordex date differs > 5 days
+                    skip_an = self._check_arrival_date_mismatch(jordex_page, item)
+                    if skip_an:
+                        go_back(jordex_page)
+                        break
+
+                    # ══════════════════════════════════════════════════════
+                    #  Upload with FCS-specific doc type if applicable
+                    # ══════════════════════════════════════════════════════
+                    upload_attachments(jordex_page, item["folder_path"],
+                                       upload_doc_type, upload_display)
+
+                    # ══════════════════════════════════════════════════════
+                    #  FCS POST-UPLOAD: update Carrier, Destination, Lane
+                    # ══════════════════════════════════════════════════════
+                    if fcs_mode:
+                        try:
+                            handle_fcs_post_upload(jordex_page, extraction)
+                        except Exception as e:
+                            log.warning(f"[{SERVICE_KEY}] FCS post-upload failed: {e}")
+                    # ══════════════════════════════════════════════════════
+
                     go_back(jordex_page)
-                    break
+                    uploaded = True
+                    self._uploaded += 1
+                    row_index += 1
 
-                upload_attachments(jordex_page, item["folder_path"], doc_type, display_name)
-                go_back(jordex_page)
-                uploaded = True
-                self._uploaded += 1
-                row_index += 1
-
-                if rows_found <= row_index:
-                    break
-
-            if uploaded:
-                tracker.update_status(CAT, item["conv_id"], "uploaded")
-            else:
-                log.warning(f"[{SERVICE_KEY}] Could not open shipment for {query}")
+                    if rows_found <= row_index:
+                        break
+            except Exception as e:
+                log.error(f"[{SERVICE_KEY}] Error during upload loop for {query}: {e}", exc_info=True)
+            finally:
+                if uploaded:
+                    tracker.update_status(CAT, item["conv_id"], "uploaded")
+                else:
+                    log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
 
     def _check_arrival_date_mismatch(self, jordex_page, item: dict) -> bool:
         """Return True if Jordex arrival date differs from extracted date by > 5 days."""
@@ -334,12 +394,25 @@ class ArrivalNoticeService:
                     an_data = json.load(f)
                 ext_date_str = an_data.get("arrival_date")
                 if ext_date_str:
-                    j_date = datetime.strptime(jordex_date_str, "%d %b %Y")
-                    fmt    = "%d/%m/%Y" if len(ext_date_str.split("/")[-1]) == 4 else "%d/%m/%y"
-                    e_date = datetime.strptime(ext_date_str, fmt)
+                    # Jordex may show "31 Jul 26" (2-digit year) or "31 Jul 2026" (4-digit year)
+                    j_date = None
+                    for fmt_j in ("%d %b %y", "%d %b %Y"):
+                        try:
+                            j_date = datetime.strptime(jordex_date_str, fmt_j)
+                            break
+                        except ValueError:
+                            continue
+                    if j_date is None:
+                        log.warning(f"[{SERVICE_KEY}] Could not parse Jordex date: '{jordex_date_str}'")
+                        return False
+
+                    # Our arrival_date is always DD/MM/YY or DD/MM/YYYY
+                    fmt_e = "%d/%m/%Y" if len(ext_date_str.split("/")[-1]) == 4 else "%d/%m/%y"
+                    e_date = datetime.strptime(ext_date_str, fmt_e)
                     diff   = abs((j_date - e_date).days)
                     if diff > 5:
-                        log.warning(f"[{SERVICE_KEY}] Arrival date mismatch {diff}d — skipping upload")
+                        log.warning(f"[{SERVICE_KEY}] Arrival date mismatch {diff}d "
+                                    f"(Jordex: '{jordex_date_str}' vs Extracted: '{ext_date_str}') — skipping upload")
                         return True
         except Exception as e:
             log.error(f"[{SERVICE_KEY}] Arrival date check error: {e}")

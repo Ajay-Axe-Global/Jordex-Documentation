@@ -743,10 +743,8 @@ class DeliveryOrderService:
                     page, section_nth=4, ref_value=return_ref,
                     label="Return"
                 )
-
-        # ── Save ────────────────────────────────────────────────────
-        self._save_routing(page)
-
+            # ── Save ────────────────────────────────────────────────────
+            self._save_routing(page)
         # ── Go back to shipment detail ──────────────────────────────
         self._go_back_from_routing(page)
         log.info(f"[{SERVICE_KEY}] Destination fill complete")
@@ -1172,15 +1170,16 @@ class DeliveryOrderService:
 
     def _dismiss_dialog(self, page: Page):
         """Force-close any open dialog to prevent blocking subsequent actions."""
-        page.evaluate("""() => {
-            const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
-                .filter(d => d.style.display !== 'none');
-            for (const dialog of dialogs) {
-                const close = dialog.querySelector('.el-dialog__headerbtn, .el-dialog__close, button[aria-label="Close"]');
-                if (close) { close.click(); return; }
-            }
-        }""")
-        page.wait_for_timeout(500)
+        try:
+            # Try clicking the close button via Playwright
+            close_btns = page.locator(".el-dialog__wrapper:not([style*='display: none']) .el-dialog__headerbtn, .el-dialog__wrapper:not([style*='display: none']) button[aria-label='Close']")
+            if close_btns.count() > 0:
+                for i in range(close_btns.count()):
+                    if close_btns.nth(i).is_visible():
+                        close_btns.nth(i).click()
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
 
         try:
             page.keyboard.press("Escape")
@@ -1188,6 +1187,7 @@ class DeliveryOrderService:
         except Exception:
             pass
 
+        # Fallback force hide
         page.evaluate("""() => {
             const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
                 .filter(d => d.style.display !== 'none');

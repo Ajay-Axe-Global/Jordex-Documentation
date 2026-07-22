@@ -50,8 +50,36 @@ class Tracker:
         with _LOCK:
             self.data = self._load()
 
+    # Statuses that are terminal — never retry these
+    _DONE_STATUSES = frozenset({
+        "uploaded",
+        "uploaded_needs_forward",
+        "Skipped",
+        "skipped_excel",
+        "skipped_multi_attach",
+        "no_attachment",
+        "jordex_not_found",
+        "failed",
+    })
+
     def is_done(self, cat: str, conv_id: str) -> bool:
-        return conv_id in self.data.get(cat, {})
+        """Return True if this email should not be reprocessed.
+
+        Rules:
+        - Terminal statuses (uploaded, skipped_*, failed, etc.) → always done.
+        - 'downloaded' with retry_count == 0 → NOT done (allow one upload retry).
+        - 'downloaded' with retry_count >= 1 → done (already retried once).
+        """
+        entry = self.data.get(cat, {}).get(conv_id)
+        if entry is None:
+            return False
+        status = entry.get("status", "")
+        if status in self._DONE_STATUSES:
+            return True
+        if status == "downloaded":
+            return entry.get("retry_count", 0) >= 1
+        # Any other unknown status → treat as done (safe default)
+        return True
 
     def mark(self, cat: str, conv_id: str, subject: str, folder_name: str,
              files: list, status: str, mbl: str = None, secondary_ref: str = None, **kwargs):
@@ -63,11 +91,17 @@ class Tracker:
             "secondary_ref": secondary_ref,
             "processed_at": datetime.now().isoformat(),
             "status": status,
+            "retry_count": 0,
         }
         data.update(kwargs)
         with _LOCK:
             self.reload()
-            self.data.setdefault(cat, {})[conv_id] = data
+            existing = self.data.setdefault(cat, {}).get(conv_id)
+            # If already present as 'downloaded', increment retry_count
+            if existing and existing.get("status") == "downloaded" and status == "downloaded":
+                data["retry_count"] = existing.get("retry_count", 0) + 1
+                log.info("tracker: retry_count=%d for %s/%s", data["retry_count"], cat, conv_id)
+            self.data[cat][conv_id] = data
             self.save()
 
     def update_status(self, cat: str, conv_id: str, status: str):

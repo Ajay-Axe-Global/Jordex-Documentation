@@ -240,16 +240,21 @@ class InvoiceCarrierService:
 
             row_index = 0
             uploaded  = False
-            while row_index < 10:
-                success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
-                if not success: break
-                inv_file_map = build_invoice_carrier_file_map(item["folder_path"])
-                upload_attachments(jordex_page, item["folder_path"], doc_type, display_name, file_map=inv_file_map)
-                go_back(jordex_page)
-                uploaded = True
-                self._uploaded += 1
-                row_index += 1
-                if rows_found <= row_index: break
-
-            if uploaded:
-                tracker.update_status(CAT, item["conv_id"], "uploaded")
+            try:
+                while row_index < 10:
+                    success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                    if not success: break
+                    inv_file_map = build_invoice_carrier_file_map(item["folder_path"])
+                    upload_attachments(jordex_page, item["folder_path"], doc_type, display_name, file_map=inv_file_map)
+                    go_back(jordex_page)
+                    uploaded = True
+                    self._uploaded += 1
+                    row_index += 1
+                    if rows_found <= row_index: break
+            except Exception as e:
+                log.error(f"[{SERVICE_KEY}] Error during upload loop for {query}: {e}", exc_info=True)
+            finally:
+                if uploaded:
+                    tracker.update_status(CAT, item["conv_id"], "uploaded")
+                else:
+                    log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")

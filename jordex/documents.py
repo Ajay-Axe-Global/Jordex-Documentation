@@ -451,6 +451,9 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
                 actual_type, actual_name = entry
                 actual_comment = ""
         else:
+            if file_map is not None:
+                log.info(f"  Skipping '{filename}' because it is not in the provided file_map.")
+                continue
             actual_type = document_type
             actual_name = display_name or os.path.splitext(filename)[0]
             actual_comment = ""

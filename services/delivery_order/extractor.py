@@ -565,7 +565,7 @@ CARRIER_SCAC = {
     "pil": "PCIU",
     "fps": "FPS", "famous pacific": "FPS", "famous pacific shipping": "FPS",
 }
-KNOWN_SCAC = set(CARRIER_SCAC.values())
+KNOWN_SCAC = set(CARRIER_SCAC.values()).union({"MEDU", "MRKU", "SUDU"})
 CONTAINER_RE = re.compile(r'\b([A-Z]{4})\s*(\d{7})\b')
 
 # ── Address normalization map ────────────────────────────────────────
@@ -1165,12 +1165,12 @@ def _normalize_result(result: dict) -> dict:
         section["reference_mode"] = "per_container"
 
         refs = section.get("references") or []
-        existing_cnos = {_safe_str(r.get("container_no")).upper() for r in refs if r}
+        existing_cnos = {_safe_str(r.get("container_no")).upper().replace(" ", "") for r in refs if r}
         for cno in result["containers"]:
             if cno.upper() not in existing_cnos:
                 refs.append({"container_no": cno, "reference": "", "address": section["address"]})
         for ref in refs:
-            ref["container_no"] = _safe_str(ref.get("container_no")).upper()
+            ref["container_no"] = _safe_str(ref.get("container_no")).upper().replace(" ", "")
             ref["reference"] = _safe_str(ref.get("reference"))
             ref["address"] = _safe_str(ref.get("address")) or section["address"]
         section["references"] = refs

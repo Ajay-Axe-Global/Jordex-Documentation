@@ -14,7 +14,7 @@ from shared.tracker import Tracker
 from shared.helpers import (
     navigate_to_folder, collect_unread, click_row, get_subject,
     download_attachments_to_temp, move_file_to_folder, cleanup_temp,
-    subject_folder_fallback,
+    subject_folder_fallback, normalize_oi_reference,
     mark_as_unread, search_jordex_with_fallback,
 )
 from outlook.session import OutlookSession
@@ -130,6 +130,8 @@ class CustomsDocsService:
                 continue
 
             oi = extract_oi_from_subject(subject)
+            if oi:
+                oi = normalize_oi_reference(oi)
             folder_name = oi if oi else subject_folder_fallback(subject)
             extraction = {
                 "oi_number": oi, "subject": subject,
@@ -271,6 +273,7 @@ class CustomsDocsService:
             if not query:
                 continue
 
+            query = normalize_oi_reference(query)
             success, used_ref, rows_found = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
@@ -287,45 +290,50 @@ class CustomsDocsService:
 
             row_index = 0
             uploaded = False
-            while row_index < 10:
-                success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
-                if not success:
-                    break
+            try:
+                while row_index < 10:
+                    success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                    if not success:
+                        break
 
-                # ── Upload ───────────────────────────────────────────
-                upload_attachments(
-                    jordex_page, item["folder_path"], doc_type, None,
-                    file_map=CUSTOMS_DOCS_FILE_MAP,
-                )
+                    # ── Upload ───────────────────────────────────────────
+                    upload_attachments(
+                        jordex_page, item["folder_path"], doc_type, None,
+                        file_map=CUSTOMS_DOCS_FILE_MAP,
+                    )
 
-                # ── Task status logic ────────────────────────────────
-                task_status = self._read_task_status(jordex_page)
+                    # ── Task status logic ────────────────────────────────
+                    task_status = self._read_task_status(jordex_page)
 
-                if task_status == "completed":
-                    log.info(f"[{SERVICE_KEY}] Task already Completed → skip")
-                else:
-                    has_both = self._check_both_customs_docs_exist(jordex_page)
-                    if has_both:
-                        log.info(f"[{SERVICE_KEY}] Both TTW + TAX found → set Completed")
-                        self._set_task_completed(jordex_page)
+                    if task_status == "completed":
+                        log.info(f"[{SERVICE_KEY}] Task already Completed → skip")
                     else:
-                        log.info(f"[{SERVICE_KEY}] Missing a doc → task stays open")
+                        has_both = self._check_both_customs_docs_exist(jordex_page)
+                        if has_both:
+                            log.info(f"[{SERVICE_KEY}] Both TTW + TAX found → set Completed")
+                            self._set_task_completed(jordex_page)
+                        else:
+                            log.info(f"[{SERVICE_KEY}] Missing a doc → task stays open")
 
-                go_back(jordex_page)
-                uploaded = True
-                self._uploaded += 1
-                row_index += 1
-                if rows_found <= row_index:
-                    break
-
-            if uploaded:
-                status = "uploaded"
-                forward_flags = item.get("forward_flags", [])
-                if forward_flags:
-                    status = "uploaded_needs_forward"
-                    item["forward_reason"] = ", ".join(forward_flags)
-                    log.info(f"[{SERVICE_KEY}] OI={query} needs forward: {forward_flags}")
-                tracker.update_status(CAT, item["conv_id"], status)
+                    go_back(jordex_page)
+                    uploaded = True
+                    self._uploaded += 1
+                    row_index += 1
+                    if rows_found <= row_index:
+                        break
+            except Exception as e:
+                log.error(f"[{SERVICE_KEY}] Error during upload loop for {query}: {e}", exc_info=True)
+            finally:
+                if uploaded:
+                    status = "uploaded"
+                    forward_flags = item.get("forward_flags", [])
+                    if forward_flags:
+                        status = "uploaded_needs_forward"
+                        item["forward_reason"] = ", ".join(forward_flags)
+                        log.info(f"[{SERVICE_KEY}] OI={query} needs forward: {forward_flags}")
+                    tracker.update_status(CAT, item["conv_id"], status)
+                else:
+                    log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
 
     def _check_both_customs_docs_exist(self, page) -> bool:
         """

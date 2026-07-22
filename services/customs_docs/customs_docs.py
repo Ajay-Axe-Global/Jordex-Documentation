@@ -266,11 +266,23 @@ class CustomsDocsService:
         doc_type, _ = JORDEX_MAPPING[CAT]
         normalize_dashboard_filters(jordex_page)
 
+        # Deduplicate: track folder_names already uploaded this batch
+        uploaded_folders: set[str] = set()
+
         for item in items:
             if self._stop_evt.is_set():
                 break
             query = item.get("oi_number") or item.get("folder_name")
             if not query:
+                continue
+
+            folder_name = item.get("folder_name") or query
+            if folder_name in uploaded_folders:
+                log.info(
+                    f"[{SERVICE_KEY}] Skipping duplicate folder '{folder_name}' "
+                    f"(conv_id={item['conv_id'][:20]}…) — already uploaded this batch"
+                )
+                tracker.update_status(CAT, item["conv_id"], "uploaded")
                 continue
 
             query = normalize_oi_reference(query)
@@ -332,6 +344,7 @@ class CustomsDocsService:
                         item["forward_reason"] = ", ".join(forward_flags)
                         log.info(f"[{SERVICE_KEY}] OI={query} needs forward: {forward_flags}")
                     tracker.update_status(CAT, item["conv_id"], status)
+                    uploaded_folders.add(folder_name)
                 else:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
 

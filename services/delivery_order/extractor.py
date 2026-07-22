@@ -905,6 +905,29 @@ RETURN:
 """
 
 # ─────────────────────────────────────────────────────────────────────
+# 11. EVERGREEN (EGLV) — "TELEX RELEASE" / "DELIVERY ORDER"
+# ─────────────────────────────────────────────────────────────────────
+# CRITICAL: Evergreen DO documents do NOT contain pickup/return depot
+# addresses. The real depot data is fetched live from the Evergreen
+# tracking portal (evergreen_portal.py). Do NOT try to guess these.
+CARRIER_PROMPTS["EGLV"] = """Return ONLY valid JSON (no markdown, no backticks):
+{
+  "pickup": {
+    "address": "",
+    "references": []
+  },
+  "return": {
+    "address": "",
+    "references": []
+  },
+  "flag": "evergreen_portal_required"
+}
+This is an Evergreen (EGLV) document. The pickup and return depot data is
+NOT available in this PDF — it is fetched live from the Evergreen web portal.
+Leave all address/reference fields as empty strings. Set flag to "evergreen_portal_required".
+"""
+
+# ─────────────────────────────────────────────────────────────────────
 # DEFAULT — unknown carrier
 # ─────────────────────────────────────────────────────────────────────
 CARRIER_PROMPTS["_DEFAULT"] = _OUTPUT_SCHEMA + """

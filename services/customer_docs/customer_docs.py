@@ -129,7 +129,7 @@ class CustomerDocsService:
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "no_attachment")
                 continue
 
-            pdf_files = [f for f in temp_files if f.lower().endswith(".pdf")]
+            pdf_files = [f for f in temp_files if f.lower().endswith((".pdf", ".jpg", ".jpeg", ".png"))]
 
             if pdf_files and gemini_model:
                 cust_results = classify_all_customer_docs(pdf_files, gemini_model=gemini_model, subject=subject)
@@ -215,10 +215,22 @@ class CustomerDocsService:
         doc_type, display_name = JORDEX_MAPPING[CAT]
         normalize_dashboard_filters(jordex_page)
 
+        # Deduplicate: track folder_names already uploaded this batch
+        uploaded_folders: set[str] = set()
+
         for item in items:
             if self._stop_evt.is_set(): break
             query = item.get("mbl") or item.get("folder_name")
             if not query: continue
+
+            folder_name = item.get("folder_name") or query
+            if folder_name in uploaded_folders:
+                log.info(
+                    f"[{SERVICE_KEY}] Skipping duplicate folder '{folder_name}' "
+                    f"(conv_id={item['conv_id'][:20]}…) — already uploaded this batch"
+                )
+                tracker.update_status(CAT, item["conv_id"], "uploaded")
+                continue
 
             query = normalize_oi_reference(query)
             success, used_ref, rows_found = search_jordex_with_fallback(
@@ -256,5 +268,6 @@ class CustomerDocsService:
             finally:
                 if uploaded:
                     tracker.update_status(CAT, item["conv_id"], "uploaded")
+                    uploaded_folders.add(folder_name)
                 else:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")

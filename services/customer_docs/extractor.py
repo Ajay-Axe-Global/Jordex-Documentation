@@ -159,7 +159,7 @@ CRITICAL CONSIGNEE RULES:
   - JORDEX in Notify Party, Delivery Agent, or anywhere else does NOT count as the Consignee.
   - ONLY the CONSIGNEE box determines MBL vs HBL.
   - EXCEPTION FOR LOGOS/CARRIERS: A prominent carrier/NVOCC logo (e.g. BEE LOGISTICS, Hapag-Lloyd, ZIM, etc.) at the top does NOT make it an MBL. If the Consignee is NOT Jordex, you MUST classify it as a HOUSE BILL OF LADING, regardless of the logo.
-  - EXCEPTION FOR FIATA / FBL: "FIATA Multimodal Transport Bill of Lading" documents are typically forwarder bills. If the Consignee is NOT Jordex, classify it strictly as a HOUSE BILL OF LADING.
+  - EXCEPTION FOR FORWARDERS: If the document explicitly says it is issued by a Freight Forwarder (e.g. "MRF INTERNATIONAL FORWARDING", "KUEHNE+NAGEL", "FIATA"), it is ALWAYS a HOUSE BILL OF LADING. Master Bills are ONLY issued by actual ocean carriers (MSC, Maersk, etc).
 
 =====================================================================
 STEP 3 — EXTRACT REFERENCE NUMBER AND DOC TITLE
@@ -395,13 +395,20 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
     # ── Gemini path ──────────────────────────────────────────────────
     if gemini_model is not None:
         try:
+            ext = os.path.splitext(pdf_path)[1].lower()
+            mime_type = "application/pdf"
+            if ext in (".jpg", ".jpeg"):
+                mime_type = "image/jpeg"
+            elif ext == ".png":
+                mime_type = "image/png"
+
             with open(pdf_path, "rb") as f:
-                pdf_bytes = f.read()
+                doc_bytes = f.read()
 
             resp = gemini_model.generate_content(
                 [
-                    {"mime_type": "application/pdf",
-                     "data": base64.b64encode(pdf_bytes).decode()},
+                    {"mime_type": mime_type,
+                     "data": base64.b64encode(doc_bytes).decode()},
                     CUSTOMER_DOC_CLASSIFY_PROMPT,
                 ],
                 generation_config={"temperature": 0.0, "max_output_tokens": 300},
@@ -414,6 +421,11 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
 
             doc_type = (parsed.get("doc_type") or "ADDITIONAL FILES").strip().upper()
             reference_number = (parsed.get("reference_number") or "").strip().upper() or None
+            
+            # Normalise common OCR error: "01" instead of "OI"
+            if reference_number and reference_number.startswith("01") and len(reference_number) >= 7:
+                reference_number = "OI" + reference_number[2:]
+                
             container_no = (parsed.get("container_no") or "").strip().upper() or None
             doc_title = (parsed.get("doc_title") or "").strip() or None
             confidence = (parsed.get("confidence") or "high").strip().lower()

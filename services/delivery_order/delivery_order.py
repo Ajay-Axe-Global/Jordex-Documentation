@@ -254,6 +254,7 @@ from jordex.login import JordexSession
 from jordex.browser import normalize_dashboard_filters, search_and_open, go_back, apply_zoom
 from jordex.documents import upload_attachments
 from services.delivery_order.extractor import extract_delivery_order
+from services.delivery_order.evergreen_portal import scrape_evergreen_depot
 
 log = logging.getLogger("service.delivery_order")
 
@@ -406,6 +407,27 @@ class DeliveryOrderService:
         pdf_to_ext = {}
         for pdf_path in pdf_files:
             ext = extract_delivery_order(pdf_path, gemini_model=gemini_model)
+
+            # ── Evergreen portal scrape ──────────────────────────────
+            if ext.get("scac") == "EGLV" and ext.get("mbl"):
+                log.info(f"[{SERVICE_KEY}] Evergreen carrier detected for '{os.path.basename(pdf_path)}' — scraping depot portal")
+                try:
+                    from playwright.sync_api import sync_playwright as _spw
+                    with _spw() as _pw:
+                        ev_data = scrape_evergreen_depot(
+                            mbl_full=ext["mbl"],
+                            pw=_pw,
+                            gemini_model=gemini_model,
+                        )
+                    if ev_data:
+                        ext = self._merge_evergreen_data(ext, ev_data)
+                        log.info(f"[{SERVICE_KEY}] Evergreen depot data merged for {ext['mbl']}")
+                    else:
+                        log.warning(f"[{SERVICE_KEY}] Evergreen portal scrape returned nothing — proceeding without depot data")
+                except Exception as ev_err:
+                    log.error(f"[{SERVICE_KEY}] Evergreen portal error: {ev_err}", exc_info=True)
+            # ────────────────────────────────────────────────────────
+
             folder_name = ext.get("folder_name") or subject_folder_fallback(subject)
             pdf_to_ext[pdf_path] = (ext, folder_name)
     
@@ -497,6 +519,20 @@ class DeliveryOrderService:
     
         return processed
 
+    def _merge_evergreen_data(self, ext: dict, ev_data: dict) -> dict:
+        """
+        Merge Evergreen portal scrape result into the DO extraction dict.
+        Overwrites pickup and return sections with the live-scraped depot data.
+        Preserves all other fields (mbl, containers, scac, etc.).
+        """
+        ext["pickup"] = ev_data["pickup"]
+        ext["return"] = ev_data["return"]
+        ext["evergreen_bl"] = ev_data.get("evergreen_bl", "")
+        # Clear the portal_required flag now that we have real data
+        if ext.get("flag") == "evergreen_portal_required":
+            ext["flag"] = ""
+        return ext
+
     # ══════════════════════════════════════════════════════════════════
     #  JORDEX UPLOAD (with destination fill BEFORE upload)
     # ══════════════════════════════════════════════════════════════════
@@ -529,6 +565,9 @@ class DeliveryOrderService:
         doc_type, display_name = JORDEX_MAPPING[CAT]
         normalize_dashboard_filters(jordex_page)
  
+        # Deduplicate: track folder_names already uploaded this batch
+        uploaded_folders: set[str] = set()
+
         for item in items:
             if self._stop_evt.is_set():
                 break
@@ -536,6 +575,15 @@ class DeliveryOrderService:
             if not query:
                 continue
  
+            folder_name = item.get("folder_name") or query
+            if folder_name in uploaded_folders:
+                log.info(
+                    f"[{SERVICE_KEY}] Skipping duplicate folder '{folder_name}' "
+                    f"(conv_id={item.get('conv_id', '')[:20]}…) — already uploaded this batch"
+                )
+                tracker.update_status(CAT, item.get("conv_id"), "uploaded")
+                continue
+
             query = normalize_oi_reference(query)
  
             success, used_ref, rows_found = search_jordex_with_fallback(
@@ -598,6 +646,7 @@ class DeliveryOrderService:
  
             if uploaded:
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
+                uploaded_folders.add(folder_name)
 
     # ══════════════════════════════════════════════════════════════════
     #  DESTINATION FILL — View Routing → 3. Destination

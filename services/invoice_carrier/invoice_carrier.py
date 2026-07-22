@@ -215,6 +215,9 @@ class InvoiceCarrierService:
         doc_type, display_name = JORDEX_MAPPING[CAT]
         normalize_dashboard_filters(jordex_page)
 
+        # Deduplicate: track folder_names already uploaded this batch
+        uploaded_folders: set[str] = set()
+
         for item in items:
             if self._stop_evt.is_set(): break
             query = item.get("mbl") or item.get("folder_name")
@@ -222,6 +225,15 @@ class InvoiceCarrierService:
             if query.startswith("OE"):
                 query = normalize_oi_reference(query)
                 tracker.update_status(CAT, item["conv_id"], "Skipped")
+                continue
+
+            folder_name = item.get("folder_name") or query
+            if folder_name in uploaded_folders:
+                log.info(
+                    f"[{SERVICE_KEY}] Skipping duplicate folder '{folder_name}' "
+                    f"(conv_id={item['conv_id'][:20]}…) — already uploaded this batch"
+                )
+                tracker.update_status(CAT, item["conv_id"], "uploaded")
                 continue
 
             success, used_ref, rows_found = search_jordex_with_fallback(
@@ -256,5 +268,7 @@ class InvoiceCarrierService:
             finally:
                 if uploaded:
                     tracker.update_status(CAT, item["conv_id"], "uploaded")
+                    uploaded_folders.add(folder_name)
                 else:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
+

@@ -264,7 +264,7 @@ class CustomsDocsService:
         3. If task already Completed → skip
         """
         doc_type, _ = JORDEX_MAPPING[CAT]
-        normalize_dashboard_filters(jordex_page)
+
 
         # Deduplicate: track folder_names already uploaded this batch
         uploaded_folders: set[str] = set()

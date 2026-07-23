@@ -213,7 +213,7 @@ class CustomerDocsService:
 
     def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
         doc_type, display_name = JORDEX_MAPPING[CAT]
-        normalize_dashboard_filters(jordex_page)
+
 
         # Deduplicate: track folder_names already uploaded this batch
         uploaded_folders: set[str] = set()

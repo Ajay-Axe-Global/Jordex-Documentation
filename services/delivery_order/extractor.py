@@ -614,6 +614,7 @@ doc_subtype rules:
 - "other": anything else.
 
 MBL: starts with SCAC (HLCU, MAEU, MRKU, MSCU, MEDU, ONEY, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU, HDMU).
+*EXCEPTION*: For Maersk (MAEU), the B/L number is often purely numeric (e.g., "270557106"). If you see "B/L number: [digits]", extract exactly those digits. Do NOT extract the "Request Number" (like "HZJQCNSXZ5K") as the MBL.
 Container: 4 uppercase letters + 7 digits. Use "" for missing values. Pure JSON only, no markdown."""
 
 
@@ -910,18 +911,7 @@ RETURN:
 # CRITICAL: Evergreen DO documents do NOT contain pickup/return depot
 # addresses. The real depot data is fetched live from the Evergreen
 # tracking portal (evergreen_portal.py). Do NOT try to guess these.
-CARRIER_PROMPTS["EGLV"] = """Return ONLY valid JSON (no markdown, no backticks):
-{
-  "pickup": {
-    "address": "",
-    "references": []
-  },
-  "return": {
-    "address": "",
-    "references": []
-  },
-  "flag": "evergreen_portal_required"
-}
+CARRIER_PROMPTS["EGLV"] = _OUTPUT_SCHEMA + """
 This is an Evergreen (EGLV) document. The pickup and return depot data is
 NOT available in this PDF — it is fetched live from the Evergreen web portal.
 Leave all address/reference fields as empty strings. Set flag to "evergreen_portal_required".
@@ -1188,7 +1178,13 @@ def _normalize_result(result: dict) -> dict:
         section["reference_mode"] = "per_container"
 
         refs = section.get("references") or []
-        existing_cnos = {_safe_str(r.get("container_no")).upper().replace(" ", "") for r in refs if r}
+        
+        # Robustness: If AI returned list of strings instead of dicts, convert them
+        for i in range(len(refs)):
+            if isinstance(refs[i], str):
+                refs[i] = {"container_no": refs[i], "reference": "", "address": section.get("address", "")}
+                
+        existing_cnos = {_safe_str(r.get("container_no")).upper().replace(" ", "") for r in refs if r and isinstance(r, dict)}
         for cno in result["containers"]:
             if cno.upper() not in existing_cnos:
                 refs.append({"container_no": cno, "reference": "", "address": section["address"]})

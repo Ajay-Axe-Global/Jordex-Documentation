@@ -280,7 +280,7 @@ class ArrivalNoticeService:
         """Upload downloaded files to Jordex for each processed item."""
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
-        normalize_dashboard_filters(jordex_page)
+
 
         # Deduplicate: track folder_names already uploaded this batch
         uploaded_folders: set[str] = set()
@@ -343,6 +343,7 @@ class ArrivalNoticeService:
 
             row_index = 0
             uploaded  = False
+            mismatch_found = False
 
             try:
                 while row_index < 10:  # max 10 rows per shipment
@@ -353,6 +354,9 @@ class ArrivalNoticeService:
                     # Arrival date guard — skip if Jordex date differs > 5 days
                     skip_an = self._check_arrival_date_mismatch(jordex_page, item)
                     if skip_an:
+                        tracker.update_status(CAT, item["conv_id"], "Data Mismatch")
+                        mark_as_unread(outlook_page, item["conv_id"])
+                        mismatch_found = True
                         go_back(jordex_page)
                         break
 
@@ -385,7 +389,7 @@ class ArrivalNoticeService:
                 if uploaded:
                     tracker.update_status(CAT, item["conv_id"], "uploaded")
                     uploaded_folders.add(folder_name)
-                else:
+                elif not mismatch_found:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
 
     def _check_arrival_date_mismatch(self, jordex_page, item: dict) -> bool:

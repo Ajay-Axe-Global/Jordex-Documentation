@@ -14,122 +14,6 @@ def _wait_loading(page, timeout=12000):
     except: pass
     page.wait_for_timeout(800)
 
-def _identify_filters(page):
-    return page.evaluate("""() => {
-        const containers = [...document.querySelectorAll('.filter-select-container')];
-        const map = {};
-        containers.forEach((c, i) => {
-            const text = (c.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-            const hasLabel = c.querySelector('.filter-select-label');
-            const labelText = hasLabel ? hasLabel.innerText.trim().toLowerCase() : '';
-            const isActive = c.classList.contains('active');
-            const hasClear = !!c.querySelector('.filter-clear');
-
-            // ── Filters WITH a label (unselected / default state) ──
-            if (labelText.includes('load type'))       { map['load_type'] = i; return; }
-            if (labelText.includes('order'))            { map['order_by'] = i; return; }
-            if (labelText.includes('from'))             { map['from'] = i; return; }
-            if (labelText.includes('to '))              { map['to'] = i; return; }
-            if (labelText.includes('origin'))           { map['origin'] = i; return; }
-            if (labelText.includes('direction'))        { map['direction'] = i; return; }
-            if (labelText.includes('status'))           { map['status'] = i; return; }
-
-            // ── Filters WITHOUT a label (active / selected state) ──
-            // Status: "Active", "Inactive", "Completed"
-            if (/^(active|inactive|completed|all)/.test(text) && !text.includes('from') && !text.includes('to ')) {
-                if (!map['status']) map['status'] = i;
-                return;
-            }
-            // Direction: "Import", "Export"  
-            if (/^(import|export)/.test(text)) {
-                if (!map['direction']) map['direction'] = i;
-                return;
-            }
-            // Load type when active: "FCL", "LCL" (but not "All" — that's ambiguous)
-            if (/^(fcl|lcl)/.test(text)) {
-                if (!map['load_type']) map['load_type'] = i;
-                return;
-            }
-
-            // ── Date filters (active chips like "From 12 Jul", "To 20 Jul") ──
-            if (/\\d{1,2}\\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(text)) {
-                if (text.startsWith('from') || text.startsWith('van')) {
-                    map['from'] = i;
-                } else if (text.startsWith('to') || text.startsWith('tot')) {
-                    map['to'] = i;
-                } else if (!map['from']) {
-                    map['from'] = i;  // generic date → treat as "from"
-                } else {
-                    map['to'] = i;
-                }
-                return;
-            }
-
-            // ── Order-by when active: "Arrival", "Departure", "ETA", etc. ──
-            if (isActive && hasClear && !map['order_by']) {
-                // If we get here, it's an active filter with a clear button
-                // that didn't match status/direction/load/date → likely order_by
-                if (/^(arrival|departure|eta|etd|created|updated|ata|atd)/.test(text)) {
-                    map['order_by'] = i;
-                    return;
-                }
-            }
-        });
-        return map;
-    }""")
-
-def _get_filter_value(page, index):
-    return page.evaluate(f"""() => {{
-        const c = document.querySelectorAll('.filter-select-container')[{index}];
-        if (!c) return '';
-        const items = [...c.querySelectorAll('.filter-select-container-item')];
-        const texts = items
-            .filter(el => !el.classList.contains('filter-select-label'))
-            .map(el => (el.innerText || '').trim())
-            .filter(t => t && !t.includes('\\u00a0'));
-        return texts[0] || '';
-    }}""")
-
-def _click_filter_arrow(page, index, timeout=3000):
-    containers = page.locator(".filter-select-container")
-    container = containers.nth(index)
-    arrow = container.locator(".pointer.el-icon-arrow-right")
-    arrow.click(timeout=timeout)
-    page.wait_for_timeout(600)
-
-def _click_filter_clear(page, index, timeout=3000):
-    containers = page.locator(".filter-select-container")
-    container = containers.nth(index)
-    clear_btn = container.locator(".filter-clear.el-icon-circle-close")
-    try:
-        if clear_btn.is_visible(timeout=1500):
-            clear_btn.click(timeout=timeout)
-            page.wait_for_timeout(500)
-            _wait_loading(page)
-            return True
-    except: pass
-    return False
-
-def _select_dropdown_option(page, option_text, timeout=3000):
-    try:
-        # Check if already selected
-        selected_opt = page.locator("li.selected:visible").filter(has_text=option_text).first
-        if selected_opt.is_visible(timeout=500):
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
-            return
-    except: pass
-
-    try:
-        page.get_by_role("main").locator("li").filter(has_text=option_text).first.click(timeout=timeout)
-    except:
-        try:
-            page.locator("li:visible").filter(has_text=option_text).first.click(timeout=timeout)
-        except: pass
-        
-    page.wait_for_timeout(500)
-    _wait_loading(page)
-
 def normalize_dashboard_filters(page, timeout=3000):
     if not page.url.endswith("ocean"):
         log.info("Navigating to shipment list before normalizing filters...")
@@ -138,40 +22,94 @@ def normalize_dashboard_filters(page, timeout=3000):
             page.wait_for_timeout(3000)
         except: pass
 
-    log.info("Normalizing Jordex dashboard filters...")
+    log.info("Normalizing Jordex dashboard filters (fast JS evaluation)...")
     try:
-        page.wait_for_timeout(2000)
-        fmap = _identify_filters(page)
+        page.evaluate("""() => {
+  const TARGET = { status: "Active", loadType: "All", shipment: "Import", orderBy: "", from: "" };
 
-        if 'status' in fmap:
-            try:
-                current = _get_filter_value(page, fmap['status']).strip().lower()
-                if current != 'active':
-                    _click_filter_arrow(page, fmap['status'], timeout)
-                    _select_dropdown_option(page, "Active", timeout)
-            except: pass
+  function getValue(filter, label = null) {
+    if (!filter) return "";
+    const items = filter.querySelectorAll(".filter-select-container-item");
+    if (!items.length) return "";
+    if (label && items[0].classList.contains("filter-select-label") && items[0].innerText.trim() === label)
+      return items.length > 1 ? items[1].innerText.trim() : "";
+    return items[0].innerText.trim();
+  }
 
-        if 'load_type' in fmap:
-            try:
-                current = _get_filter_value(page, fmap['load_type']).strip().lower()
-                if current != 'all':
-                    _click_filter_arrow(page, fmap['load_type'], timeout)
-                    _select_dropdown_option(page, "All", timeout)
-            except: pass
+  function readState() {
+    const f = document.querySelectorAll(".filter-select-container");
+    if (f.length < 5) return { status: "", loadType: "", shipment: "", orderBy: "", from: "" };
+    return {
+      status:   getValue(f[0]),
+      loadType: getValue(f[1], "Load type"),
+      shipment: getValue(f[2]),
+      orderBy:  getValue(f[3], "Order by"),
+      from:     getValue(f[4], "From"),
+    };
+  }
 
-        if 'direction' in fmap:
-            try:
-                current = _get_filter_value(page, fmap['direction']).strip().lower()
-                if current != 'import':
-                    _click_filter_arrow(page, fmap['direction'], timeout)
-                    _select_dropdown_option(page, "Import", timeout)
-            except: pass
+  const FILTER_MAP = [
+    { index: 0, key: "status",   target: TARGET.status   },
+    { index: 1, key: "loadType", target: TARGET.loadType },
+    { index: 2, key: "shipment", target: TARGET.shipment },
+    { index: 3, key: "orderBy",  target: TARGET.orderBy  },
+    { index: 4, key: "from",     target: TARGET.from     },
+  ];
 
-        for f in ['order_by', 'from', 'to']:
-            if f in fmap:
-                try: _click_filter_clear(page, fmap[f])
-                except: pass
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+  function reactClick(el) {
+    if (!el) return;
+    ["mousedown", "mouseup", "click"].forEach(t =>
+      el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true }))
+    );
+  }
+
+  function findVisibleByText(text) {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    const hits = [];
+    let n;
+    while ((n = walker.nextNode()))
+      if (n.children.length <= 1 && n.innerText?.trim() === text) hits.push(n);
+    return hits.find(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }) || null;
+  }
+
+  async function clearFilter(index) {
+    const filter = document.querySelectorAll(".filter-select-container")[index];
+    const icon = filter?.querySelector("i.filter-clear.el-icon-circle-close");
+    if (icon) reactClick(icon);
+    await sleep(200);
+  }
+
+  async function setFilter(index, target) {
+    const filter = document.querySelectorAll(".filter-select-container")[index];
+    reactClick(filter);
+    await sleep(300);
+    const el = findVisibleByText(target);
+    if (el) reactClick(el);
+    else document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(200);
+  }
+
+  return (async () => {
+    const state = readState();
+    if (!state) return true;
+    const mismatches = FILTER_MAP.filter(({ key, target }) => state[key] !== target);
+    if (!mismatches.length) return true;
+
+    for (const { index, key, target } of mismatches) {
+      const current = state[key];
+      if (current === target) continue;
+      if (target === "") {
+        await clearFilter(index);
+      } else {
+        if (current !== "") await clearFilter(index);
+        await setFilter(index, target);
+      }
+    }
+    return true;
+  })();
+}""")
         page.wait_for_timeout(1000)
     except Exception as e:
         log.warning(f"Filter normalization issue: {e}")
@@ -184,6 +122,8 @@ def search_and_open(page, query, row_index=0):
             page.wait_for_timeout(3000)
         except: pass
         
+    normalize_dashboard_filters(page)
+    
     log.info(f"Searching for {query} in Jordex (row index: {row_index})...")
     try:
         page.locator(".el-table__body").first.wait_for(state="visible", timeout=10000)

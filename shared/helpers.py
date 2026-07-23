@@ -129,8 +129,11 @@ def get_subject(page: Page) -> str:
 
 def download_attachments_to_temp(page: Page) -> list[str]:
     """Download all attachments to a temp directory. Returns list of temp file paths."""
+    # Broaden container selector to catch 'av-container' (used for images)
     ctr = page.locator(
-        "#ReadingPaneContainerId div[role='listbox'][aria-label='file attachments']"
+        "#ReadingPaneContainerId div[role='listbox'][aria-label='file attachments'],"
+        "#ReadingPaneContainerId div[role='listbox'][aria-label='bijlagen'],"
+        "#ReadingPaneContainerId div.av-container"
     ).first
     try:
         ctr.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
@@ -146,7 +149,16 @@ def download_attachments_to_temp(page: Page) -> list[str]:
         fname = _att_name(att)
         log.info(f"  Downloading: {fname}")
         try:
-            att.locator("button[aria-label='More actions']").first.click()
+            att.hover()
+            page.wait_for_timeout(500)
+            
+            more_btn = att.locator("button[aria-label='More actions']").first
+            if more_btn.is_visible():
+                more_btn.click()
+            else:
+                # Fallback for images: right-click to open context menu
+                att.click(button="right")
+                
             page.wait_for_timeout(1000)
             dl_btn = page.locator(
                 "div[role='menu'] button:has-text('Download'),"

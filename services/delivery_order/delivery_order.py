@@ -1,228 +1,4 @@
-# """
-# services/delivery_order/delivery_order.py — Delivery Order Service
-# ===================================================================
-# Handles "02.Delivery Order" Outlook label.
-# Owns its own Playwright instances with isolated profiles.
-# Multi-PDF support: each PDF may have its own MBL → its own folder.
-# """
-# import os, json, logging, threading, time
-# from datetime import datetime
-# from playwright.sync_api import sync_playwright
 
-# from config import OUTPUT_DIR, JORDEX_MAPPING, ROUND_ROBIN_BATCH
-# from extractor import gemini_model, save_result
-# from shared.tracker import Tracker
-# from shared.helpers import (
-#     navigate_to_folder, collect_unread, click_row, get_subject,
-#     download_attachments_to_temp, move_file_to_folder, cleanup_temp,
-#     subject_folder_fallback,
-# )
-# from outlook.session import OutlookSession
-# from jordex.login import JordexSession
-# from jordex.browser import normalize_dashboard_filters, search_and_open, go_back
-# from jordex.documents import upload_attachments
-# from services.delivery_order.extractor import extract_delivery_order
-
-# log = logging.getLogger("service.delivery_order")
-
-# SERVICE_KEY   = "delivery_order"
-# OUTLOOK_LABEL = "02.Delivery Order"
-# CAT           = "Delivery_Order"
-
-
-# class DeliveryOrderService:
-#     def __init__(self):
-#         self.status     = "idle"
-#         self.error      = None
-#         self._thread    = None
-#         self._stop_evt  = threading.Event()
-#         self._processed = 0
-#         self._uploaded  = 0
-#         self.last_run   = None
-
-#     def start(self):
-#         if self.status == "running":
-#             return {"ok": False, "message": "Already running"}
-#         self._stop_evt.clear()
-#         self._thread = threading.Thread(target=self._run, daemon=True, name=f"svc-{SERVICE_KEY}")
-#         self._thread.start()
-#         self.status = "running"
-#         return {"ok": True, "message": "Started"}
-
-#     def stop(self):
-#         if self.status != "running":
-#             return {"ok": False, "message": "Not running"}
-#         self._stop_evt.set()
-#         self.status = "stopping"
-#         return {"ok": True, "message": "Stop signal sent"}
-
-#     def get_status(self) -> dict:
-#         tracker = Tracker()
-#         stats   = tracker.stats(CAT)
-#         return {
-#             "service":   SERVICE_KEY,
-#             "label":     OUTLOOK_LABEL,
-#             "status":    self.status,
-#             "error":     self.error,
-#             "processed": stats.get("total", 0),      # from tracking.json
-#             "uploaded":  stats.get("uploaded", 0),   # from tracking.json
-#             "last_run":  self.last_run,
-#             "stats":     stats,
-#         }
-
-#     def _run(self):
-#         pw = outlook_session = jordex_session = None
-#         try:
-#             pw              = sync_playwright().start()
-#             outlook_session = OutlookSession(service_key=SERVICE_KEY, pw=pw)
-#             jordex_session  = JordexSession(service_key=SERVICE_KEY, pw=pw)
-#             outlook_page    = outlook_session.start()
-#             jordex_page     = jordex_session.start()
-#             tracker         = Tracker()
-
-#             while not self._stop_evt.is_set():
-#                 self.last_run = datetime.now().isoformat()
-#                 items = self._process_batch(outlook_page, tracker)
-#                 if items:
-#                     self._upload_to_jordex(jordex_page, tracker, items)
-#                 for _ in range(ROUND_ROBIN_BATCH * 2):
-#                     if self._stop_evt.is_set(): break
-#                     time.sleep(1)
-
-#         except Exception as e:
-#             log.error(f"[{SERVICE_KEY}] Fatal: {e}", exc_info=True)
-#             self.error  = str(e)
-#             self.status = "error"
-#         finally:
-#             for s in [outlook_session, jordex_session]:
-#                 if s:
-#                     try: s.close()
-#                     except Exception: pass
-#             if pw:
-#                 try: pw.stop()
-#                 except Exception: pass
-#             if self.status != "error":
-#                 self.status = "idle"
-
-#     def _process_batch(self, page, tracker: Tracker) -> list:
-#         navigate_to_folder(page, OUTLOOK_LABEL)
-#         msgs = collect_unread(page, tracker, CAT, limit=ROUND_ROBIN_BATCH)
-#         if not msgs:
-#             return []
-
-#         base            = os.path.join(OUTPUT_DIR, CAT)
-#         processed_items = []
-
-#         for msg in msgs:
-#             if self._stop_evt.is_set(): break
-#             cid = msg["conv_id"]
-
-#             if not click_row(page, cid):
-#                 tracker.mark(CAT, cid, "", "", [], "failed")
-#                 continue
-
-#             subject    = get_subject(page) or cid[:40]
-#             temp_files = download_attachments_to_temp(page)
-
-#             if not temp_files:
-#                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "no_attachment")
-#                 continue
-
-#             pdf_files = [f for f in temp_files if f.lower().endswith(".pdf")]
-
-#             if gemini_model and pdf_files:
-#                 # Multi-PDF: each PDF may have a different MBL
-#                 multi_items = self._process_multi_pdfs(pdf_files, temp_files, base, subject, cid)
-#                 cleanup_temp(temp_files)
-
-#                 if multi_items:
-#                     all_mbls  = [it["mbl"] for it in multi_items if it.get("mbl")]
-#                     all_files = [f for it in multi_items for f in it.get("files", [])]
-#                     tracker.mark(
-#                         CAT, cid, subject,
-#                         multi_items[0]["folder_name"], all_files, "downloaded",
-#                         mbl=all_mbls[0] if all_mbls else None,
-#                     )
-#                     for it in multi_items:
-#                         it["conv_id"] = cid
-#                         self._processed += 1
-#                         processed_items.append(it)
-#                 else:
-#                     tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "failed")
-#             else:
-#                 cleanup_temp(temp_files)
-#                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "failed")
-
-#         return processed_items
-
-#     def _process_multi_pdfs(self, pdf_files, all_temp_files, base, subject, cid) -> list:
-#         pdf_to_ext  = {}
-#         for pdf_path in pdf_files:
-#             ext         = extract_delivery_order(pdf_path, gemini_model=gemini_model)
-#             folder_name = ext.get("folder_name") or subject_folder_fallback(subject)
-#             pdf_to_ext[pdf_path] = (ext, folder_name)
-
-#         folder_groups: dict[str, dict] = {}
-#         for pdf_path, (ext, folder_name) in pdf_to_ext.items():
-#             if folder_name not in folder_groups:
-#                 folder_groups[folder_name] = {"extraction": ext, "pdfs": []}
-#             folder_groups[folder_name]["pdfs"].append(pdf_path)
-
-#         # Non-PDF temps go to first folder
-#         non_pdfs    = [f for f in all_temp_files if not f.lower().endswith(".pdf")]
-#         first_folder = next(iter(folder_groups)) if folder_groups else None
-#         if first_folder and non_pdfs:
-#             folder_groups[first_folder]["pdfs"] = non_pdfs + folder_groups[first_folder]["pdfs"]
-
-#         processed = []
-#         for folder_name, group in folder_groups.items():
-#             final_dir = os.path.join(base, folder_name)
-#             os.makedirs(final_dir, exist_ok=True)
-#             saved     = []
-#             for tmp in group["pdfs"]:
-#                 if not os.path.exists(tmp): continue
-#                 s = move_file_to_folder(tmp, final_dir)
-#                 if s: saved.append(s)
-
-#             ext = group["extraction"]
-#             ext["subject"] = subject
-#             save_result(ext, final_dir)
-
-#             mbl_val = ext.get("mbl") or ext.get("reference")
-#             processed.append({
-#                 "cat":         CAT,
-#                 "folder_path": final_dir,
-#                 "folder_name": folder_name,
-#                 "mbl":         mbl_val,
-#                 "files":       saved,
-#                 "oi_number":   None,
-#             })
-
-#         return processed
-
-#     def _upload_to_jordex(self, jordex_page, tracker: Tracker, items: list):
-#         doc_type, display_name = JORDEX_MAPPING[CAT]
-#         normalize_dashboard_filters(jordex_page)
-
-#         for item in items:
-#             if self._stop_evt.is_set(): break
-#             query = item.get("mbl") or item.get("folder_name")
-#             if not query: continue
-
-#             row_index = 0
-#             uploaded  = False
-#             while row_index < 10:
-#                 success, rows_found = search_and_open(jordex_page, query, row_index=row_index)
-#                 if not success: break
-#                 upload_attachments(jordex_page, item["folder_path"], doc_type, display_name)
-#                 go_back(jordex_page)
-#                 uploaded = True
-#                 self._uploaded += 1
-#                 row_index += 1
-#                 if rows_found <= row_index: break
-
-#             if uploaded:
-#                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
 
 """
 services/delivery_order/delivery_order.py — Delivery Order Service
@@ -319,7 +95,7 @@ class DeliveryOrderService:
 
             while not self._stop_evt.is_set():
                 self.last_run = datetime.now().isoformat()
-                items = self._process_batch(outlook_page, tracker)
+                items = self._process_batch(outlook_page, tracker, pw=pw)
                 if items:
                     self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
@@ -345,7 +121,7 @@ class DeliveryOrderService:
     #  EMAIL PROCESSING (download + extract)
     # ══════════════════════════════════════════════════════════════════
 
-    def _process_batch(self, page, tracker: Tracker) -> list:
+    def _process_batch(self, page, tracker: Tracker, pw=None) -> list:
         navigate_to_folder(page, OUTLOOK_LABEL)
         msgs = collect_unread(page, tracker, CAT, limit=ROUND_ROBIN_BATCH)
         if not msgs:
@@ -372,7 +148,7 @@ class DeliveryOrderService:
             pdf_files = [f for f in temp_files if f.lower().endswith(".pdf")]
 
             if gemini_model and pdf_files:
-                multi_items = self._process_multi_pdfs(pdf_files, temp_files, base, subject, cid)
+                multi_items = self._process_multi_pdfs(pdf_files, temp_files, base, subject, cid, pw=pw)
                 cleanup_temp(temp_files)
 
                 if multi_items:
@@ -397,7 +173,7 @@ class DeliveryOrderService:
 
         return processed_items
 
-    def _process_multi_pdfs(self, pdf_files, all_temp_files, base, subject, cid) -> list:
+    def _process_multi_pdfs(self, pdf_files, all_temp_files, base, subject, cid, pw=None) -> list:
         """
         Process multiple PDFs. Each PDF is classified as:
         - delivery_order → full extraction, upload as "Container release" / "DO"
@@ -412,13 +188,15 @@ class DeliveryOrderService:
             if ext.get("scac") == "EGLV" and ext.get("mbl"):
                 log.info(f"[{SERVICE_KEY}] Evergreen carrier detected for '{os.path.basename(pdf_path)}' — scraping depot portal")
                 try:
-                    from playwright.sync_api import sync_playwright as _spw
-                    with _spw() as _pw:
+                    if pw:
                         ev_data = scrape_evergreen_depot(
                             mbl_full=ext["mbl"],
-                            pw=_pw,
+                            pw=pw,
                             gemini_model=gemini_model,
                         )
+                    else:
+                        log.warning(f"[{SERVICE_KEY}] No Playwright context available for Evergreen scrape")
+                        ev_data = None
                     if ev_data:
                         ext = self._merge_evergreen_data(ext, ev_data)
                         log.info(f"[{SERVICE_KEY}] Evergreen depot data merged for {ext['mbl']}")
@@ -428,7 +206,30 @@ class DeliveryOrderService:
                     log.error(f"[{SERVICE_KEY}] Evergreen portal error: {ev_err}", exc_info=True)
             # ────────────────────────────────────────────────────────
 
-            folder_name = ext.get("folder_name") or subject_folder_fallback(subject)
+            folder_name = ext.get("folder_name") or ""
+
+            # ── Acknowledgement MBL fix ──────────────────────────────
+            # If no folder_name (MBL missing from doc), try to recover the
+            # BL from the subject and prepend the SCAC code so Jordex can
+            # find the shipment.
+            if not folder_name and ext.get("doc_subtype") in ("acknowledgement", "other"):
+                scac = ext.get("scac", "")
+                # Try to extract a BL-like number from the subject
+                # Pattern: 6–15 digit/alphanum group that appears in the subject
+                bl_candidates = re.findall(r'\b([A-Z0-9]{6,15})\b', subject.upper())
+                # Filter out known non-BL tokens (request numbers usually mixed-case alpha)
+                for cand in bl_candidates:
+                    if re.match(r'^\d+$', cand) and len(cand) >= 6:
+                        # Pure numeric → likely BL (e.g. 270557106)
+                        folder_name = (scac + cand) if scac else cand
+                        ext["mbl"] = folder_name
+                        ext["folder_name"] = folder_name
+                        log.info(f"[{SERVICE_KEY}] Recovered BL from subject: '{folder_name}'")
+                        break
+
+            if not folder_name:
+                folder_name = subject_folder_fallback(subject)
+
             pdf_to_ext[pdf_path] = (ext, folder_name)
     
         folder_groups: dict[str, dict] = {}
@@ -563,7 +364,7 @@ class DeliveryOrderService:
           - Destination fill → ONLY if extraction exists (i.e. actual DO)
         """
         doc_type, display_name = JORDEX_MAPPING[CAT]
-        normalize_dashboard_filters(jordex_page)
+
  
         # Deduplicate: track folder_names already uploaded this batch
         uploaded_folders: set[str] = set()
@@ -658,21 +459,17 @@ class DeliveryOrderService:
           3.1 Pick-up Terminal: fill address + reference
           3.3 Return Terminal: fill address + reference
         Then save and go back to shipment detail.
-
-        Data comes from extraction JSON:
-          pickup.address, pickup.reference, pickup.reference_mode
-          return.references[] (per-container), return.address, return.reference
         """
-        pickup  = extraction.get("pickup", {})
-        returns = extraction.get("return", {})
+        pickup   = extraction.get("pickup", {})
+        returns  = extraction.get("return", {})
         containers = extraction.get("containers", [])
-
+ 
         pickup_address = (pickup.get("address") or "").strip()
         pickup_ref     = (pickup.get("reference") or "").strip()
         ref_mode       = (returns.get("reference_mode") or "single").lower()
-
+ 
         # Build per-container return lookup
-        return_lookup = {}  # container_no → {address, reference}
+        return_lookup = {}
         for r in returns.get("references", []):
             cno = (r.get("container_no") or "").strip().upper()
             if cno:
@@ -681,45 +478,47 @@ class DeliveryOrderService:
                     "address":   addr_lines[0].strip() if addr_lines else "",
                     "reference": (r.get("reference") or "").strip(),
                 }
-
-        # Fallback for single-mode return
+ 
         default_return_addr = ""
         default_return_ref  = ""
         if ref_mode == "single" or not return_lookup:
             addr_lines = (returns.get("address") or "").strip().split("\n")
             default_return_addr = addr_lines[0].strip() if addr_lines else ""
             default_return_ref  = (returns.get("reference") or "").strip()
-
+ 
         if not pickup_address and not default_return_addr and not return_lookup:
             log.info(f"[{SERVICE_KEY}] No destination data to fill — skipping")
             return
-
-        log.info(f"[{SERVICE_KEY}] Filling destination: pickup='{pickup_address}' "
-                 f"ref='{pickup_ref}' return_mode='{ref_mode}' containers={len(containers)}")
-
+ 
+        log.info(
+            f"[{SERVICE_KEY}] Filling destination: pickup='{pickup_address}' "
+            f"ref='{pickup_ref}' return_mode='{ref_mode}' containers={len(containers)}"
+        )
+ 
         # ── Open View Routing ────────────────────────────────────────
         if not self._open_view_routing(page):
             return
-
+ 
         # ── Wait for sidebar ────────────────────────────────────────
         try:
             page.locator(".cargo-tab__block").first.wait_for(state="visible", timeout=8000)
         except Exception:
             pass
-
+ 
         sidebar_count = page.evaluate("""() => {
             const c = document.querySelector('.cargo-tab__content');
             return c ? c.querySelectorAll('.cargo-tab__block').length
                      : document.querySelectorAll('.cargo-tab__block').length;
         }""") or 0
-
+ 
         log.info(f"[{SERVICE_KEY}] Sidebar has {sidebar_count} container block(s)")
-
+ 
         # ── Process each container ──────────────────────────────────
         for idx in range(sidebar_count):
-            if self._stop_evt.is_set(): break
-
-            # Click sidebar block
+            if self._stop_evt.is_set():
+                break
+ 
+            # Click sidebar block + wait for content reload
             if idx > 0:
                 page.evaluate(f"""() => {{
                     const c = document.querySelector('.cargo-tab__content');
@@ -727,12 +526,16 @@ class DeliveryOrderService:
                                      : document.querySelectorAll('.cargo-tab__block');
                     if (blocks[{idx}]) blocks[{idx}].click();
                 }}""")
-                page.wait_for_timeout(2000)
-
-            # Read container number from sidebar text
+                page.wait_for_timeout(2500)
+                # Wait for any loading spinner to disappear
+                try:
+                    page.locator(".el-loading-mask").wait_for(state="hidden", timeout=5000)
+                except Exception:
+                    pass
+ 
             sidebar_cno = self._read_sidebar_container_no(page, idx)
-            log.info(f"[{SERVICE_KEY}] Container [{idx+1}/{sidebar_count}]: {sidebar_cno}")
-
+            log.info(f"[{SERVICE_KEY}] Container [{idx + 1}/{sidebar_count}]: {sidebar_cno}")
+ 
             # Resolve return data for this container
             if sidebar_cno and sidebar_cno in return_lookup:
                 ret = return_lookup[sidebar_cno]
@@ -741,26 +544,16 @@ class DeliveryOrderService:
             else:
                 return_addr = default_return_addr
                 return_ref  = default_return_ref
-
-            # ── Click Destination tab ────────────────────────────────
-            try:
-                dest_tab = page.locator("#tab-destination, .el-tabs__item:has-text('Destination')").first
-                if dest_tab.is_visible(timeout=3000):
-                    dest_tab.click()
-                    page.wait_for_timeout(1500)
-                else:
-                    log.warning(f"[{SERVICE_KEY}] Destination tab not visible")
-                    continue
-            except Exception as e:
-                log.warning(f"[{SERVICE_KEY}] Destination tab click failed: {e}")
+ 
+            # ── ALWAYS click Destination tab (it resets after sidebar click) ──
+            if not self._ensure_destination_tab(page):
+                log.warning(f"[{SERVICE_KEY}] Cannot activate Destination tab for container {idx + 1}")
                 continue
-
+ 
             # ── 3.1 PICK-UP TERMINAL ─────────────────────────────────
-            # Resolve pickup data for this specific container
             pickup_addr_for_container = pickup_address
-            pickup_ref_for_container = pickup_ref
-            
-            # Check per-container pickup refs
+            pickup_ref_for_container  = pickup_ref
+ 
             if sidebar_cno and pickup.get("references"):
                 for pr in pickup.get("references", []):
                     if (pr.get("container_no") or "").strip().upper() == sidebar_cno:
@@ -769,7 +562,7 @@ class DeliveryOrderService:
                         if pr.get("reference"):
                             pickup_ref_for_container = pr["reference"]
                         break
-            
+ 
             if pickup_addr_for_container:
                 self._fill_section_terminal(
                     page, section_nth=2, terminal_name=pickup_addr_for_container,
@@ -780,7 +573,19 @@ class DeliveryOrderService:
                     page, section_nth=2, ref_value=pickup_ref_for_container,
                     label="Pick-up"
                 )
-
+ 
+            # ── Scroll Return section into view BEFORE interacting ───
+            page.evaluate("""() => {
+                const pane = document.querySelector('#pane-destination');
+                if (!pane) return;
+                const body = pane.querySelector('.routing-tab-panel__body');
+                if (!body) return;
+                const returnSection = body.children[3]; // div:nth-child(4)
+                if (returnSection)
+                    returnSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }""")
+            page.wait_for_timeout(1000)
+ 
             # ── 3.3 RETURN TERMINAL ──────────────────────────────────
             if return_addr:
                 self._fill_section_terminal(
@@ -792,11 +597,38 @@ class DeliveryOrderService:
                     page, section_nth=4, ref_value=return_ref,
                     label="Return"
                 )
-            # ── Save ────────────────────────────────────────────────────
+ 
+            # ── Save after each container ────────────────────────────
             self._save_routing(page)
+ 
         # ── Go back to shipment detail ──────────────────────────────
         self._go_back_from_routing(page)
         log.info(f"[{SERVICE_KEY}] Destination fill complete")
+    
+    def _ensure_destination_tab(self, page: Page) -> bool:
+        """
+        Click the Destination tab and verify #pane-destination is visible.
+        Retries up to 3 times. Returns True if active.
+        """
+        for attempt in range(3):
+            try:
+                tab = page.locator("#tab-destination")
+                if tab.count() > 0 and tab.first.is_visible(timeout=2000):
+                    tab.first.click()
+                    page.wait_for_timeout(1500)
+                else:
+                    tab = page.locator(".el-tabs__item:has-text('Destination')")
+                    if tab.count() > 0 and tab.first.is_visible(timeout=2000):
+                        tab.first.click()
+                        page.wait_for_timeout(1500)
+ 
+                pane = page.locator("#pane-destination")
+                if pane.count() > 0 and pane.first.is_visible(timeout=2000):
+                    return True
+            except Exception as e:
+                log.warning(f"[{SERVICE_KEY}] Destination tab attempt {attempt + 1}: {e}")
+            page.wait_for_timeout(1000 * (attempt + 1))
+        return False
 
     # ══════════════════════════════════════════════════════════════════
     #  DESTINATION HELPERS
@@ -805,7 +637,6 @@ class DeliveryOrderService:
     def _open_view_routing(self, page: Page) -> bool:
         """Click View Routing, set zoom to 1.0, wait for sidebar."""
         try:
-            # Wait up to 15s for the View routing button to appear (SPA load)
             clicked = False
             for _ in range(15):
                 clicked = page.evaluate("""() => {
@@ -820,18 +651,18 @@ class DeliveryOrderService:
                 if clicked:
                     break
                 page.wait_for_timeout(1000)
-                
+ 
             if not clicked:
                 log.warning(f"[{SERVICE_KEY}] View Routing button not found")
                 return False
-
+ 
             try:
                 page.wait_for_load_state("networkidle", timeout=30000)
             except Exception:
                 pass
             page.wait_for_timeout(3000)
-
-            # Set zoom to 1.0 for stable selectors
+ 
+            # Set zoom to 1.0
             page.evaluate("""() => {
                 let style = document.getElementById('jordex-zoom-style');
                 if (!style) {
@@ -842,12 +673,287 @@ class DeliveryOrderService:
                 style.innerHTML = 'body { zoom: 1.0 !important; }';
             }""")
             page.wait_for_timeout(1000)
+ 
+            # Wait for loading to finish
+            try:
+                page.locator(".el-loading-mask").wait_for(state="hidden", timeout=8000)
+            except Exception:
+                pass
+ 
             return True
-
+ 
         except Exception as e:
             log.error(f"[{SERVICE_KEY}] Failed to open View Routing: {e}")
             return False
-
+    def _score_and_click_best_row(self, page: Page, doc_address: str,
+                                   label: str, min_score: int = 12) -> bool:
+        """
+        Score every row in the visible address dialog against the FULL doc
+        address blob, using all 5 columns (Name, Street, Postal, City, Country).
+ 
+        Scoring weights:
+          Postal code exact match   → +10
+          Street name + number      → +8
+          Street name only          → +4
+          City match                → +3
+          Country match             → +2
+          Name word matches         → +1 each (max +3)
+ 
+        Returns True if a row was clicked (score ≥ min_score), False otherwise.
+        All scoring runs inside a single page.evaluate() — no network calls.
+        """
+        result = page.evaluate("""(docAddr) => {
+            // ── Normalize doc address ───────────────────────────────
+            let doc = docAddr.toUpperCase()
+                .replace(/[.,;:()\/\\-]/g, ' ')
+                .replace(/\\bNETHERLANDS\\b/g, 'NL')
+                .replace(/\\bBELGIUM\\b/g, 'BE')
+                .replace(/\\bBELGIE\\b/g, 'BE')
+                .replace(/\\bGERMANY\\b/g, 'DE')
+                .replace(/\\bDEUTSCHLAND\\b/g, 'DE')
+                .replace(/\\bFRANCE\\b/g, 'FR')
+                .replace(/\\bUNITED KINGDOM\\b/g, 'GB')
+                .replace(/\\bGREAT BRITAIN\\b/g, 'GB')
+                .replace(/\\bB\\.?V\\.?\\b/g, '')
+                .replace(/\\bN\\.?V\\.?\\b/g, '')
+                .replace(/\\bHAVENNUMMER\\b/g, '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+ 
+            // Doc address with ALL spaces removed (for postal matching)
+            const docNoSpaces = doc.replace(/\\s/g, '');
+ 
+            // ── Find visible dialog table ───────────────────────────
+            const visibleDialog = [...document.querySelectorAll('.el-dialog')]
+                .find(d => d.offsetParent !== null);
+            if (!visibleDialog) return { clicked: false, reason: 'no-dialog' };
+ 
+            const table = visibleDialog.querySelector('table');
+            if (!table) return { clicked: false, reason: 'no-table' };
+ 
+            // ── Read headers ────────────────────────────────────────
+            const headers = [...table.querySelectorAll('thead th')]
+                .map(h => h.innerText.trim().toUpperCase());
+ 
+            const nameIdx   = headers.findIndex(h => h.includes('NAME'));
+            const streetIdx = headers.findIndex(h => h.includes('STREET'));
+            const postalIdx = headers.findIndex(h => h.includes('POSTAL'));
+            const cityIdx   = headers.findIndex(h => h.includes('CITY'));
+            const countryIdx = headers.findIndex(h => h.includes('COUNTRY'));
+ 
+            // ── Score each row ──────────────────────────────────────
+            const rows = [...table.querySelectorAll('tbody tr')];
+            let bestIdx = -1;
+            let bestScore = 0;
+            let bestName = '';
+            const scores = [];
+ 
+            for (let i = 0; i < rows.length; i++) {
+                const cells = rows[i].querySelectorAll('td');
+                if (!cells.length) continue;
+ 
+                const cell = (idx) => idx >= 0 && cells[idx]
+                    ? cells[idx].innerText.trim() : '';
+ 
+                const name    = cell(nameIdx).toUpperCase();
+                const street  = cell(streetIdx).toUpperCase();
+                const postal  = cell(postalIdx).toUpperCase();
+                const city    = cell(cityIdx).toUpperCase();
+                const country = cell(countryIdx).toUpperCase();
+ 
+                let score = 0;
+ 
+                // ── Postal code match (+10) ─────────────────────────
+                if (postal.length >= 4) {
+                    const postalClean = postal.replace(/[\\s-]/g, '');
+                    if (docNoSpaces.includes(postalClean)) {
+                        score += 10;
+                    }
+                }
+ 
+                // ── Street match (+8 full, +4 name only) ────────────
+                if (street.length >= 3) {
+                    // Extract street name (longest word ≥5 chars) and number
+                    const streetClean = street
+                        .replace(/[.,;:()\/\\-]/g, ' ')
+                        .replace(/\\s+/g, ' ').trim();
+                    const streetWords = streetClean.split(' ');
+ 
+                    // Find the main street name word (longest alphabetic word)
+                    let streetName = '';
+                    let streetNum = '';
+                    for (const w of streetWords) {
+                        if (/^[A-Z]{5,}/.test(w) && w.length > streetName.length) {
+                            streetName = w;
+                        }
+                        if (!streetNum && /^\\d{1,5}$/.test(w)) {
+                            streetNum = w;
+                        }
+                    }
+ 
+                    if (streetName && doc.includes(streetName)) {
+                        if (streetNum && doc.includes(streetNum)) {
+                            // Check street name and number are near each other in doc
+                            const namePos = doc.indexOf(streetName);
+                            const numPos = doc.indexOf(streetNum, Math.max(0, namePos - 5));
+                            if (Math.abs(numPos - namePos) < 40) {
+                                score += 8;  // Full street match
+                            } else {
+                                score += 4;  // Street name found but number far away
+                            }
+                        } else {
+                            score += 4;  // Street name only
+                        }
+                    }
+                }
+ 
+                // ── City match (+3) ─────────────────────────────────
+                if (city.length >= 3) {
+                    const cityClean = city.replace(/[()]/g, '').split(/[\/,]/)[0].trim();
+                    if (cityClean && doc.includes(cityClean)) {
+                        score += 3;
+                    }
+                }
+ 
+                // ── Country match (+2) ──────────────────────────────
+                if (country.length >= 2) {
+                    if (doc.includes(country)) {
+                        score += 2;
+                    }
+                }
+ 
+                // ── Name word match (+1 each, max +3) ───────────────
+                if (name) {
+                    const nameWords = name
+                        .replace(/[.,;:()\/\\-]/g, ' ')
+                        .split(/\\s+/)
+                        .filter(w => w.length >= 4);
+                    // Skip noise words
+                    const noise = new Set([
+                        'TERMINAL', 'TERMINALS', 'DEPOT', 'CONTAINER',
+                        'PORT', 'PORTS', 'GROUP', 'INTERNATIONAL'
+                    ]);
+                    let nameScore = 0;
+                    for (const w of nameWords) {
+                        if (noise.has(w)) continue;
+                        if (doc.includes(w)) {
+                            nameScore++;
+                            if (nameScore >= 3) break;
+                        }
+                    }
+                    score += nameScore;
+                }
+ 
+                scores.push({ idx: i, score, name: name.substring(0, 50) });
+ 
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestIdx = i;
+                    bestName = name.substring(0, 60);
+                }
+            }
+ 
+            // ── Click best row if above threshold ───────────────────
+            if (bestIdx >= 0 && bestScore >= arguments[1]) {
+                const row = rows[bestIdx];
+                row.click();
+ 
+                // Also click radio button if present
+                const radio = row.querySelector(
+                    '.el-radio__input, .el-radio, input[type="radio"], ' +
+                    '.el-radio__original, label.el-radio'
+                );
+                if (radio) radio.click();
+ 
+                // Click first cell as backup trigger
+                const firstCell = row.querySelector('td, [role="cell"]');
+                if (firstCell) firstCell.click();
+ 
+                return {
+                    clicked: true,
+                    score: bestScore,
+                    index: bestIdx,
+                    name: bestName,
+                    total_rows: rows.length,
+                    top3: scores.sort((a, b) => b.score - a.score).slice(0, 3)
+                };
+            }
+ 
+            return {
+                clicked: false,
+                best_score: bestScore,
+                best_name: bestName,
+                total_rows: rows.length,
+                top3: scores.sort((a, b) => b.score - a.score).slice(0, 3)
+            };
+        }""", doc_address, min_score) or {}
+ 
+        if result.get("clicked"):
+            log.info(
+                f"[{SERVICE_KEY}]   {label} Scored row {result.get('index')} "
+                f"(score={result.get('score')}, name='{result.get('name')}')"
+            )
+            top3 = result.get("top3", [])
+            if len(top3) > 1:
+                log.debug(
+                    f"[{SERVICE_KEY}]   {label} Top 3 scores: "
+                    + ", ".join(f"#{t['idx']}={t['score']}" for t in top3)
+                )
+            return True
+        else:
+            log.warning(
+                f"[{SERVICE_KEY}]   {label} No confident match "
+                f"(best_score={result.get('best_score', 0)}, "
+                f"best='{result.get('best_name', '')}')"
+            )
+            top3 = result.get("top3", [])
+            if top3:
+                log.info(
+                    f"[{SERVICE_KEY}]   {label} Top 3: "
+                    + ", ".join(f"#{t['idx']}={t['score']}({t['name'][:25]})" for t in top3)
+                )
+            return False
+    
+    def _build_street_search_term(self, doc_address: str) -> str:
+        """
+        Extract the street name from a doc address blob for fallback search.
+ 
+        Looks for pattern: long word (6+ chars) followed by a number.
+        Examples:
+          "... BUNSCHOTENWEG 200 ..." → "BUNSCHOTENWEG"
+          "... EUROPAWEG 875 ..."     → "EUROPAWEG"
+          "... MAASVLAKTEWEG 951 ..." → "MAASVLAKTEWEG"
+        """
+        # Pattern: word with 6+ alpha chars followed by a number within a few words
+        matches = re.findall(
+            r'\b([A-Za-z]{6,})\s+(\d{1,5})\b',
+            doc_address.upper()
+        )
+ 
+        # Filter out noise words that look like streets but aren't
+        noise = {
+            "NETHERLANDS", "ROTTERDAM", "ANTWERPEN", "AMSTERDAM",
+            "BELGIUM", "GERMANY", "HAVENNUMMER", "TERMINAL",
+            "TERMINALS", "CONTAINER", "CONTAINERS",
+        }
+ 
+        for word, _num in matches:
+            if word not in noise:
+                return word
+ 
+        # Fallback: just find the longest word that looks like a street
+        # (words ending in common Dutch/German street suffixes)
+        street_suffixes = ("WEG", "STRAAT", "LAAN", "KADE", "PLEIN", "GRACHT",
+                           "SINGEL", "DIJK", "STEEG", "PAD", "BAAN", "DREEF",
+                           "ALLEE", "STRASSE", "ROAD", "STREET", "AVENUE")
+        words = re.findall(r'[A-Za-z]{5,}', doc_address.upper())
+        for w in words:
+            for suffix in street_suffixes:
+                if w.endswith(suffix):
+                    return w
+ 
+        return ""
+ 
     def _read_sidebar_container_no(self, page: Page, idx: int) -> str:
         """Read container number from sidebar block text."""
         block_text = page.evaluate(f"""() => {{
@@ -866,15 +972,27 @@ class DeliveryOrderService:
     def _fill_section_terminal(self, page: Page, section_nth: int,
                                 terminal_name: str, label: str):
         """
-        Fill a terminal address in Destination section via address book search.
-        section_nth: 2 for Pick-up (3.1), 4 for Return (3.3)
+        Fill a terminal address via address book search with two-phase matching:
+          Phase 1: Search by name → score all rows → click if confident
+          Phase 2: Search by street name → score again → click if confident
+          Phase 3: Last resort → click first row
         """
         log.info(f"[{SERVICE_KEY}]   {label} Terminal: searching '{terminal_name}'")
-
-        # Check if already filled correctly
+ 
+        # ── Scroll section into view ─────────────────────────────────
+        page.evaluate(f"""() => {{
+            const pane = document.querySelector('#pane-destination');
+            if (!pane) return;
+            const body = pane.querySelector('.routing-tab-panel__body');
+            if (!body) return;
+            const section = body.children[{section_nth - 1}];
+            if (section) section.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+        }}""")
+        page.wait_for_timeout(800)
+ 
+        # ── Check if already filled correctly ────────────────────────
         existing = self._read_existing_terminal(page, section_nth)
         if existing:
-            # Normalize both for comparison (first 20 chars, uppercase)
             norm_existing = existing.upper().replace(",", "").strip()[:20]
             norm_new = terminal_name.upper().replace(",", "").strip()[:20]
             if norm_new in norm_existing or norm_existing in norm_new:
@@ -884,119 +1002,368 @@ class DeliveryOrderService:
                 log.info(f"[{SERVICE_KEY}]   {label} Terminal different — overwriting")
                 self._delete_existing_terminal(page, section_nth)
                 page.wait_for_timeout(1000)
-
-        # ── Click address book button ────────────────────────────────
-        addr_clicked = self._click_address_book_button(page, section_nth, label)
-        if not addr_clicked:
-            log.warning(f"[{SERVICE_KEY}]   {label} Could not open address book — skipping")
+ 
+        # ── Open address book (with drawer detection + retry) ────────
+        if not self._open_address_book_dialog(page, section_nth, label):
             return
-
-        page.wait_for_timeout(2000)
-
-        # ── Wait for dialog to appear ────────────────────────────────
-        dialog_visible = False
-        for attempt in range(5):
-            dialog_visible = page.evaluate("""() => {
-                const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
-                    .filter(d => d.style.display !== 'none' && d.offsetParent !== null);
-                if (dialogs.length > 0) return true;
-                // Also check for dialog by title
-                const headers = document.querySelectorAll('.el-dialog__title, .el-dialog__header');
-                for (const h of headers) {
-                    if (h.textContent.includes('Select address') || h.textContent.includes('Address')) {
-                        const dialog = h.closest('.el-dialog__wrapper') || h.closest('.el-dialog');
-                        if (dialog) return true;
-                    }
+ 
+        # ══════════════════════════════════════════════════════════════
+        #  PHASE 1: Search by name, score results
+        # ══════════════════════════════════════════════════════════════
+        search_term = self._build_search_term(terminal_name)
+        log.info(f"[{SERVICE_KEY}]   {label} Phase 1 search: '{search_term}'")
+ 
+        if not self._fill_search_box(page, search_term, label):
+            self._close_dialog_properly(page, label)
+            return
+ 
+        page.wait_for_timeout(2500)
+ 
+        # Score and click
+        matched = self._score_and_click_best_row(page, terminal_name, label, min_score=12)
+ 
+        # ══════════════════════════════════════════════════════════════
+        #  PHASE 2: If no confident match, search by street name
+        # ══════════════════════════════════════════════════════════════
+        if not matched:
+            street_term = self._build_street_search_term(terminal_name)
+            if street_term and street_term.upper() != search_term.upper():
+                log.info(f"[{SERVICE_KEY}]   {label} Phase 2 search: '{street_term}'")
+ 
+                # Clear and re-fill search box
+                if self._fill_search_box(page, street_term, label):
+                    page.wait_for_timeout(2500)
+                    matched = self._score_and_click_best_row(
+                        page, terminal_name, label, min_score=8
+                    )
+ 
+        # ══════════════════════════════════════════════════════════════
+        #  PHASE 3: Last resort — click first row
+        # ══════════════════════════════════════════════════════════════
+        if not matched:
+            log.warning(f"[{SERVICE_KEY}]   {label} No confident match — clicking first row as fallback")
+            page.evaluate("""() => {
+                const dialog = [...document.querySelectorAll('.el-dialog')]
+                    .find(d => d.offsetParent !== null);
+                if (!dialog) return;
+                const row = dialog.querySelector('table tbody tr');
+                if (row) {
+                    row.click();
+                    const radio = row.querySelector(
+                        '.el-radio__input, .el-radio, input[type="radio"]');
+                    if (radio) radio.click();
+                }
+            }""")
+            page.wait_for_timeout(1000)
+ 
+        # ── Close dialog properly ────────────────────────────────────
+        page.wait_for_timeout(500)
+        self._close_dialog_properly(page, label)
+        page.wait_for_timeout(1000)
+    def _open_address_book_dialog(self, page: Page, section_nth: int,
+                                   label: str) -> bool:
+        """
+        Click address book button + handle drawer-vs-dialog detection.
+        Returns True if the dialog Search textbox is visible and ready.
+        """
+        dialog_ready = False
+        for attempt in range(2):
+            addr_clicked = self._click_address_book_js(page, section_nth, label)
+            if not addr_clicked:
+                log.warning(f"[{SERVICE_KEY}]   {label} Could not click address book button")
+                break
+ 
+            page.wait_for_timeout(2000)
+ 
+            # Check: did a drawer open instead of the dialog?
+            drawer_opened = page.evaluate("""() => {
+                const drawers = document.querySelectorAll('.el-drawer__wrapper');
+                for (const d of drawers) {
+                    if (getComputedStyle(d).display !== 'none') return true;
                 }
                 return false;
             }""")
-            if dialog_visible:
+ 
+            if drawer_opened:
+                log.warning(
+                    f"[{SERVICE_KEY}]   {label} Drawer opened instead of address book "
+                    f"(attempt {attempt + 1}) — closing"
+                )
+                try:
+                    close_drawer = page.get_by_role("button", name="close drawer")
+                    if close_drawer.is_visible(timeout=2000):
+                        close_drawer.click(timeout=3000)
+                        page.wait_for_timeout(1500)
+                except Exception:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(1000)
+                    page.evaluate("""() => {
+                        const drawers = document.querySelectorAll('.el-drawer__wrapper');
+                        for (const d of drawers) d.style.display = 'none';
+                        const masks = document.querySelectorAll('.v-modal');
+                        for (const m of masks) m.remove();
+                        document.body.classList.remove('el-popup-parent--hidden');
+                    }""")
+                    page.wait_for_timeout(500)
+                continue
+ 
+            # Check: is the Search textbox visible?
+            for wait in range(3):
+                try:
+                    search_box = page.get_by_role("textbox", name="Search")
+                    if search_box.is_visible(timeout=2000):
+                        dialog_ready = True
+                        break
+                except Exception:
+                    pass
+                page.wait_for_timeout(1000)
+ 
+            if dialog_ready:
                 break
-            page.wait_for_timeout(1000)
-
-        if not dialog_visible:
-            log.warning(f"[{SERVICE_KEY}]   {label} Address dialog did not appear")
-            return
-
-        # ── Build clean search term ──────────────────────────────────
-        search_term = self._build_search_term(terminal_name)
-        log.info(f"[{SERVICE_KEY}]   {label} Search term: '{search_term}'")
-
-        # ── Type into search box ─────────────────────────────────────
-        search_filled = page.evaluate("""(term) => {
-            // Find the search input inside the visible dialog
-            const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
-                .filter(d => d.style.display !== 'none');
-            for (const dialog of dialogs) {
-                const inputs = dialog.querySelectorAll('input');
-                for (const inp of inputs) {
-                    if (inp.type === 'file' || !inp.offsetParent) continue;
-                    // Clear and fill
-                    const setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(inp, '');
-                    inp.dispatchEvent(new Event('input', {bubbles: true}));
-                    setter.call(inp, term);
-                    inp.dispatchEvent(new Event('input', {bubbles: true}));
-                    inp.dispatchEvent(new Event('change', {bubbles: true}));
-                    // Some dialogs need Enter or a search button click
-                    inp.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
+ 
+        if not dialog_ready:
+            log.warning(f"[{SERVICE_KEY}]   {label} Address dialog did not appear after retries")
+            self._cleanup_overlays(page)
+ 
+        return dialog_ready
+ 
+    def _click_address_book_js(self, page: Page, section_nth: int, label: str) -> bool:
+        """
+        Click the address book button using JS .click() on the exact recorded
+        CSS selector. JS .click() bypasses any overlay (mf-drawer, v-modal).
+ 
+        section_nth: 2 = Pick-up, 4 = Return
+        """
+        exact_selector = (
+            f"#pane-destination > div > .el-card > .el-card__body > .el-form > div > "
+            f".routing-tab-panel__body > div:nth-child({section_nth}) > div:nth-child(2) > "
+            f"div:nth-child(3) > .el-form-item > .el-form-item__content > div > "
+            f".address-select__body--select > .address-select__toolbar > "
+            f".address-select-toolbar > button"
+        )
+ 
+        clicked = page.evaluate(f"""() => {{
+            const btn = document.querySelector('{exact_selector}');
+            if (btn) {{
+                btn.scrollIntoView({{ block: 'center' }});
+                btn.click();
+                return true;
+            }}
+            return false;
+        }}""")
+ 
+        if clicked:
+            log.info(f"[{SERVICE_KEY}]   {label} Address book clicked via JS exact selector")
+            return True
+ 
+        # Fallback: broader selector
+        clicked = page.evaluate(f"""() => {{
+            const pane = document.querySelector('#pane-destination');
+            if (!pane) return false;
+            const body = pane.querySelector('.routing-tab-panel__body');
+            if (!body) return false;
+            const section = body.children[{section_nth - 1}];
+            if (!section) return false;
+ 
+            // Find the address-select-toolbar button specifically
+            const toolbar = section.querySelector('.address-select-toolbar');
+            if (toolbar) {{
+                const btn = toolbar.querySelector('button');
+                if (btn) {{
+                    btn.scrollIntoView({{ block: 'center' }});
+                    btn.click();
                     return true;
-                }
+                }}
+            }}
+ 
+            // Last resort: any button in address-select__body--select
+            const areaBtn = section.querySelector(
+                '.address-select__body--select .address-select__toolbar button');
+            if (areaBtn) {{
+                areaBtn.scrollIntoView({{ block: 'center' }});
+                areaBtn.click();
+                return true;
+            }}
+            return false;
+        }}""")
+ 
+        if clicked:
+            log.info(f"[{SERVICE_KEY}]   {label} Address book clicked via JS fallback")
+        else:
+            log.warning(f"[{SERVICE_KEY}]   {label} Address book button not found in DOM")
+        return bool(clicked)
+    def _fill_search_box(self, page: Page, search_term: str, label: str) -> bool:
+        """
+        Clear and fill the Search textbox in the visible address dialog.
+        Returns True if the search term was successfully entered.
+        """
+        try:
+            search_box = page.get_by_role("textbox", name="Search")
+            search_box.click(timeout=3000)
+            search_box.fill("")
+            page.wait_for_timeout(300)
+            search_box.fill(search_term)
+            page.keyboard.press("Enter")
+            return True
+        except Exception as e:
+            log.warning(f"[{SERVICE_KEY}]   {label} Playwright search fill failed ({e}), trying JS")
+ 
+        # JS fallback
+        filled = page.evaluate("""(term) => {
+            const dialog = [...document.querySelectorAll('.el-dialog')]
+                .find(d => d.offsetParent !== null);
+            if (!dialog) return false;
+ 
+            const inputs = dialog.querySelectorAll('input');
+            for (const inp of inputs) {
+                if (inp.type === 'file' || !inp.offsetParent) continue;
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(inp, '');
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                setter.call(inp, term);
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                inp.dispatchEvent(new Event('change', {bubbles: true}));
+                inp.dispatchEvent(new KeyboardEvent('keyup',
+                    {key: 'Enter', bubbles: true}));
+                return true;
             }
             return false;
         }""", search_term)
-
-        if not search_filled:
-            log.warning(f"[{SERVICE_KEY}]   {label} Could not fill search box")
-            self._dismiss_dialog(page)
-            return
-
-        # Wait for search results to load
-        page.wait_for_timeout(2500)
-
-        # ── Click the best matching row ──────────────────────────────
-        row_clicked = self._click_dialog_row(page, search_term, label)
-
-        if not row_clicked:
-            log.warning(f"[{SERVICE_KEY}]   {label} No row clicked — trying first row")
-            # Fallback: click first visible row
+ 
+        return bool(filled)
+    # ══════════════════════════════════════════════════════════════════
+    #  _close_dialog_properly  (NEW — replaces _confirm_dialog + CSS hack)
+    # ══════════════════════════════════════════════════════════════════
+ 
+    def _close_dialog_properly(self, page: Page, label: str):
+        """
+        Close the Select Address dialog through proper UI interactions.
+        Preserves Vue/Element UI internal state so subsequent dialogs work.
+ 
+        Strategy order:
+          1. Click 'Close' button (from recorded Playwright session)
+          2. Click dialog header X button
+          3. Escape key
+          4. Vue component API (vm.visible = false / vm.handleClose())
+          5. LAST RESORT: remove overlay elements from DOM
+        After each, verify dialog is actually closed.
+        """
+        # ── Strategy 1: 'Close' button by role ───────────────────────
+        try:
+            close_btn = page.get_by_role("button", name="Close")
+            if close_btn.is_visible(timeout=1500):
+                close_btn.click(timeout=2000)
+                page.wait_for_timeout(800)
+                if self._is_all_dialogs_closed(page):
+                    log.info(f"[{SERVICE_KEY}]   {label} Dialog closed via 'Close' button")
+                    return
+        except Exception:
+            pass
+ 
+        # ── Strategy 2: Header X button ──────────────────────────────
+        try:
+            x_btn = page.locator(
+                ".el-dialog__wrapper:not([style*='display: none']) .el-dialog__headerbtn"
+            ).first
+            if x_btn.is_visible(timeout=1000):
+                x_btn.click(timeout=2000)
+                page.wait_for_timeout(800)
+                if self._is_all_dialogs_closed(page):
+                    log.info(f"[{SERVICE_KEY}]   {label} Dialog closed via header X")
+                    return
+        except Exception:
+            pass
+ 
+        # ── Strategy 3: Escape key ───────────────────────────────────
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(800)
+            if self._is_all_dialogs_closed(page):
+                log.info(f"[{SERVICE_KEY}]   {label} Dialog closed via Escape")
+                return
+        except Exception:
+            pass
+ 
+        # ── Strategy 4: Vue component close ──────────────────────────
+        try:
             page.evaluate("""() => {
-                const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
-                    .filter(d => d.style.display !== 'none');
-                for (const dialog of dialogs) {
-                    const row = dialog.querySelector('table tbody tr, .el-table__body tr');
-                    if (row) {
-                        row.click();
-                        // Also try radio button
-                        const radio = row.querySelector('.el-radio__input, .el-radio, input[type="radio"]');
-                        if (radio) radio.click();
-                        return;
+                const wrappers = [...document.querySelectorAll('.el-dialog__wrapper')]
+                    .filter(d => getComputedStyle(d).display !== 'none');
+                for (const wrapper of wrappers) {
+                    const dialog = wrapper.querySelector('.el-dialog');
+                    // Walk up __vue__ chain to find close/handleClose
+                    const el = dialog || wrapper;
+                    if (el.__vue__) {
+                        let vm = el.__vue__;
+                        for (let depth = 0; depth < 10 && vm; depth++) {
+                            if (typeof vm.handleClose === 'function') {
+                                vm.handleClose();
+                                return;
+                            }
+                            if (typeof vm.close === 'function') {
+                                vm.close();
+                                return;
+                            }
+                            if (vm.visible !== undefined) {
+                                vm.visible = false;
+                                if (vm.$emit) vm.$emit('update:visible', false);
+                                return;
+                            }
+                            vm = vm.$parent;
+                        }
                     }
                 }
             }""")
             page.wait_for_timeout(1000)
-
-        # ── Click confirm/save button in the dialog ──────────────────
-        page.wait_for_timeout(500)
-        confirmed = self._confirm_dialog(page, label)
-
-        if not confirmed:
-            log.warning(f"[{SERVICE_KEY}]   {label} Dialog confirm failed — dismissing")
-            self._dismiss_dialog(page)
-
-        page.wait_for_timeout(1500)
-
-        # ── Verify dialog is closed ──────────────────────────────────
-        still_open = page.evaluate("""() => {
-            const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
-                .filter(d => d.style.display !== 'none' && d.offsetParent !== null);
-            return dialogs.length > 0;
+            if self._is_all_dialogs_closed(page):
+                log.info(f"[{SERVICE_KEY}]   {label} Dialog closed via Vue API")
+                return
+        except Exception:
+            pass
+ 
+        # ── Strategy 5: LAST RESORT — remove overlays from DOM ───────
+        log.warning(f"[{SERVICE_KEY}]   {label} All close methods failed — force cleanup")
+        self._cleanup_overlays(page)
+    def _is_all_dialogs_closed(self, page: Page) -> bool:
+        """Check that no dialog wrappers are visible."""
+        return page.evaluate("""() => {
+            const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+            for (const w of wrappers) {
+                if (getComputedStyle(w).display !== 'none') return false;
+            }
+            return true;
         }""")
-        if still_open:
-            log.warning(f"[{SERVICE_KEY}]   {label} Dialog still open — force dismissing")
-            self._dismiss_dialog(page)
-            page.wait_for_timeout(1000)
+ 
+    def _cleanup_overlays(self, page: Page):
+        """
+        Nuclear cleanup: remove stale overlays and body locks.
+        Only use as last resort after all proper close methods fail.
+        """
+        page.evaluate("""() => {
+            // Force-hide dialog wrappers
+            const dialogs = document.querySelectorAll('.el-dialog__wrapper');
+            for (const d of dialogs) {
+                if (getComputedStyle(d).display !== 'none') {
+                    d.style.display = 'none';
+                }
+            }
+            // Force-hide drawers
+            const drawers = document.querySelectorAll('.el-drawer__wrapper');
+            for (const d of drawers) {
+                if (getComputedStyle(d).display !== 'none') {
+                    d.style.display = 'none';
+                }
+            }
+            // REMOVE (not hide) modal masks — prevents them blocking future clicks
+            const masks = document.querySelectorAll('.v-modal, .el-overlay');
+            for (const m of masks) m.remove();
+            // Remove body scroll lock
+            document.body.classList.remove('el-popup-parent--hidden');
+            document.body.style.removeProperty('overflow');
+            document.body.style.removeProperty('padding-right');
+        }""")
+        page.wait_for_timeout(500)
 
     def _build_search_term(self, terminal_name: str) -> str:
         """
@@ -1028,23 +1395,45 @@ class DeliveryOrderService:
         return " ".join(cleaned)
 
     def _click_address_book_button(self, page: Page, section_nth: int, label: str) -> bool:
-        """Click the address book (📖) button in the destination section."""
-        # Strategy 1: Scoped selector
+        """Click the address book button in the destination section.
+        Uses the exact selector recorded from Playwright session:
+        #pane-destination > div > .el-card > .el-card__body > .el-form > div >
+        .routing-tab-panel__body > div:nth-child(N) > div:nth-child(2) > div:nth-child(3) >
+        .el-form-item > .el-form-item__content > div > .address-select__body--select >
+        .address-select__toolbar > .address-select-toolbar > button
+        """
+        # Strategy 1: Exact recorded selector (most reliable)
+        exact_selector = (
+            f"#pane-destination > div > .el-card > .el-card__body > .el-form > div > "
+            f".routing-tab-panel__body > div:nth-child({section_nth}) > div:nth-child(2) > "
+            f"div:nth-child(3) > .el-form-item > .el-form-item__content > div > "
+            f".address-select__body--select > .address-select__toolbar > .address-select-toolbar > button"
+        )
+        try:
+            btn = page.locator(exact_selector).first
+            if btn.is_visible(timeout=3000):
+                btn.click(timeout=5000)
+                log.info(f"[{SERVICE_KEY}]   {label} Address book clicked via exact selector")
+                return True
+        except Exception:
+            pass
+
+        # Strategy 2: Shorter scoped selectors
         for selector in [
             f"#pane-destination .routing-tab-panel__body > div:nth-child({section_nth}) .address-select-toolbar > button",
             f"#pane-destination .routing-tab-panel__body > div:nth-child({section_nth}) .address-select__toolbar button",
-            f"#pane-destination .routing-tab-panel__body > div:nth-child({section_nth}) button.address-book-btn",
+            f"#pane-destination .routing-tab-panel__body > div:nth-child({section_nth}) .address-select__body--select button",
         ]:
             try:
                 btn = page.locator(selector).first
                 if btn.is_visible(timeout=2000):
                     btn.click(timeout=3000)
-                    log.info(f"[{SERVICE_KEY}]   {label} Address book clicked via: {selector[:60]}")
+                    log.info(f"[{SERVICE_KEY}]   {label} Address book clicked via: {selector[:70]}")
                     return True
             except Exception:
                 continue
 
-        # Strategy 2: Find by icon or aria-label within the section
+        # Strategy 3: JS fallback
         clicked = page.evaluate(f"""() => {{
             const pane = document.querySelector('#pane-destination');
             if (!pane) return false;
@@ -1052,29 +1441,22 @@ class DeliveryOrderService:
             if (!body) return false;
             const section = body.children[{section_nth - 1}];
             if (!section) return false;
-            
-            // Look for any button with book/address icon in this section
-            const btns = [...section.querySelectorAll('button')]
-                .filter(b => b.offsetParent !== null);
-            for (const btn of btns) {{
-                const icon = btn.querySelector('i, svg, .el-icon');
-                const text = (btn.innerText || '').trim().toLowerCase();
-                if (icon || text === '' || text.includes('address') || text.includes('book')) {{
-                    btn.click();
-                    return true;
-                }}
-            }}
-            const toolbar = section.querySelector('.address-select-toolbar, .address-select__toolbar');
+            const toolbar = section.querySelector(
+                '.address-select-toolbar, .address-select__toolbar'
+            );
             if (toolbar) {{
-                const firstBtn = toolbar.querySelector('button');
-                if (firstBtn) {{ firstBtn.click(); return true; }}
+                const btn = toolbar.querySelector('button');
+                if (btn) {{ btn.click(); return true; }}
             }}
+            // Try any button in address-select area
+            const areaBtn = section.querySelector('.address-select__body--select button');
+            if (areaBtn) {{ areaBtn.click(); return true; }}
             return false;
         }}""")
 
         if clicked:
             log.info(f"[{SERVICE_KEY}]   {label} Address book clicked via JS fallback")
-        return clicked
+        return bool(clicked)
 
     def _click_dialog_row(self, page: Page, search_term: str, label: str) -> bool:
         """
@@ -1144,74 +1526,62 @@ class DeliveryOrderService:
 
     def _confirm_dialog(self, page: Page, label: str) -> bool:
         """
-        Click the confirm/save/select button in the address dialog footer.
+        Close the Select Address dialog after row selection.
+        Recorded Playwright session shows the dialog uses a 'Close' button
+        (not 'Select'/'Save'/'Confirm') to dismiss after selecting a row.
         """
+        # Strategy 1: Exact recorded — get_by_role("button", name="Close")
+        try:
+            close_btn = page.get_by_role("button", name="Close")
+            if close_btn.is_visible(timeout=2000):
+                close_btn.click(timeout=3000)
+                log.info(f"[{SERVICE_KEY}]   {label} Dialog closed via 'Close' button")
+                return True
+        except Exception:
+            pass
+
+        # Strategy 2: JS — look for any Close/primary button in visible dialog
         confirmed = page.evaluate("""() => {
             const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
-                .filter(d => d.style.display !== 'none');
+                .filter(d => getComputedStyle(d).display !== 'none');
 
             for (const dialog of dialogs) {
-                const footer = dialog.querySelector('.el-dialog__footer, .dialog-footer');
-                if (footer) {
-                    const btns = [...footer.querySelectorAll('button')];
-                    const primary = btns.find(b => 
-                        b.classList.contains('el-button--primary') ||
-                        b.classList.contains('is-primary')
-                    );
-                    if (primary) {
-                        primary.click();
-                        return 'footer-primary';
-                    }
-                    const confirmBtn = btns.find(b => {
-                        const t = (b.innerText || '').trim().toLowerCase();
-                        return ['select', 'save', 'confirm', 'ok', 'submit', 'apply'].includes(t);
-                    });
-                    if (confirmBtn) {
-                        confirmBtn.click();
-                        return 'footer-text';
-                    }
-                }
+                const allBtns = [...dialog.querySelectorAll('button')]
+                    .filter(b => b.offsetParent !== null);
 
-                const allBtns = [...dialog.querySelectorAll('button')];
-                const primaryBtn = allBtns.find(b => 
-                    b.classList.contains('el-button--primary') &&
-                    b.offsetParent !== null &&
-                    !(b.innerText || '').toLowerCase().includes('search') &&
-                    !(b.innerText || '').toLowerCase().includes('new')
+                // First try: button named Close
+                const closeBtn = allBtns.find(b =>
+                    (b.innerText || '').trim().toLowerCase() === 'close'
                 );
-                if (primaryBtn) {
-                    primaryBtn.click();
-                    return 'dialog-primary';
-                }
+                if (closeBtn) { closeBtn.click(); return 'close-btn'; }
 
-                const textBtn = allBtns.find(b => {
-                    if (!b.offsetParent) return false;
-                    const t = (b.innerText || '').trim().toLowerCase();
-                    return ['select', 'save', 'confirm', 'ok'].includes(t);
-                });
-                if (textBtn) {
-                    textBtn.click();
-                    return 'dialog-text';
-                }
+                // Second: primary button not labeled Search/New
+                const primary = allBtns.find(b =>
+                    b.classList.contains('el-button--primary') &&
+                    !(b.innerText || '').toLowerCase().match(/search|new/)
+                );
+                if (primary) { primary.click(); return 'primary-btn'; }
+
+                // Third: confirm keywords
+                const keywords = ['select', 'save', 'confirm', 'ok', 'submit', 'apply'];
+                const kw = allBtns.find(b =>
+                    keywords.includes((b.innerText || '').trim().toLowerCase())
+                );
+                if (kw) { kw.click(); return 'keyword-btn'; }
             }
             return null;
         }""")
 
         if confirmed:
-            log.info(f"[{SERVICE_KEY}]   {label} Dialog confirmed via: {confirmed}")
+            log.info(f"[{SERVICE_KEY}]   {label} Dialog closed via JS: {confirmed}")
             return True
 
+        # Strategy 3: Enter key fallback
         try:
-            page.keyboard.press("Enter")
+            page.keyboard.press("Escape")
             page.wait_for_timeout(500)
-            still_open = page.evaluate("""() => {
-                const dialogs = [...document.querySelectorAll('.el-dialog__wrapper')]
-                    .filter(d => d.style.display !== 'none' && d.offsetParent !== null);
-                return dialogs.length > 0;
-            }""")
-            if not still_open:
-                log.info(f"[{SERVICE_KEY}]   {label} Dialog confirmed via Enter key")
-                return True
+            log.info(f"[{SERVICE_KEY}]   {label} Dialog dismissed via Escape")
+            return True
         except Exception:
             pass
 
@@ -1252,28 +1622,41 @@ class DeliveryOrderService:
                                  ref_value: str, label: str):
         """
         Fill the Reference field in a Destination section.
-
-        section_nth: 2 for Pick-up (3.1), 4 for Return (3.3)
+        section_nth: 2 for Pick-up (3.1), 4 for Return (3.3).
         """
         log.info(f"[{SERVICE_KEY}]   {label} Reference: '{ref_value}'")
-
+ 
+        # ── Scroll section into view ─────────────────────────────────
+        page.evaluate(f"""() => {{
+            const pane = document.querySelector('#pane-destination');
+            if (!pane) return;
+            const body = pane.querySelector('.routing-tab-panel__body');
+            if (!body) return;
+            const section = body.children[{section_nth - 1}];
+            if (section) section.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+        }}""")
+        page.wait_for_timeout(500)
+ 
+        filled = False
+ 
+        # ── Strategy 1: Scoped JS fill within the correct section ────
         try:
-            # Strategy 1: Scoped to section via div:nth-child + placeholder
-            ref_filled = page.evaluate(f"""(refVal) => {{
+            filled = page.evaluate(f"""(refVal) => {{
                 const pane = document.querySelector('#pane-destination');
                 if (!pane) return false;
                 const body = pane.querySelector('.routing-tab-panel__body');
                 if (!body) return false;
                 const section = body.children[{section_nth - 1}];
                 if (!section) return false;
-
+ 
                 const inputs = [...section.querySelectorAll('input[placeholder="Reference"]')]
                     .filter(i => i.offsetParent !== null);
                 if (!inputs.length) return false;
-
+ 
                 const inp = inputs[0];
                 if (inp.readOnly) return false;
-
+ 
+                inp.focus();
                 const setter = Object.getOwnPropertyDescriptor(
                     window.HTMLInputElement.prototype, 'value').set;
                 setter.call(inp, '');
@@ -1281,36 +1664,65 @@ class DeliveryOrderService:
                 setter.call(inp, refVal);
                 inp.dispatchEvent(new Event('input', {{bubbles: true}}));
                 inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
                 return true;
             }}""", ref_value)
-
-            if ref_filled:
-                log.info(f"[{SERVICE_KEY}]   {label} Reference filled OK")
-                page.wait_for_timeout(300)
-                return
-
-            # Strategy 2: Use nth Reference textbox
-            # Pick-up = section 3.1 → first Reference in pane
-            # Return = section 3.3 → third Reference (nth(2))
-            if section_nth == 2:
-                ref_nth = 0
-            elif section_nth == 4:
-                ref_nth = 2
-            else:
-                ref_nth = 0
-
-            ref_input = page.get_by_role("textbox", name="Reference").nth(ref_nth)
+        except Exception:
+            pass
+ 
+        if filled:
+            log.info(f"[{SERVICE_KEY}]   {label} Reference filled OK")
+            page.wait_for_timeout(300)
+            return
+ 
+        # ── Strategy 2: Playwright nth (dynamically computed) ────────
+        try:
+            # Find the global index of the Reference input in our section
+            ref_nth = page.evaluate(f"""() => {{
+                const pane = document.querySelector('#pane-destination');
+                if (!pane) return -1;
+                const body = pane.querySelector('.routing-tab-panel__body');
+                if (!body) return -1;
+                const section = body.children[{section_nth - 1}];
+                if (!section) return -1;
+ 
+                const allRefs = [...pane.querySelectorAll('input[placeholder="Reference"]')]
+                    .filter(i => i.offsetParent !== null);
+                const sectionRefs = [...section.querySelectorAll('input[placeholder="Reference"]')]
+                    .filter(i => i.offsetParent !== null);
+                if (!sectionRefs.length) return -1;
+                return allRefs.indexOf(sectionRefs[0]);
+            }}""")
+ 
+            if ref_nth >= 0:
+                ref_input = page.get_by_role("textbox", name="Reference").nth(ref_nth)
+                if ref_input.is_visible(timeout=2000):
+                    ref_input.click()
+                    ref_input.fill("")
+                    ref_input.fill(ref_value)
+                    page.keyboard.press("Tab")  # trigger blur to commit in Vue
+                    page.wait_for_timeout(300)
+                    log.info(f"[{SERVICE_KEY}]   {label} Reference filled via nth({ref_nth})")
+                    return
+        except Exception as e:
+            log.warning(f"[{SERVICE_KEY}]   {label} Reference strategy 2 failed: {e}")
+ 
+        # ── Strategy 3: Hardcoded nth fallback ───────────────────────
+        try:
+            fallback_nth = 0 if section_nth == 2 else 2
+            ref_input = page.get_by_role("textbox", name="Reference").nth(fallback_nth)
             if ref_input.is_visible(timeout=2000):
                 ref_input.click()
                 ref_input.fill("")
                 ref_input.fill(ref_value)
+                page.keyboard.press("Tab")
                 page.wait_for_timeout(300)
-                log.info(f"[{SERVICE_KEY}]   {label} Reference filled via nth({ref_nth})")
-            else:
-                log.warning(f"[{SERVICE_KEY}]   {label} Reference input not visible")
-
-        except Exception as e:
-            log.warning(f"[{SERVICE_KEY}]   {label} Reference fill failed: {e}")
+                log.info(f"[{SERVICE_KEY}]   {label} Reference filled via hardcoded nth({fallback_nth})")
+                return
+        except Exception:
+            pass
+ 
+        log.warning(f"[{SERVICE_KEY}]   {label} Reference could not be filled")
 
     def _read_existing_terminal(self, page: Page, section_nth: int) -> str:
         """Read existing terminal name from a Destination section."""
@@ -1354,22 +1766,88 @@ class DeliveryOrderService:
             log.warning(f"[{SERVICE_KEY}]   Delete terminal failed: {e}")
 
     def _save_routing(self, page: Page):
-        """Click Save on the routing page."""
+        """
+        Click Save on the routing page.
+        Uses JS .click() to bypass the mf-drawer_content / mf-drawer_footer
+        overlay that blocks Playwright's native click.
+        """
         try:
-            save_btn = page.locator("button:has-text('Save'):visible").first
-            if save_btn.is_visible(timeout=5000):
-                save_btn.click()
-                page.wait_for_timeout(2500)
-                try:
-                    ok = page.locator("button:has-text('OK'):visible").first
-                    if ok.is_visible(timeout=2000):
-                        ok.click()
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-                log.info(f"[{SERVICE_KEY}] Routing saved")
+            # ── Step 1: Clean up any stale overlays first ────────────
+            # Dialogs/masks from address book may still be lingering
+            self._cleanup_overlays(page)
+ 
+            # ── Step 2: Scroll Save into view ────────────────────────
+            save_found = page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')];
+                const saveBtn = btns.find(b => {
+                    const text = (b.innerText || '').trim();
+                    return text === 'Save' && b.offsetParent !== null && !b.disabled;
+                });
+                if (saveBtn) {
+                    saveBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    return true;
+                }
+                return false;
+            }""")
+ 
+            if not save_found:
+                log.warning(f"[{SERVICE_KEY}] Save button not found in DOM")
+                return
+ 
+            page.wait_for_timeout(800)
+ 
+            # ── Step 3: Click via JS (bypasses any overlay) ──────────
+            clicked = page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')];
+                const saveBtn = btns.find(b => {
+                    const text = (b.innerText || '').trim();
+                    return text === 'Save' && b.offsetParent !== null && !b.disabled;
+                });
+                if (saveBtn) {
+                    saveBtn.click();
+                    return true;
+                }
+                return false;
+            }""")
+ 
+            if not clicked:
+                log.warning(f"[{SERVICE_KEY}] Save JS click failed")
+                return
+ 
+            log.info(f"[{SERVICE_KEY}] Save clicked via JS")
+ 
+            # ── Step 4: Wait for save to complete ────────────────────
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+ 
+            # ── Step 5: Handle confirmation OK dialog ────────────────
+            try:
+                ok_btn = page.locator("button:has-text('OK'):visible").first
+                if ok_btn.is_visible(timeout=2000):
+                    ok_btn.click(timeout=3000)
+                    page.wait_for_timeout(1000)
+            except Exception:
+                pass
+ 
+            # ── Step 6: Check for error toast ────────────────────────
+            error_toast = page.evaluate("""() => {
+                const toasts = document.querySelectorAll(
+                    '.el-message--error, .el-notification__content');
+                for (const t of toasts) {
+                    if (t.offsetParent && t.innerText.trim())
+                        return t.innerText.trim();
+                }
+                return null;
+            }""")
+ 
+            if error_toast:
+                log.warning(f"[{SERVICE_KEY}] Save may have error: {error_toast[:80]}")
             else:
-                log.warning(f"[{SERVICE_KEY}] Save button not visible")
+                log.info(f"[{SERVICE_KEY}] Routing saved")
+ 
         except Exception as e:
             log.warning(f"[{SERVICE_KEY}] Save failed: {e}")
 

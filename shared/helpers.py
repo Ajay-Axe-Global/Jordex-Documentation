@@ -227,7 +227,54 @@ def recover_page(page, service_key: str = "", wait_selector: str = None) -> bool
     except Exception as e:
         log.error("[%s] Stage 2 failed: %s", service_key, e)
         return False
- 
+
+def _download_image_attachment(page, att, temp_dir: str) -> str | None:
+    """
+    Download an image attachment by opening Outlook's preview
+    and using the download button in the preview toolbar.
+    """
+    fname = _att_name(att)
+
+    # Click the image thumbnail to open the lightbox/preview
+    try:
+        img = att.locator("img").first
+        img.click()
+        page.wait_for_timeout(1500)
+    except Exception as e:
+        log.warning("  Could not open image preview: %s", e)
+        return None
+
+    # In the lightbox, look for the Download button
+    try:
+        dl_btn = page.locator(
+            "button[aria-label='Download'], "
+            "button[aria-label='Downloaden'], "
+            "button:has-text('Download'), "
+            "button:has-text('Downloaden')"
+        ).first
+        dl_btn.wait_for(state="visible", timeout=5000)
+
+        with page.expect_download(timeout=30000) as di:
+            dl_btn.click()
+
+        path = os.path.join(temp_dir, fname)
+        di.value.save_as(path)
+        log.info("  Image saved: %s", path)
+
+        # Close the preview
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+        return path
+
+    except Exception as e:
+        log.warning("  Image download from preview failed: %s", e)
+        # Try closing the preview
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return None
+
  
 def download_attachments_to_temp(page, max_retries: int = 2) -> list[str]:
     """
@@ -245,8 +292,10 @@ def download_attachments_to_temp(page, max_retries: int = 2) -> list[str]:
     # Broaden container selector to catch 'av-container' (used for images)
     ctr = page.locator(
         "#ReadingPaneContainerId div[role='listbox'][aria-label='file attachments'],"
+        "#ReadingPaneContainerId div[role='listbox'][aria-label='image attachments'],"
         "#ReadingPaneContainerId div[role='listbox'][aria-label='bijlagen'],"
         "#ReadingPaneContainerId div.av-container"
+        
     ).first
     try:
         ctr.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
@@ -290,7 +339,17 @@ def download_attachments_to_temp(page, max_retries: int = 2) -> list[str]:
  
                 att.hover()
                 page.wait_for_timeout(400)                     # ★ FIX 5: 500→400
- 
+                is_image = att.locator("img.ms-Image-image").count() > 0
+
+                if is_image:
+                    path = _download_image_attachment(page, att, temp_dir)
+                    if path:
+                        saved.append(path)
+                        downloaded = True
+                        break          # exit retry loop
+                    else:
+                        raise Exception("Image preview download failed — will retry")
+
                 more_btn = att.locator("button[aria-label='More actions']").first
                 if more_btn.is_visible():
                     more_btn.click()

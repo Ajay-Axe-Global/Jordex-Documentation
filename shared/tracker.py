@@ -59,6 +59,7 @@ class Tracker:
         "skipped_multi_attach",
         "no_attachment",
         "jordex_not_found",
+        "no_return_info",
         "failed",
     })
 

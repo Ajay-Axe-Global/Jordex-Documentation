@@ -72,12 +72,35 @@ TERMINAL_SHORTCODES = {
     "PSA ANTWERP":                    "913",
     "BTT BARGE TERMINAL":             "BTT",
     "UWT DEPOT":                      "UWT DEPOTS 2",
+    "BTT MULTIMODAL CONTAINER SOLUTIONS": "BTT",
+    "BTT MULTIMODAL CONTAINER":           "BTT",
+    "BTT MULTIMODAL":                     "BTT",
     
 
 }
 
 # Pre-sorted longest key first so "ECT DELTA TERMINAL BV / DDE" matches before "ECT DELTA TERMINAL"
 _SHORTCODE_KEYS_SORTED = sorted(TERMINAL_SHORTCODES.keys(), key=len, reverse=True)
+
+
+def _addr_ref_complete(addr, ref):
+    return bool((addr or "").strip()) and bool((ref or "").strip())
+
+
+def has_valid_return_info(extraction: dict) -> bool:
+    """True if the extraction has a complete return address+reference,
+    either at the top level or for at least one container."""
+    returns = extraction.get("return") or {}
+    if not isinstance(returns, dict):
+        return False
+    if _addr_ref_complete(returns.get("address"), returns.get("reference")):
+        return True
+    for ref in returns.get("references", []) or []:
+        if isinstance(ref, dict) and _addr_ref_complete(ref.get("address"), ref.get("reference")):
+            return True
+    return False
+
+
 class DeliveryOrderService:
     def __init__(self):
         self.status     = "idle"
@@ -211,6 +234,54 @@ class DeliveryOrderService:
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "failed")
 
         return processed_items
+    def _merge_extraction(self, existing: dict, new_ext: dict) -> dict:
+        """
+        Merge a new PDF extraction into an existing one for same MBL.
+        Combines containers and pickup/return references from both.
+        """
+        # Merge containers (deduplicated)
+        existing_cnos = set(existing.get("containers", []))
+        for c in new_ext.get("containers", []):
+            if c and c not in existing_cnos:
+                existing["containers"].append(c)
+                existing_cnos.add(c)
+ 
+        # Merge pickup and return references
+        for section_key in ("pickup", "return"):
+            exist_sec = existing.get(section_key)
+            new_sec = new_ext.get(section_key)
+            if not new_sec or not isinstance(new_sec, dict):
+                continue
+            if not exist_sec or not isinstance(exist_sec, dict):
+                existing[section_key] = new_sec
+                continue
+ 
+            # Keep first non-empty address
+            if not exist_sec.get("address") and new_sec.get("address"):
+                exist_sec["address"] = new_sec["address"]
+ 
+            # Append new references (skip duplicates by container_no)
+            exist_refs = exist_sec.get("references", [])
+            exist_ref_cnos = {
+                (r.get("container_no") or "").strip().upper()
+                for r in exist_refs if isinstance(r, dict)
+            }
+            for ref in new_sec.get("references", []):
+                if not isinstance(ref, dict):
+                    continue
+                cno = (ref.get("container_no") or "").strip().upper()
+                if cno and cno not in exist_ref_cnos:
+                    exist_refs.append(ref)
+                    exist_ref_cnos.add(cno)
+            exist_sec["references"] = exist_refs
+ 
+        log.info(
+            f"[{SERVICE_KEY}] Merged extraction: now {len(existing.get('containers', []))} containers, "
+            f"pickup_refs={len((existing.get('pickup') or {}).get('references', []))}, "
+            f"return_refs={len((existing.get('return') or {}).get('references', []))}"
+        )
+        return existing
+
 
     def _process_multi_pdfs(self, pdf_files, all_temp_files, base, subject, cid, pw=None) -> list:
         """
@@ -282,10 +353,9 @@ class DeliveryOrderService:
     
             doc_subtype = ext.get("doc_subtype", "delivery_order")
     
-            if doc_subtype == "acknowledgement":
-                # Acknowledgement → no extraction, upload as Additional Files
+            if doc_subtype in ("acknowledgement", "other"):
                 folder_groups[folder_name]["ack_pdfs"].append(pdf_path)
-                log.info(f"[{SERVICE_KEY}] '{os.path.basename(pdf_path)}' is Acknowledgement → Additional Files")
+                log.info(f"[{SERVICE_KEY}] '{os.path.basename(pdf_path)}' is {doc_subtype} → Additional Files")
             elif doc_subtype == "invoice":
                 # Invoice → skip entirely
                 log.info(f"[{SERVICE_KEY}] '{os.path.basename(pdf_path)}' is Invoice → skipping")
@@ -293,9 +363,13 @@ class DeliveryOrderService:
             else:
                 # Actual Delivery Order → full extraction
                 folder_groups[folder_name]["pdfs"].append(pdf_path)
-                # Use the DO extraction (not acknowledgement) for destination fill
+                # Merge extraction: combine containers + references from all DOs
                 if folder_groups[folder_name]["extraction"] is None:
                     folder_groups[folder_name]["extraction"] = ext
+                else:
+                    folder_groups[folder_name]["extraction"] = self._merge_extraction(
+                        folder_groups[folder_name]["extraction"], ext
+                    )
                 log.info(f"[{SERVICE_KEY}] '{os.path.basename(pdf_path)}' is Delivery Order → Container release")
     
         # Non-PDF temps go to first folder
@@ -386,13 +460,12 @@ class DeliveryOrderService:
         return file_map
      
     def _build_ack_file_map(self, ack_files):
-        """Build file_map for Acknowledgement files: type='Additional Files', keep original name."""
+        """Build file_map for Acknowledgement files: type='Additional Files', no rename."""
         file_map = {}
         for filepath in ack_files:
             filename = os.path.basename(filepath)
-            # Use original filename (without .pdf extension) as display name
-            name_without_ext = os.path.splitext(filename)[0]
-            file_map[filename] = ("Additional Files", name_without_ext)
+            # None = skip renaming, upload file as-is
+            file_map[filename] = ("Additional Files", None)
         return file_map
         
     def _resolve_terminal_shortcode(self, terminal_address: str) -> str | None:
@@ -434,9 +507,13 @@ class DeliveryOrderService:
         """
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
- 
+
         # Deduplicate: track folder_names already uploaded this batch
         uploaded_folders: set[str] = set()
+        # conv_ids that had at least one item with no return address/ref —
+        # flagged unread AFTER the loop so it isn't overwritten by an
+        # "uploaded" status from a sibling item in the same email
+        missing_return_conv_ids: set[str] = set()
 
         for item in items:
             if self._stop_evt.is_set():
@@ -459,6 +536,15 @@ class DeliveryOrderService:
                 log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email")
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 uploaded_folders.add(folder_name)
+                continue
+
+            extraction = item.get("extraction")
+            if extraction and not has_valid_return_info(extraction):
+                log.info(
+                    f"[{SERVICE_KEY}] No return address/ref for '{folder_name}' "
+                    f"— skipping Jordex search, flagging email for manual review"
+                )
+                missing_return_conv_ids.add(item.get("conv_id"))
                 continue
 
             query = normalize_oi_reference(query)
@@ -525,16 +611,27 @@ class DeliveryOrderService:
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 uploaded_folders.add(folder_name)
 
+        # ── Flag emails with missing return address/ref for manual review ──
+        # Runs after the main loop so it isn't clobbered by an "uploaded"
+        # status written earlier for a sibling item in the same email.
+        for cid in missing_return_conv_ids:
+            mark_as_unread(outlook_page, cid)
+            tracker.update_status(CAT, cid, "no_return_info")
+
     # ══════════════════════════════════════════════════════════════════
     #  DESTINATION FILL — View Routing → 3. Destination
     # ══════════════════════════════════════════════════════════════════
 
     def _fill_destination(self, page: Page, extraction: dict):
         """
-        Open View Routing → Destination tab → for each container:
+        Open View Routing → Destination tab → for each container
+        that exists in our extraction:
           3.1 Pick-up Terminal: fill address + reference
           3.3 Return Terminal: fill address + reference
         Then save and go back to shipment detail.
+ 
+        KEY CHANGE: Only fills containers we have data for.
+        If sidebar has 5 containers but our DO covers 1, only that 1 is filled.
         """
         pickup   = extraction.get("pickup", {})
         returns  = extraction.get("return", {})
@@ -566,9 +663,24 @@ class DeliveryOrderService:
             log.info(f"[{SERVICE_KEY}] No destination data to fill — skipping")
             return
  
+        # ── Build set of containers we have data for ─────────────────
+        known_containers = set()
+        for c in containers:
+            if isinstance(c, str) and c.strip():
+                known_containers.add(c.strip().upper())
+        for ref in pickup.get("references", []):
+            cno = (ref.get("container_no") or "").strip().upper()
+            if cno:
+                known_containers.add(cno)
+        for ref in returns.get("references", []):
+            cno = (ref.get("container_no") or "").strip().upper()
+            if cno:
+                known_containers.add(cno)
+ 
         log.info(
             f"[{SERVICE_KEY}] Filling destination: pickup='{pickup_address}' "
-            f"ref='{pickup_ref}' return_mode='{ref_mode}' containers={len(containers)}"
+            f"ref='{pickup_ref}' return_mode='{ref_mode}' "
+            f"known_containers={known_containers or 'ALL'}"
         )
  
         # ── Open View Routing ────────────────────────────────────────
@@ -589,28 +701,26 @@ class DeliveryOrderService:
  
         log.info(f"[{SERVICE_KEY}] Sidebar has {sidebar_count} container block(s)")
  
-        # ── Process each container ──────────────────────────────────
+        # ── Process only containers we have data for ─────────────────
+        filled_any = False
         for idx in range(sidebar_count):
             if self._stop_evt.is_set():
                 break
  
-            # Click sidebar block + wait for content reload
-            if idx > 0:
-                page.evaluate(f"""() => {{
-                    const c = document.querySelector('.cargo-tab__content');
-                    const blocks = c ? c.querySelectorAll('.cargo-tab__block')
-                                     : document.querySelectorAll('.cargo-tab__block');
-                    if (blocks[{idx}]) blocks[{idx}].click();
-                }}""")
-                page.wait_for_timeout(2500)
-                # Wait for any loading spinner to disappear
-                try:
-                    page.locator(".el-loading-mask").wait_for(state="hidden", timeout=5000)
-                except Exception:
-                    pass
- 
             sidebar_cno = self._read_sidebar_container_no(page, idx)
-            log.info(f"[{SERVICE_KEY}] Container [{idx + 1}/{sidebar_count}]: {sidebar_cno}")
+ 
+            # ── SKIP if this container is not in our extraction ──────
+            if known_containers and sidebar_cno and sidebar_cno not in known_containers:
+                log.info(
+                    f"[{SERVICE_KEY}] Skipping container [{idx + 1}/{sidebar_count}]: "
+                    f"{sidebar_cno} — not in our DO"
+                )
+                continue
+ 
+            log.info(f"[{SERVICE_KEY}] Container [{idx + 1}/{sidebar_count}]: {sidebar_cno} — FILLING")
+ 
+            # ── Click this specific sidebar block ────────────────────
+            self._click_sidebar_container(page, idx, sidebar_cno)
  
             # Resolve return data for this container
             if sidebar_cno and sidebar_cno in return_lookup:
@@ -676,10 +786,52 @@ class DeliveryOrderService:
  
             # ── Save after each container ────────────────────────────
             self._save_routing(page)
+            filled_any = True
  
         # ── Go back to shipment detail ──────────────────────────────
         self._go_back_from_routing(page)
-        log.info(f"[{SERVICE_KEY}] Destination fill complete")
+        log.info(f"[{SERVICE_KEY}] Destination fill complete (filled={filled_any})")
+
+
+    def _click_sidebar_container(self, page: Page, idx: int, container_no: str):
+        """
+        Click a specific container in the routing sidebar.
+        Strategy 1: Playwright filter by container number text (most reliable)
+        Strategy 2: JS click by index (fallback)
+        """
+        if container_no:
+            # Strategy 1: Playwright locator filter (from recorded session)
+            try:
+                block = page.locator("div").filter(
+                    has_text=re.compile(rf"^{re.escape(container_no)}$")
+                )
+                if block.count() > 0 and block.first.is_visible(timeout=2000):
+                    block.first.click()
+                    page.wait_for_timeout(2500)
+                    try:
+                        page.locator(".el-loading-mask").wait_for(state="hidden", timeout=5000)
+                    except Exception:
+                        pass
+                    log.info(f"[{SERVICE_KEY}]   Clicked sidebar container {container_no} via Playwright filter")
+                    return
+            except Exception:
+                pass
+ 
+        # Strategy 2: JS click by index
+        if idx > 0:
+            page.evaluate(f"""() => {{
+                const c = document.querySelector('.cargo-tab__content');
+                const blocks = c ? c.querySelectorAll('.cargo-tab__block')
+                                 : document.querySelectorAll('.cargo-tab__block');
+                if (blocks[{idx}]) blocks[{idx}].click();
+            }}""")
+            page.wait_for_timeout(2500)
+            try:
+                page.locator(".el-loading-mask").wait_for(state="hidden", timeout=5000)
+            except Exception:
+                pass
+            log.info(f"[{SERVICE_KEY}]   Clicked sidebar container index {idx} via JS")
+ 
     
     def _ensure_destination_tab(self, page: Page) -> bool:
         """
@@ -1085,17 +1237,19 @@ class DeliveryOrderService:
         # ══════════════════════════════════════════════════════════════
         #  PHASE 1: Search by name, score results
         # ══════════════════════════════════════════════════════════════
-        search_term = self._resolve_terminal_shortcode(terminal_name) or self._build_search_term(terminal_name)
+        shortcode = self._resolve_terminal_shortcode(terminal_name)
+        search_term = shortcode or self._build_search_term(terminal_name)
         log.info(f"[{SERVICE_KEY}]   {label} Phase 1 search: '{search_term}'")
- 
+
         if not self._fill_search_box(page, search_term, label):
             self._close_dialog_properly(page, label)
             return
- 
+
         page.wait_for_timeout(2500)
- 
-        # Score and click
-        matched = self._score_and_click_best_row(page, terminal_name, label, min_score=12)
+
+        # If shortcode resolved, we already know the target — use lower threshold
+        phase1_min_score = 6 if shortcode else 12
+        matched = self._score_and_click_best_row(page, terminal_name, label, min_score=phase1_min_score)
  
         # ══════════════════════════════════════════════════════════════
         #  PHASE 2: If no confident match, search by street name

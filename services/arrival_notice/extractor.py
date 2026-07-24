@@ -80,6 +80,17 @@ RULES FOR carrier_name and carrier_code:
    - Hamburg Süd → SUDU
    CRITICAL: ALWAYS return carrier_code. If you see a carrier logo or name, you MUST map it.
    Never return carrier_code as null if carrier_name is identified.
+
+    RULES FOR container_no:
+    1. Container numbers are ALWAYS 4 uppercase letters + 7 digits (e.g. ZIMU3157970).
+    2. If the document shows "ZIMU 3157970 - 20FT" → extract "ZIMU3157970" (remove space, strip size suffix).
+    3. NEVER return just the numeric part. Always include the 4-letter prefix.
+
+    RULES FOR FPS / Famous Pacific Shipping:
+    1. If you see "FPS" logo or "Famous Pacific Shipping" → carrier_code = "FPS", carrier_name = "FPS".
+    2. FPS is the NVOCC carrier on the BL — do NOT use the vessel operator (MSC, ZIM, etc.) as carrier.
+    3. The BL is under "Bill of Lading" field (e.g. "231164").
+
 """
 
 
@@ -255,6 +266,18 @@ def _regex_fallback(pdf_path: str, result: dict) -> dict:
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════
 
+def _extract_oi_from_subject(subject: str) -> str | None:
+    """Extract OI reference from email subject for FPS/FCS carriers."""
+    if not subject:
+        return None
+    m = re.search(r'YourReference[:\s]*([A-Z]{2}\d{5,})', subject, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'\b(OI\d{5,})\b', subject)
+    if m:
+        return m.group(1).strip()
+    return None
+
 def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> dict:
     """
     Extract reference (B/L Number) + arrival_date from an Arrival Notice PDF.
@@ -319,6 +342,13 @@ def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> 
         result["carrier_code"] = resolve_carrier_code(
             result["carrier_name"], result["carrier_code"]
         )
+
+        # FPS carrier code fix — resolve_carrier_code may not map it
+        if not result["carrier_code"]:
+            carrier_lower = (result.get("carrier_name") or "").lower()
+            if "fps" in carrier_lower or "famous pacific" in carrier_lower:
+                result["carrier_code"] = "FPS"
+                log.info("  AN carrier_code resolved to FPS from name")
 
         # ── Ensure reference has a known SCAC prefix ────────────────
         if result["reference"] and result["carrier_code"]:
@@ -401,6 +431,15 @@ def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> 
             except Exception as e:
                 log.warning("  AN FCS extra extraction failed: %s", e)
                 # FCS extra fields remain None — non-fatal, standard fields are intact
+            
+        # ── FCS/FPS: Use OI from subject as primary reference ────────
+        if result.get("is_fcs") and subject:
+                oi_ref = _extract_oi_from_subject(subject)
+                if oi_ref:
+                    result["bl_number"] = result["reference"]
+                    result["reference"] = oi_ref
+                    log.info("  AN FPS: Using OI from subject: %s (BL=%s)",
+                            oi_ref, result.get("bl_number"))
         # ══════════════════════════════════════════════════════════════
 
     except json.JSONDecodeError as e:

@@ -66,11 +66,15 @@ doc_subtype rules:
 - "acknowledgement": title says "Acknowledgement copy for delivery order request" or
   "Delivery Order request" or "Smart Inland Delivery request". A request confirmation, NOT the release.
 - "invoice": explicitly says "INVOICE" or "INVOICE NO." as the document type.
-- "other": anything else.
+- "other": anything else — including Terms and Conditions pages,
+  general instructions, cover letters, or documents with no container/shipment data.
 
 MBL: starts with SCAC (HLCU, MAEU, MRKU, MSCU, MEDU, ONEY, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU, HDMU).
 *EXCEPTION*: For Maersk (MAEU), the B/L number is often purely numeric (e.g., "270557106"). If you see "B/L number: [digits]", extract exactly those digits. Do NOT extract the "Request Number" (like "HZJQCNSXZ5K") as the MBL.
-Container: 4 uppercase letters + 7 digits. Use "" for missing values. Pure JSON only, no markdown."""
+Container: STRICTLY 4 uppercase letters + 7 digits (e.g. TGBU4744557, HMMU4531833).
+Do NOT extract voyage numbers (e.g. ODUT0019W, 0087W), vessel codes, or booking numbers as containers.
+If the container table is empty or has no data rows → containers = [].
+Use "" for missing values. Pure JSON only, no markdown."""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -115,13 +119,21 @@ CRITICAL — ADDRESS vs REFERENCE SEPARATION:
   Example of WRONG: {"address": "ONEMT", "reference": "ONEMT"}
   Example of RIGHT: {"address": "",      "reference": "ONEMT"}
  
-MISSING DATA RULES:
+ MISSING DATA RULES:
 - If the container table is empty or no container numbers are visible → "references": [].
   Do NOT fabricate container numbers. Return an empty array.
+- Do NOT confuse voyage numbers (e.g. "ODUT0019W", "0087W") with container numbers.
+  Container numbers are ALWAYS 4 uppercase letters + 7 digits (e.g. TGBU4744557).
 - If a section (pickup or return) has no data at all in the document:
   → {"address": "", "references": []}
 - NEVER fill address with a reference code just because the address is missing.
-  Missing address = "", missing reference = use carrier default (PCS, ONEMT, etc.).
+ 
+PICKUP vs RETURN REFERENCE DEFAULTS:
+- PICKUP reference missing → use "PCS" (Portbase Community System lookup).
+- RETURN reference missing → use "" (empty string). Do NOT use "PCS" for return.
+  Return references are carrier-specific codes. If none is given, leave empty.
+- Only use a carrier default (ONEMT, MAEMT, etc.) when the carrier prompt explicitly says to.
+
 """
 
 _OUTPUT_SCHEMA = _GENERAL_RULES + """Return ONLY valid JSON (no markdown, no backticks):
@@ -257,27 +269,49 @@ RETURN:
 # ─────────────────────────────────────────────────────────────────────
 CARRIER_PROMPTS["OOLU"] = _OUTPUT_SCHEMA + """
 This is an OOCL Delivery Order.
-
+ 
 PICKUP:
 - address = "CARGO PICKUP LOCATION" section (left side, below container table).
   Example: "Euromax Terminal Rotterdam BV, Maasvlakte weg 951"
 - reference per container = Look for "PIN" at the top of the document or in the table.
   → If a pincode value exists → use it.
   → If blank or no PIN field → use "PCS".
-
+ 
 RETURN:
 - address = "EMPTY RETURN LOCATION" section (middle, below container table).
-  Example: "UWT Bunschotenweg (Depot 2)"
-- reference per container = Read the "REMARKS" section carefully. It lists return rules
-  per container size/type, like:
-    "20GP = RCT Kramer Delta - CONTAINER NUMBER"
+  Example: "Rotterdam Container Terminal, Missouriweg 17"
+- reference per container: Read the "REMARKS" section carefully.
+ 
+  REMARKS FORMAT — each line maps a container SIZE/TYPE to a return rule:
+    "20GP = UWT DEPOT 2-REFERENCE:?CONTAINER NUMBER"
     "40GP = EUROMAX"
-    "45HQ + 40HQ = UWT MAASVLAKTE - REFERENCE: CONTAINER NUMBER"
-    "20RF + 40HQ = UWT DEPOT 2 - REFERENCE: CONTAINER NUMBER"
-  Find the line that matches this container's SIZE/TYPE (from the table above).
-  → If it says "CONTAINER NUMBER" → use the container's ACTUAL container number as the reference.
-  → If it says a specific depot name without "CONTAINER NUMBER" → use that depot name.
-  → If no matching rule → "".
+    "40HQ = RCT Kramer Delta-CONTAINER NUMBER"
+    "45HQ = UWT MAASVLAKTE-REFERENCE: CONTAINER NUMBER"
+ 
+  HOW TO READ EACH LINE:
+  1. Match the container's SIZE/TYPE (from the table: 20GP, 40GP, 40HQ, etc.)
+  2. The text after "=" has TWO possible formats:
+     a) "DEPOT NAME-REFERENCE: CONTAINER NUMBER" or "DEPOT NAME-CONTAINER NUMBER"
+        → reference = the container's ACTUAL container number (e.g. "TGBU4744557")
+        → also update this container's return address to the depot named here
+     b) "DEPOT NAME" only (no dash, no "CONTAINER NUMBER", no "REFERENCE:")
+        → reference = "" (empty — just a depot name, no reference instruction)
+        → update this container's return address to this depot name
+  3. If no line matches this container's SIZE/TYPE → reference = ""
+ 
+  CRITICAL: "CONTAINER NUMBER" is a LITERAL instruction meaning
+  "use the actual container number as the reference value".
+  It is NOT a placeholder for you to ignore.
+ 
+  Example with container TGBU4744557 (40HQ):
+    "40HQ = RCT Kramer Delta-CONTAINER NUMBER"
+    → return address for this container = "RCT Kramer Delta"
+    → return reference = "TGBU4744557"
+ 
+  Example with container XXXX1234567 (40GP):
+    "40GP = EUROMAX"
+    → return address for this container = "EUROMAX"
+    → return reference = "" (no reference instruction given)
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -302,8 +336,12 @@ RETURN:
 - reference per container = "Turn-In Ref" column in the EQ Return Facility table.
   → If a Turn-In Ref exists and is an actual code → use it.
   → CRITICAL: If the Turn-In Ref says "Contact HMM Netherlands" or similar instructions, use an EMPTY STRING "". Do NOT mistakenly extract numbers from the Facility Name (like "8970") as the reference.
-  → If empty → check the container's size/type (e.g. "20DC", "40HQ") and use that as reference.
-  → If nothing at all → "PCS".
+ → If Turn-In Ref says "[CntrNo]" or "[ContainerNo]" → use the container's
+    ACTUAL container number as the reference (e.g. "HMMU4531833").
+  → If Turn-In Ref says "Contact HMM Netherlands" or similar instructions → reference = "".
+  → CRITICAL: Do NOT extract numbers from the Facility Name (like "8970") as reference.
+  → If Turn-In Ref is empty or missing → reference = "".
+  → Do NOT use "PCS" for HMM return references.
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -346,22 +384,52 @@ RETURN — THIS TABLE CAN HAVE MULTIPLE ROWS WITH DIFFERENT ADDRESSES:
 # 9. MSC (MSCU) — "RELEASE ORDER"
 # ─────────────────────────────────────────────────────────────────────
 CARRIER_PROMPTS["MSCU"] = _OUTPUT_SCHEMA + """
-This is an MSC Release Order.
-
+This is an MSC "RELEASE ORDER" document.
+ 
+DOCUMENT LAYOUT:
+  TOP TABLE: VESSELNAME | VOYAGE NO | ESTIMATED DATE OF ARRIVAL
+  SECOND ROW: BILL OF LADING | PORT OF LOADING | PORT OF DISCHARGE
+  THIRD ROW: NUMBER OF CONTAINERS
+ 
+  MAIN TABLE has 3 columns:
+    CONTAINERNUMBER | TYPE | CONTAINER RELEASE DETAILS
+ 
+  Inside the "CONTAINER RELEASE DETAILS" column, there are LABEL-VALUE pairs
+  stacked vertically for EACH container:
+    RELEASE REFERENCE    → value (URL or pincode)
+    TERMINAL             → value (pickup terminal name)
+    VALIDITY             → value (date)
+    DROP OFF REFERENCE   → value (return reference code)
+    DEPOT                → value (return depot name + address)
+ 
+  Read EACH container row separately. Each container has its OWN set of
+  TERMINAL, DEPOT, RELEASE REFERENCE, and DROP OFF REFERENCE values.
+ 
 PICKUP:
-- address = "TERMINAL" field in the "CONTAINER RELEASE DETAILS" section.
-  Example: "ECT DELTA DDE"
-- reference per container = "RELEASE REFERENCE" field.
+- address = the "TERMINAL" value from inside CONTAINER RELEASE DETAILS.
+  Example: "ECT DELTA DDN" or "ECT DELTA DDE" or "EUROMAX TERMINAL"
+  → Extract ONLY the terminal name. Remove any address/city after it.
+- reference per container = the "RELEASE REFERENCE" value.
   → If it shows a Portbase URL (e.g. "https://start.pcs.portbase.com/") → use "PCS".
-  → If an actual pincode/reference value → use it.
-
+  → If an actual pincode/reference code → use it.
+ 
 RETURN:
-- address = "DEPOT" field in the "CONTAINER RELEASE DETAILS" section.
-  Example: "MED, Smirnoffweg 17, 3088 HE, Rotterdam"
-- reference per container = "DROP OFF REFERENCE" field.
-  Example: "614RTB723236"
-  → If a value exists → use it.
+- address = the "DEPOT" value from inside CONTAINER RELEASE DETAILS.
+  The DEPOT line often has format: "CODE, Street, Postal City"
+  Example: "ECT, Europaweg 875, 3199 LD, Rotterdam" → address = "ECT"
+  Example: "MED, Smirnoffweg 17, 3088 HE, Rotterdam" → address = "MED"
+  → Extract the depot CODE or NAME (the first part before the comma).
+  → If DEPOT = "ECT" and TERMINAL also contains "ECT" → the return depot is the same terminal.
+- reference per container = the "DROP OFF REFERENCE" value.
+  Example: "601RTST45166" or "614RTB723236"
+  → If a value exists → use it exactly.
   → If missing/empty → set flag = "forward_to_jordex_import".
+ 
+CRITICAL NOTES:
+- The BL number may start with MEDU (not MSCU). Both are valid MSC prefixes.
+- Do NOT confuse VALIDITY (a date) with a reference.
+- Each container may have DIFFERENT terminal/depot/references — read each row independently.
+- If the document has a "COMMENTS" section at the bottom, ignore it for extraction.
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -420,6 +488,10 @@ RETURN:
     Extract terminal name with descriptive suffix, remove location code and city.
     "NLRTM24 (KRAMER TERMINAL (ONE DEDICATED DEPOT), ROTTERDAM)" → "KRAMER TERMINAL (ONE DEDICATED DEPOT)"
 - reference: read REMARKS section for "REF: [CODE]" or "OPEN REF.: '[CODE]'".
+- If the "Container Information" table has NO container rows (headers only, no data):
+  → containers in Call 1 = [] (empty array)
+  → references arrays = [] (empty)
+  → Do NOT extract voyage numbers (like "ODUT0019W") as container numbers.
   Extract exact code. If not found → "ONEMT".
 """
 
@@ -827,7 +899,7 @@ def _apply_safety_net(scac: str, result: dict) -> dict:
 
     elif scac == "HDMU":
         _pcs_if_empty(pickup)
-        _pcs_if_empty(ret)
+        
 
     elif scac == "CMDU":
         _cmdu_clean_pickup(pickup)

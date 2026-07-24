@@ -232,6 +232,13 @@ class CustomerDocsService:
                 tracker.update_status(CAT, item["conv_id"], "uploaded")
                 continue
 
+            if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name, mbl=item.get("mbl"),
+                                              exclude_conv_id=item["conv_id"]):
+                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email")
+                tracker.update_status(CAT, item["conv_id"], "uploaded")
+                uploaded_folders.add(folder_name)
+                continue
+
             query = normalize_oi_reference(query)
             success, used_ref, rows_found = search_jordex_with_fallback(
                 jordex_page=jordex_page,

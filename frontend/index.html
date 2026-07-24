@@ -207,6 +207,29 @@
     .pill-Skipped       { background:rgba(156,163,175,.2); color:#9ca3af; }
     .mbl-code { font-family:monospace; font-size:11px; color:var(--accent); }
     .cat-tag  { font-size:10px; background:var(--surface2); border-radius:4px; padding:2px 5px; color:var(--text2); }
+
+    /* Statistics */
+    .stats-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:14px; }
+    .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s; }
+    .stat-card:hover { border-color:var(--accent); }
+    .stat-card-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+    .stat-card-title { font-size:13px; font-weight:600; }
+    .stat-counts { display:flex; gap:14px; }
+    .stat-count { display:flex; flex-direction:column; align-items:center; gap:2px; }
+    .stat-count .n { font-size:18px; font-weight:700; }
+    .stat-count .l { font-size:9px; color:var(--text2); text-transform:uppercase; letter-spacing:.5px; }
+    .stat-count.info  .n { color:#60a5fa; }
+    .stat-count.warn  .n { color:var(--warning); }
+    .stat-count.err   .n { color:var(--danger); }
+    .stat-issues { margin-top:12px; border-top:1px solid var(--border); padding-top:10px; max-height:220px; overflow-y:auto; display:none; }
+    .stat-card.expanded .stat-issues { display:block; }
+    .stat-issue-row { font-size:11px; padding:5px 0; border-bottom:1px solid var(--border); display:flex; gap:8px; }
+    .stat-issue-row:last-child { border-bottom:none; }
+    .stat-issue-row .t { color:var(--text2); font-family:monospace; white-space:nowrap; }
+    .stat-issue-row .m { color:var(--text); word-break:break-word; }
+    .stat-issue-row.WARNING .t { color:var(--warning); }
+    .stat-issue-row.ERROR   .t { color:var(--danger); }
+    .stat-empty { font-size:11px; color:var(--text2); padding:6px 0; }
     .tree-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; vertical-align: middle; box-shadow: 0 0 4px rgba(0,0,0,0.2); flex-shrink: 0; }
 
     /* ════════════════════════════════════════════════════════
@@ -388,8 +411,9 @@
       </div>
     </div>
     <div class="tabbar">
-      <button class="tab-btn active" id="btn-dashboard" onclick="switchTab('dashboard')">&#9681; Dashboard</button>
-      <button class="tab-btn"        id="btn-documents" onclick="switchTab('documents')">&#128193; Documents</button>
+      <button class="tab-btn active" id="btn-dashboard"  onclick="switchTab('dashboard')">&#9681; Dashboard</button>
+      <button class="tab-btn"        id="btn-documents"  onclick="switchTab('documents')">&#128193; Documents</button>
+      <button class="tab-btn"        id="btn-statistics" onclick="switchTab('statistics')">&#128202; Statistics</button>
     </div>
     <div class="server-dot"><div class="dot"></div><span id="last-updated">Online</span></div>
   </div>
@@ -417,7 +441,7 @@
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
         <div class="section-title" style="margin-bottom: 0;">Recent Activity</div>
         <div style="display: flex; gap: 10px; align-items: center;">
-          <input type="text" id="activitySearch" placeholder="Search OI, REF..." style="padding: 6px 10px; border-radius: 4px; border: 1px solid #2d3748; background: var(--surface); color: var(--text); outline: none; font-size: 0.9rem;" oninput="applyActivityFilter()" />
+          <input type="text" id="activitySearch" placeholder="Search OI, REF, Carrier..." style="padding: 6px 10px; border-radius: 4px; border: 1px solid #2d3748; background: var(--surface); color: var(--text); outline: none; font-size: 0.9rem;" oninput="onActivitySearchInput()" />
           <select id="activityFilter" style="padding: 6px 10px; border-radius: 4px; border: 1px solid #2d3748; background: var(--surface); color: var(--text); outline: none; font-size: 0.9rem;" onchange="applyActivityFilter()">
             <option value="">All Categories</option>
             <option value="Customs_Docs">01.Customs docs</option>
@@ -432,11 +456,12 @@
       <table class="activity-table">
         <thead>
           <tr>
-            <th>Category</th><th>Subject / Folder</th><th>MBL</th><th>Files</th><th>Status</th><th>Time</th>
+            <th>Category</th><th>Subject / Folder</th><th>MBL</th><th>Carrier</th><th>Files</th><th>Status</th><th>Time</th>
           </tr>
         </thead>
-        <tbody id="activityBody"><tr><td colspan="6" style="padding:20px;text-align:center;color:var(--text2)">Loading...</td></tr></tbody>
+        <tbody id="activityBody"><tr><td colspan="7" style="padding:20px;text-align:center;color:var(--text2)">Loading...</td></tr></tbody>
       </table>
+      <div id="activityPagination" style="display:flex;justify-content:center;align-items:center;gap:6px;margin-top:10px;"></div>
     </div>
   </div>
 
@@ -475,6 +500,22 @@
           <div class="json-pane" id="jsonPane"></div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       STATISTICS TAB
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="tab-statistics" class="tab-panel" style="flex-direction:column;overflow-y:auto;padding:22px;gap:18px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div class="section-title" style="margin-bottom:0;">Daily Log Statistics — per label</div>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <input type="date" id="statsDate" style="padding:6px 10px;border-radius:4px;border:1px solid #2d3748;background:var(--surface);color:var(--text);outline:none;font-size:0.9rem;" onchange="loadLogStats()" />
+        <button class="btn btn-outline" onclick="loadLogStats()">&#8635; Refresh</button>
+      </div>
+    </div>
+    <div class="stats-grid" id="statsGrid">
+      <div class="stat-empty">Loading…</div>
     </div>
   </div>
 
@@ -589,60 +630,81 @@
     setTimeout(loadStatus, 800);
   }
 
+  let activityPage = 1;
+  let activityTotal = 0;
+  const ACTIVITY_PAGE_SIZE = 20;
+
   async function loadStatus() {
     try {
+      const searchStr = document.getElementById("activitySearch")?.value || "";
+      const filterCat = document.getElementById("activityFilter")?.value || "";
+      const params = new URLSearchParams({ page: activityPage, page_size: ACTIVITY_PAGE_SIZE });
+      if (searchStr) params.set("search", searchStr);
+      if (filterCat) params.set("category", filterCat);
+
       const [sRes, tRes] = await Promise.all([
         fetch("/api/services/status"),
-        fetch("/api/tracker"),
+        fetch("/api/tracker?" + params.toString()),
       ]);
       const sData = await sRes.json();
       const tData = await tRes.json();
       window.fullTrackerData = tData;
       updateCards(sData);
-      updateActivity(tData.recent || []);
+      updateActivity(tData);
       document.getElementById("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
     } catch(e) { console.error(e); }
   }
 
-  let _lastRecent = [];
-
-  function updateActivity(recent) {
-    _lastRecent = recent;
-    applyActivityFilter();
+  let _activitySearchDebounce = null;
+  function onActivitySearchInput() {
+    clearTimeout(_activitySearchDebounce);
+    _activitySearchDebounce = setTimeout(applyActivityFilter, 300);
   }
 
   function applyActivityFilter() {
-    const tbody = document.getElementById("activityBody");
-    const searchStr = document.getElementById("activitySearch")?.value.toLowerCase() || "";
-    const filterCat = document.getElementById("activityFilter")?.value || "";
-    
-    let filtered = _lastRecent;
-    
-    if (filterCat) {
-      filtered = filtered.filter(r => r.category === filterCat);
-    }
-    
-    if (searchStr) {
-      filtered = filtered.filter(r => {
-        const mbl = (r.mbl || "").toLowerCase();
-        const subj = (r.folder || r.subject || "").toLowerCase();
-        return mbl.includes(searchStr) || subj.includes(searchStr);
-      });
-    }
+    activityPage = 1;
+    loadStatus();
+  }
 
-    if (!filtered.length) {
-      tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--text2)">No activity found</td></tr>';
+  function goActivityPage(p) {
+    activityPage = p;
+    loadStatus();
+  }
+
+  function updateActivity(tData) {
+    activityTotal = tData.total || 0;
+    renderActivityRows(tData.recent || []);
+    renderActivityPagination();
+  }
+
+  function renderActivityRows(recent) {
+    const tbody = document.getElementById("activityBody");
+    if (!recent.length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="padding:20px;text-align:center;color:var(--text2)">No activity found</td></tr>';
       return;
     }
-    
-    tbody.innerHTML = filtered.slice(0, 25).map(r => {
-      const pill  = `<span class="status-pill pill-${r.status}">${r.status}</span>`;
-      const mbl   = r.mbl ? `<span class="mbl-code">${esc(r.mbl)}</span>` : "—";
-      const subj  = esc((r.folder || r.subject || "").substring(0, 50));
-      const cat   = `<span class="cat-tag">${esc(r.category)}</span>`;
-      const time  = r.time ? new Date(r.time).toLocaleTimeString() : "";
-      return `<tr><td>${cat}</td><td>${subj}</td><td>${mbl}</td><td>${r.files ? r.files.length : 0}</td><td>${pill}</td><td>${time}</td></tr>`;
+
+    tbody.innerHTML = recent.map(r => {
+      const pill    = `<span class="status-pill pill-${r.status}">${r.status}</span>`;
+      const mbl     = r.mbl ? `<span class="mbl-code">${esc(r.mbl)}</span>` : "—";
+      const carrier = r.carrier_code ? esc(r.carrier_code) : "—";
+      const subj    = esc((r.folder || r.subject || "").substring(0, 50));
+      const cat     = `<span class="cat-tag">${esc(r.category)}</span>`;
+      const time    = r.time ? new Date(r.time).toLocaleTimeString() : "";
+      return `<tr><td>${cat}</td><td>${subj}</td><td>${mbl}</td><td>${carrier}</td><td>${r.files ? r.files.length : 0}</td><td>${pill}</td><td>${time}</td></tr>`;
     }).join('');
+  }
+
+  function renderActivityPagination() {
+    const el = document.getElementById("activityPagination");
+    if (!el) return;
+    const totalPages = Math.max(1, Math.ceil(activityTotal / ACTIVITY_PAGE_SIZE));
+    if (activityPage > totalPages) activityPage = totalPages;
+    el.innerHTML = `
+      <button class="btn btn-outline" ${activityPage <= 1 ? "disabled" : ""} onclick="goActivityPage(${activityPage - 1})">&laquo; Prev</button>
+      <span style="padding:0 10px;color:var(--text2);font-size:12px;">Page ${activityPage} of ${totalPages} (${activityTotal} total)</span>
+      <button class="btn btn-outline" ${activityPage >= totalPages ? "disabled" : ""} onclick="goActivityPage(${activityPage + 1})">Next &raquo;</button>
+    `;
   }
 
   // ═══════════════════════════════════════════════════
@@ -900,6 +962,58 @@
     document.getElementById("tab-" + name).classList.add("active");
     document.getElementById("btn-" + name).classList.add("active");
     if (name === "documents") loadTreeRoot();
+    if (name === "statistics") loadLogStats();
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  STATISTICS TAB
+  // ═══════════════════════════════════════════════════
+
+  const LABEL_BY_KEY = Object.fromEntries(SERVICES.map(s => [s.key, s.label]));
+
+  async function loadLogStats() {
+    const dateInput = document.getElementById("statsDate");
+    if (!dateInput.value) {
+      dateInput.value = new Date().toISOString().slice(0, 10);
+    }
+    const grid = document.getElementById("statsGrid");
+    try {
+      const res  = await fetch("/api/logs/stats?date=" + dateInput.value);
+      const data = await res.json();
+      renderLogStats(data.services || {});
+    } catch (e) {
+      grid.innerHTML = '<div class="stat-empty" style="color:var(--danger)">Failed to load log stats</div>';
+    }
+  }
+
+  function renderLogStats(services) {
+    const grid = document.getElementById("statsGrid");
+    const keys = SERVICES.map(s => s.key).concat(
+      Object.keys(services).filter(k => !SERVICES.some(s => s.key === k))
+    );
+
+    grid.innerHTML = keys.map(key => {
+      const s = services[key] || { INFO: 0, WARNING: 0, ERROR: 0, recent_issues: [] };
+      const title = LABEL_BY_KEY[key] || key;
+      const issuesHtml = s.recent_issues.length
+        ? s.recent_issues.slice().reverse().map(i =>
+            `<div class="stat-issue-row ${esc(i.level)}"><span class="t">${esc(i.time)}</span><span class="m">${esc(i.message)}</span></div>`
+          ).join('')
+        : '<div class="stat-empty">No warnings or errors for this day.</div>';
+
+      return `
+        <div class="stat-card" onclick="this.classList.toggle('expanded')">
+          <div class="stat-card-head">
+            <div class="stat-card-title">${esc(title)}</div>
+          </div>
+          <div class="stat-counts">
+            <div class="stat-count info"><span class="n">${s.INFO}</span><span class="l">Info</span></div>
+            <div class="stat-count warn"><span class="n">${s.WARNING}</span><span class="l">Warn</span></div>
+            <div class="stat-count err"><span class="n">${s.ERROR}</span><span class="l">Error</span></div>
+          </div>
+          <div class="stat-issues">${issuesHtml}</div>
+        </div>`;
+    }).join('');
   }
 
   // ═══════════════════════════════════════════════════

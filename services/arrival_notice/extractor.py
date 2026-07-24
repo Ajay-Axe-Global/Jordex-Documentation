@@ -132,42 +132,69 @@ _MONTHS = {
 
 
 def _normalize_date(raw: str) -> str | None:
-    """Normalize a wide variety of printed date formats to DD/MM/YY."""
+    """
+    Normalize a wide variety of printed date formats to DD/MM/YY.
+ 
+    Parse order (first match wins):
+      1. ISO format:  2026-08-01   → strptime, NO dateutil
+      2. Named month: 04-AUG-26, 30.JUL.2026, "Monday, 27 Jul, 2026"
+      3. Slash format: 01/08/2026  → assume DD/MM (European)
+      4. Dateutil fallback (dayfirst=True) — only for truly exotic formats
+    """
     if not raw:
         return None
     s = raw.strip()
-
+ 
+    # ── 1. ISO format (YYYY-MM-DD) — MUST be handled before dateutil ──
+    #    dateutil with dayfirst=True BREAKS these by swapping month/day
+    m = re.search(r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', s)
+    if m:
+        year, mon, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mon <= 12 and 1 <= day <= 31:
+            return f"{day:02d}/{mon:02d}/{str(year)[-2:]}"
+        # Could be YYYY-DD-MM (unlikely but handle gracefully)
+        if 1 <= day <= 12 and 1 <= mon <= 31:
+            log.warning("  ISO date ambiguous (month>12): '%s' — treating as YYYY-MM-DD", raw)
+            return f"{day:02d}/{mon:02d}/{str(year)[-2:]}"
+ 
+    # ── 2. Named month: "04-AUG-26", "30.JUL.2026", "Monday, 27 Jul, 2026" ──
+    #    Unambiguous because the month is a word, not a number
+    s_clean = re.sub(r'^[A-Za-z]+,\s*', '', s)  # strip leading weekday
+    m = re.search(r'\b(\d{1,2})[-.\s]+([A-Za-z]{3,9})[-,.\s]+(\d{2,4})\b', s_clean)
+    if m:
+        day_str, mon_txt, year_str = m.groups()
+        mon = _MONTHS.get(mon_txt.lower()[:3])
+        if mon:
+            yy = year_str[-2:] if len(year_str) >= 2 else year_str.zfill(2)
+            return f"{int(day_str):02d}/{mon:02d}/{yy}"
+ 
+    # ── 3. Slash or dash with all numbers: DD/MM/YYYY or DD/MM/YY ──
+    #    European convention (day first) — matches Jordex's locale
+    m = re.search(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})\b', s)
+    if m:
+        a, b, year_str = int(m.group(1)), int(m.group(2)), m.group(3)
+        yy = year_str[-2:]
+        # If first number > 12, it MUST be the day (e.g. 25/07/26)
+        if a > 12 and 1 <= b <= 12:
+            return f"{a:02d}/{b:02d}/{yy}"
+        # If second number > 12, it MUST be the day (e.g. 07/25/26 — US format)
+        if b > 12 and 1 <= a <= 12:
+            return f"{b:02d}/{a:02d}/{yy}"
+        # Both ≤ 12: ambiguous — assume DD/MM (European)
+        if 1 <= a <= 12 and 1 <= b <= 12:
+            return f"{a:02d}/{b:02d}/{yy}"
+ 
+    # ── 4. Dateutil fallback — for exotic formats only ──
+    #    dayfirst=True is safe here because ISO was already caught above
     try:
         from dateutil import parser as dateutil_parser
         dt = dateutil_parser.parse(s, fuzzy=True, dayfirst=True)
         return dt.strftime("%d/%m/%y")
     except Exception:
         pass
-
-    s_clean = re.sub(r'^[A-Za-z]+,\s*', '', s)
-
-    m = re.search(r'\b(\d{1,2})[-\s]([A-Za-z]{3,9})[-,\s]+(\d{2,4})\b', s_clean)
-    if m:
-        day, mon_txt, year = m.groups()
-        mon = _MONTHS.get(mon_txt.lower()[:3])
-        if mon:
-            yy = year[-2:] if len(year) >= 2 else year.zfill(2)
-            return f"{int(day):02d}/{mon:02d}/{yy}"
-
-    m = re.search(r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', s_clean)
-    if m:
-        year, mon, day = m.groups()
-        return f"{int(day):02d}/{int(mon):02d}/{year[-2:]}"
-
-    m = re.search(r'\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b', s_clean)
-    if m:
-        day, mon, year = m.groups()
-        yy = year[-2:] if len(year) >= 2 else year.zfill(2)
-        return f"{int(day):02d}/{int(mon):02d}/{yy}"
-
+ 
     log.warning("  Could not normalize date: '%s'", raw)
     return None
-
 
 # ══════════════════════════════════════════════════════════════════════
 #  REGEX FALLBACK

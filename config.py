@@ -14,6 +14,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 OUTPUT_DIR    = os.path.join(BASE_DIR, "output")
 TRACKING_FILE = os.path.join(BASE_DIR, "tracking.json")
 PROFILES_DIR  = os.path.join(BASE_DIR, "profiles")
+LOGS_DIR      = os.path.join(BASE_DIR, "logs")
 
 # ── Outlook credentials ────────────────────────────────────────────────
 EMAIL    = "axebpo.import@jordex.com"

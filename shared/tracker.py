@@ -104,6 +104,34 @@ class Tracker:
             self.data[cat][conv_id] = data
             self.save()
 
+    def is_uploaded_elsewhere(self, cat: str, folder_name: str = None, mbl: str = None,
+                               exclude_conv_id: str = None) -> bool:
+        """True if some OTHER conv_id in this category was already uploaded for the
+        same shipment (matched by folder_name or mbl).
+
+        Catches duplicate emails for a shipment that already went to Jordex — e.g. a
+        resend, a correction copy, or a duplicate carrier notification — which arrive
+        under a brand-new conv_id and would otherwise look like unprocessed work.
+        Unlike the in-batch `uploaded_folders` set each service keeps, this survives
+        across polling cycles because it reads tracking.json itself.
+        """
+        if not folder_name and not mbl:
+            return False
+        folder_norm = (folder_name or "").strip().upper()
+        mbl_norm    = (mbl or "").strip().upper()
+        with _LOCK:
+            self.reload()
+            for cid, info in self.data.get(cat, {}).items():
+                if cid == exclude_conv_id:
+                    continue
+                if info.get("status") != "uploaded":
+                    continue
+                if folder_norm and (info.get("folder_name") or "").strip().upper() == folder_norm:
+                    return True
+                if mbl_norm and (info.get("mbl") or "").strip().upper() == mbl_norm:
+                    return True
+        return False
+
     def update_status(self, cat: str, conv_id: str, status: str):
         with _LOCK:
             self.reload()

@@ -39,6 +39,45 @@ OUTLOOK_LABEL = "02.Delivery Order"
 CAT           = "Delivery_Order"
 
 
+
+TERMINAL_SHORTCODES = {
+    "IJSSEL DELTA TERMINAL":          "IJSSEL",
+    "EUROMAX TERMINAL ROTTERDAM":     "EUROMAX",
+    "CTVREDE BV":                     "CTV",
+    "CTVREDE":                        "CTV",
+    "TMA FLEVOKUST":                  "FLEVOKUST",
+    "ROTTERDAM WORLD GATEWAY TERMINAL": "RWG",
+    "ROTTERDAM WORLD GATEWAY":        "RWG",
+    "KRAMER DISTRIPARK DEPOTS":       "VOORHEEN DR",
+    "KRAMER DISTRIPARK":              "VOORHEEN DR",
+    "ECT DELTA TERMINAL BV / DDE":    "DDE",
+    "ECT DELTA TERMINAL BV":          "DDE",
+    "ECT DELTA TERMINAL":             "ECT (DELTA)",
+    "UWT BUNSCHOTENWEG":              "UWT DEPOTS 2",
+    "ROTTERDAM CONTAINER TERMINAL":   "ROTTERDAM CONTAINER TERMINAL",
+    "CTU FLEVOKUST BV":               "FLEVOKUST",
+    "CTU FLEVOKUST":                  "FLEVOKUST",
+    "APM 2 TERMINAL MAASVLAKTE II":   "APM II",
+    "APM 2 TERMINAL MAASVLAKTE":      "APM II",
+    "QTERMINALS KRAMER CITY":         "KRAMER CITY",
+    "QTERMINALS KRAMER":              "KRAMER CITY",
+    "PSA ANTWERP K913 NOORDZEE":      "PSA ANTWERP K913",
+    "PSA ANTWERP K913":               "PSA ANTWERP K913",
+    "ACC 1":                          "ACC TERMINAL",
+    "KRAMER HOME":                    "KRAMER HOME",
+    "UWT MAASVLAKTE":                 "MAASVLAKTE",
+    "KRAMER TERMINAL":                "RCT / KRAMER",
+    "NOORDZEE TERMINAL":              "913",
+    "PSA ANTWERP K913":               "913",
+    "PSA ANTWERP":                    "913",
+    "BTT BARGE TERMINAL":             "BTT",
+    "UWT DEPOT":                      "UWT DEPOTS 2",
+    
+
+}
+
+# Pre-sorted longest key first so "ECT DELTA TERMINAL BV / DDE" matches before "ECT DELTA TERMINAL"
+_SHORTCODE_KEYS_SORTED = sorted(TERMINAL_SHORTCODES.keys(), key=len, reverse=True)
 class DeliveryOrderService:
     def __init__(self):
         self.status     = "idle"
@@ -355,6 +394,36 @@ class DeliveryOrderService:
             name_without_ext = os.path.splitext(filename)[0]
             file_map[filename] = ("Additional Files", name_without_ext)
         return file_map
+        
+    def _resolve_terminal_shortcode(self, terminal_address: str) -> str | None:
+    # Take name part: before first comma OR first " - " (whichever comes first)
+        name = terminal_address.split("\n")[0].strip()
+
+        # Find the earliest separator (comma or dash)
+        comma_pos = name.find(",")
+        dash_pos = name.find(" - ")
+        if comma_pos >= 0 and dash_pos >= 0:
+            cut = min(comma_pos, dash_pos)
+        elif comma_pos >= 0:
+            cut = comma_pos
+        elif dash_pos >= 0:
+            cut = dash_pos
+        else:
+            cut = len(name)
+
+        name = name[:cut].strip().upper()
+        # Normalize: B.V. → BV, extra spaces
+        name = name.replace("B.V.", "BV").replace("B.V", "BV")
+        name = re.sub(r'\s+', ' ', name).strip()
+
+        for key in _SHORTCODE_KEYS_SORTED:
+            if key in name:
+                shortcode = TERMINAL_SHORTCODES[key]
+                log.info(f"[{SERVICE_KEY}]   Shortcode resolved: '{name}' → '{shortcode}'")
+                return shortcode
+
+        log.info(f"[{SERVICE_KEY}]   No shortcode match for '{name}' — using default search")
+        return None
     
     def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items):
         """
@@ -385,8 +454,15 @@ class DeliveryOrderService:
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 continue
 
+            if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name, mbl=item.get("mbl"),
+                                              exclude_conv_id=item.get("conv_id")):
+                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email")
+                tracker.update_status(CAT, item.get("conv_id"), "uploaded")
+                uploaded_folders.add(folder_name)
+                continue
+
             query = normalize_oi_reference(query)
- 
+
             success, used_ref, rows_found = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
@@ -501,7 +577,7 @@ class DeliveryOrderService:
  
         # ── Wait for sidebar ────────────────────────────────────────
         try:
-            page.locator(".cargo-tab__block").first.wait_for(state="visible", timeout=8000)
+            page.locator(".cargo-tab__block").first.wait_for(state="visible", timeout=3000)
         except Exception:
             pass
  
@@ -651,17 +727,16 @@ class DeliveryOrderService:
                 if clicked:
                     break
                 page.wait_for_timeout(1000)
- 
+
             if not clicked:
                 log.warning(f"[{SERVICE_KEY}] View Routing button not found")
                 return False
- 
+
             try:
                 page.wait_for_load_state("networkidle", timeout=30000)
             except Exception:
                 pass
-            page.wait_for_timeout(3000)
- 
+
             # Set zoom to 1.0
             page.evaluate("""() => {
                 let style = document.getElementById('jordex-zoom-style');
@@ -672,19 +747,19 @@ class DeliveryOrderService:
                 }
                 style.innerHTML = 'body { zoom: 1.0 !important; }';
             }""")
-            page.wait_for_timeout(1000)
- 
-            # Wait for loading to finish
+
+            # Single smart wait: sidebar visible = page is ready
             try:
-                page.locator(".el-loading-mask").wait_for(state="hidden", timeout=8000)
+                page.locator(".cargo-tab__block").first.wait_for(state="visible", timeout=10000)
             except Exception:
-                pass
- 
+                page.wait_for_timeout(2000)
+
             return True
- 
+
         except Exception as e:
             log.error(f"[{SERVICE_KEY}] Failed to open View Routing: {e}")
             return False
+
     def _score_and_click_best_row(self, page: Page, doc_address: str,
                                    label: str, min_score: int = 12) -> bool:
         """
@@ -702,7 +777,7 @@ class DeliveryOrderService:
         Returns True if a row was clicked (score ≥ min_score), False otherwise.
         All scoring runs inside a single page.evaluate() — no network calls.
         """
-        result = page.evaluate("""(docAddr) => {
+        result = page.evaluate("""([docAddr, minScore]) => {
             // ── Normalize doc address ───────────────────────────────
             let doc = docAddr.toUpperCase()
                 .replace(/[.,;:()\/\\-]/g, ' ')
@@ -854,7 +929,7 @@ class DeliveryOrderService:
             }
  
             // ── Click best row if above threshold ───────────────────
-            if (bestIdx >= 0 && bestScore >= arguments[1]) {
+            if (bestIdx >= 0 && bestScore >= minScore) {
                 const row = rows[bestIdx];
                 row.click();
  
@@ -886,7 +961,7 @@ class DeliveryOrderService:
                 total_rows: rows.length,
                 top3: scores.sort((a, b) => b.score - a.score).slice(0, 3)
             };
-        }""", doc_address, min_score) or {}
+        }""", [doc_address, min_score]) or {}
  
         if result.get("clicked"):
             log.info(
@@ -1010,7 +1085,7 @@ class DeliveryOrderService:
         # ══════════════════════════════════════════════════════════════
         #  PHASE 1: Search by name, score results
         # ══════════════════════════════════════════════════════════════
-        search_term = self._build_search_term(terminal_name)
+        search_term = self._resolve_terminal_shortcode(terminal_name) or self._build_search_term(terminal_name)
         log.info(f"[{SERVICE_KEY}]   {label} Phase 1 search: '{search_term}'")
  
         if not self._fill_search_box(page, search_term, label):
@@ -1192,11 +1267,23 @@ class DeliveryOrderService:
         else:
             log.warning(f"[{SERVICE_KEY}]   {label} Address book button not found in DOM")
         return bool(clicked)
+
     def _fill_search_box(self, page: Page, search_term: str, label: str) -> bool:
         """
         Clear and fill the Search textbox in the visible address dialog.
+        After submitting, waits for the table rows to refresh before returning.
         Returns True if the search term was successfully entered.
         """
+        # Snapshot current row count so we can detect when results change
+        old_row_count = page.evaluate("""() => {
+            const dialog = [...document.querySelectorAll('.el-dialog')]
+                .find(d => d.offsetParent !== null);
+            if (!dialog) return -1;
+            const rows = dialog.querySelectorAll('table tbody tr');
+            return rows.length;
+        }""") or -1
+
+        filled = False
         try:
             search_box = page.get_by_role("textbox", name="Search")
             search_box.click(timeout=3000)
@@ -1204,34 +1291,77 @@ class DeliveryOrderService:
             page.wait_for_timeout(300)
             search_box.fill(search_term)
             page.keyboard.press("Enter")
-            return True
+            filled = True
         except Exception as e:
             log.warning(f"[{SERVICE_KEY}]   {label} Playwright search fill failed ({e}), trying JS")
- 
+
         # JS fallback
-        filled = page.evaluate("""(term) => {
-            const dialog = [...document.querySelectorAll('.el-dialog')]
-                .find(d => d.offsetParent !== null);
-            if (!dialog) return false;
- 
-            const inputs = dialog.querySelectorAll('input');
-            for (const inp of inputs) {
-                if (inp.type === 'file' || !inp.offsetParent) continue;
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(inp, '');
-                inp.dispatchEvent(new Event('input', {bubbles: true}));
-                setter.call(inp, term);
-                inp.dispatchEvent(new Event('input', {bubbles: true}));
-                inp.dispatchEvent(new Event('change', {bubbles: true}));
-                inp.dispatchEvent(new KeyboardEvent('keyup',
-                    {key: 'Enter', bubbles: true}));
-                return true;
-            }
-            return false;
-        }""", search_term)
- 
-        return bool(filled)
+        if not filled:
+            filled = page.evaluate("""(term) => {
+                const dialog = [...document.querySelectorAll('.el-dialog')]
+                    .find(d => d.offsetParent !== null);
+                if (!dialog) return false;
+                const inputs = dialog.querySelectorAll('input');
+                for (const inp of inputs) {
+                    if (inp.type === 'file' || !inp.offsetParent) continue;
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(inp, '');
+                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    setter.call(inp, term);
+                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    inp.dispatchEvent(new KeyboardEvent('keyup',
+                        {key: 'Enter', bubbles: true}));
+                    return true;
+                }
+                return false;
+            }""", search_term)
+            filled = bool(filled)
+
+        if not filled:
+            return False
+
+        # ── Wait for search results to actually refresh ──────────────
+        # Poll until row count changes or loading spinner disappears,
+        # up to 5 seconds max. This prevents scoring stale rows.
+        for _wait in range(10):
+            page.wait_for_timeout(500)
+
+            # Check if a loading indicator is still active
+            still_loading = page.evaluate("""() => {
+                const dialog = [...document.querySelectorAll('.el-dialog')]
+                    .find(d => d.offsetParent !== null);
+                if (!dialog) return false;
+                const loader = dialog.querySelector(
+                    '.el-loading-mask, .el-loading-spinner, .is-loading');
+                return loader && loader.offsetParent !== null;
+            }""")
+            if still_loading:
+                continue
+
+            # Check if the row count has changed (results refreshed)
+            new_row_count = page.evaluate("""() => {
+                const dialog = [...document.querySelectorAll('.el-dialog')]
+                    .find(d => d.offsetParent !== null);
+                if (!dialog) return -1;
+                const rows = dialog.querySelectorAll('table tbody tr');
+                return rows.length;
+            }""") or -1
+
+            if new_row_count != old_row_count:
+                log.info(
+                    f"[{SERVICE_KEY}]   {label} Search results refreshed "
+                    f"({old_row_count} → {new_row_count} rows)"
+                )
+                break
+        else:
+            log.info(
+                f"[{SERVICE_KEY}]   {label} Search results wait timed out "
+                f"— proceeding with current rows"
+            )
+
+        return True
     # ══════════════════════════════════════════════════════════════════
     #  _close_dialog_properly  (NEW — replaces _confirm_dialog + CSS hack)
     # ══════════════════════════════════════════════════════════════════

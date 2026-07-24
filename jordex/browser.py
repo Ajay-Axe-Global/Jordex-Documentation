@@ -153,7 +153,7 @@ def search_and_open(page, query, row_index=0):
     
     if not filled:
         log.error("Search input not found.")
-        return False
+        return False, 0
 
     page.wait_for_timeout(500)
     _wait_loading(page)

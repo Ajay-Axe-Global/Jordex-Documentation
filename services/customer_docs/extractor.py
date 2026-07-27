@@ -36,6 +36,29 @@ _KNOWN_SCAC_PREFIXES = {
 }
 
 
+# Ocean carriers — BLs issued by these are ALWAYS Master BLs
+_CARRIER_TO_SCAC = {
+    "CMA CGM":              "CMDU",
+    "HAPAG-LLOYD":          "HLCU",
+    "HAPAG LLOYD":          "HLCU",
+    "MAERSK":               "MAEU",
+    "MSC":                  "MEDU",
+    "OOCL":                 "OOLU",
+    "EVERGREEN":            "EGLV",
+    "ZIM":                  "ZIMU",
+    "ONE":                  "ONEY",
+    "OCEAN NETWORK EXPRESS":"ONEY",
+    "YANG MING":            "YMLU",
+    "HMM":                  "HDMU",
+    "HYUNDAI":              "HDMU",
+    "COSCO":                "COSU",
+    "PIL":                  "PCIU",
+    "WAN HAI":              "WHLC",
+    "HAMBURG SUD":          "SUDU",
+    "HAMBURG SÜD":          "SUDU",
+}
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  CLASSIFICATION PROMPT
 # ══════════════════════════════════════════════════════════════════════
@@ -117,6 +140,19 @@ If the header says "WEIGHT CERTIFICATE", "INSPECTION CERTIFICATE",
   → classify as: "ADDITIONAL FILES"
   doc_title: use the exact header text.
 
+── CMR / TRANSPORT DOCUMENT ──
+If the header/title says ANY of:
+  "CMR", "LETTRE DE VOITURE", "VRACHTBRIEF", "FRACHTBRIEF",
+  "TRANSPORTDOKUMENT", "CONSIGNMENT NOTE", "CMR CONSIGNMENT NOTE",
+  "VERVOERDOCUMENT", "TRANSPORT DOCUMENT"
+  This is a ROAD TRANSPORT document, NOT a Bill of Lading.
+  It has sender/receiver fields that look like Shipper/Consignee — ignore them.
+  → classify as: "ADDITIONAL FILES"
+  doc_title: "CMR"
+  reference_number: Look for an OI number, container number, or B/L reference
+    mentioned anywhere on the document. If none found, return null.
+  CRITICAL: Do NOT proceed to Step 2. This is NOT a Bill of Lading.
+
 ── LOPERSOPDRACHT (COURIER ASSIGNMENT) ──
 If the header/title says "LOPERSOPDRACHT" or "LOPERS OPDRACHT":
   This is a Jordex internal courier/runner assignment form.
@@ -195,6 +231,7 @@ OUTPUT — Return ONLY valid JSON. No markdown. No backticks.
   "reference_number": "BL number / booking ref / invoice number or null",
   "container_no": "first container number or null",
   "doc_title": "the main header/title text from the document, or null",
+  "carrier_name": "the shipping line / ocean carrier name from the logo or header, e.g. CMA CGM, MAERSK, MSC, or null if not a BL",
   "confidence": "high" or "medium" or "low"
 }
 
@@ -266,6 +303,9 @@ def _keyword_fallback(pdf_path: str) -> dict:
             doc_title = "Booking Confirmation"
         elif re.search(r'\bINVOICE\b|\bTAX\s+INVOICE\b|\bFREIGHT\s+INVOICE\b', text_upper):
             doc_type = "AGENT INVOICE" if "JORDEX" in text_upper else "COMMERCIAL INVOICE"
+        elif re.search(r'\bCMR\b|\bVRACHTBRIEF\b|\bFRACHTBRIEF\b|\bLETTRE\s+DE\s+VOITURE\b', text_upper):
+            doc_type = "ADDITIONAL FILES"
+            doc_title = "CMR"
         elif re.search(r'\bBILL\s+OF\s+LADING\b|\bSEA\s+WAYBILL\b|\bB/L\b', text_upper):
             consignee_match = re.search(
                 r'CONSIGNEE[:\s]+(.{0,200}?)(?:\n[A-Z]{3,}|\Z)', text_upper, re.DOTALL
@@ -303,9 +343,13 @@ def _resolve_folder_name(doc_type: str, reference_number: str, container_no: str
     if reference_number:
         ref = re.sub(r'\s+', '', reference_number).upper()
         if len(ref) >= 6:
-            if doc_type in ("ADDITIONAL FILES", "BOOKING CONFIRMATION"):
+            if doc_type in ("ADDITIONAL FILES",):
+                # Additional files: only accept refs that look like BL/OI numbers
                 if (re.match(r'^[A-Z]{4}', ref) and not ref.isdigit()) or re.match(r'^OI\d{4,}', ref):
                     return ref
+            elif doc_type == "BOOKING CONFIRMATION":
+                # Booking confirmations: accept booking numbers (can be all digits)
+                return ref
             else:
                 return ref
     if container_no:
@@ -347,6 +391,10 @@ _NORMALISE = {
     "DEMURRAGE NOTICE": "ADDITIONAL FILES",
     "SHIPPING ADVISE": "BOOKING CONFIRMATION",
     "BOOKING ADVICE": "BOOKING CONFIRMATION",
+    "CMR": "ADDITIONAL FILES",
+    "CMR CONSIGNMENT NOTE": "ADDITIONAL FILES",
+    "VRACHTBRIEF": "ADDITIONAL FILES",
+    "TRANSPORT DOCUMENT": "ADDITIONAL FILES",
     "UNKNOWN": "ADDITIONAL FILES",
 }
 
@@ -392,6 +440,8 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
         "flag": None,
     }
 
+    carrier_name = None
+
     # ── Gemini path ──────────────────────────────────────────────────
     if gemini_model is not None:
         try:
@@ -422,13 +472,15 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
             doc_type = (parsed.get("doc_type") or "ADDITIONAL FILES").strip().upper()
             reference_number = (parsed.get("reference_number") or "").strip().upper() or None
             
-            # Normalise common OCR error: "01" instead of "OI"
-            if reference_number and reference_number.startswith("01") and len(reference_number) >= 7:
-                reference_number = "OI" + reference_number[2:]
+            # Normalise all OI OCR variants (01, O1, 0I, 0i, etc.)
+            if reference_number:
+                from shared.helpers import normalize_oi_reference
+                reference_number = normalize_oi_reference(reference_number)
                 
             container_no = (parsed.get("container_no") or "").strip().upper() or None
             doc_title = (parsed.get("doc_title") or "").strip() or None
             confidence = (parsed.get("confidence") or "high").strip().lower()
+            carrier_name = (parsed.get("carrier_name") or "").strip().upper() or None
 
             log.info(
                 "  Customer Doc Gemini: %s → type=%s ref=%s title=%s conf=%s",
@@ -441,6 +493,7 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
             doc_type, reference_number = fb["doc_type"], fb["reference_number"]
             container_no, doc_title = fb["container_no"], fb["doc_title"]
             confidence = "low"
+            carrier_name = None
 
         except Exception as e:
             log.warning("  Customer Doc Gemini failed: %s — keyword fallback", e)
@@ -448,6 +501,7 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
             doc_type, reference_number = fb["doc_type"], fb["reference_number"]
             container_no, doc_title = fb["container_no"], fb["doc_title"]
             confidence = "low"
+            carrier_name = None
 
     # ── No Gemini ────────────────────────────────────────────────────
     else:
@@ -455,6 +509,7 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
         doc_type, reference_number = fb["doc_type"], fb["reference_number"]
         container_no, doc_title = fb["container_no"], fb["doc_title"]
         confidence = "low"
+        carrier_name = None
 
     # ── Normalise doc_type ───────────────────────────────────────────
     # ── Lopersopdracht: force OI as reference, strip verbose title ───
@@ -473,6 +528,18 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
     if doc_type not in _VALID_TYPES:
         log.warning("  Unrecognised doc_type '%s' → ADDITIONAL FILES", doc_type)
         doc_type = "ADDITIONAL FILES"
+
+    # ── Ocean carrier detection → upgrade HBL → MBL + prepend SCAC ──
+    if doc_type == "HOUSE BILL OF LADING" and carrier_name:
+        for carrier_key, scac in _CARRIER_TO_SCAC.items():
+            if carrier_key in carrier_name:
+                log.info("  Ocean carrier '%s' detected → upgrading HBL → MBL", carrier_name)
+                doc_type = "MASTER BILL OF LADING"
+                # Prepend SCAC if reference doesn't already have one
+                if reference_number and reference_number[:4] not in _KNOWN_SCAC_PREFIXES:
+                    reference_number = scac + reference_number
+                    log.info("  Prepended SCAC %s → %s", scac, reference_number)
+                break
 
     # ── Secondary MBL check via SCAC prefix ──────────────────────────
     if doc_type == "HOUSE BILL OF LADING" and reference_number:

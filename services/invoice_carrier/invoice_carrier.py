@@ -84,9 +84,11 @@ class InvoiceCarrierService:
 
             while not self._stop_evt.is_set():
                 self.last_run = datetime.now().isoformat()
+                # NEW
                 items = self._process_batch(outlook_page, tracker)
                 if items:
-                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
+                    merged = self._merge_by_folder(items)
+                    self._upload_to_jordex(jordex_page, outlook_page, tracker, merged)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -211,36 +213,70 @@ class InvoiceCarrierService:
 
         return processed_items
 
+
+    # NEW
+    @staticmethod
+    def _merge_by_folder(items: list) -> list:
+        """
+        Collapse multiple email-level items into one item per folder_name.
+        All conv_ids are gathered so every email gets marked after upload.
+        """
+        grouped: dict[str, dict] = {}
+        for item in items:
+            key = item["folder_name"]
+            if key not in grouped:
+                grouped[key] = {
+                    "conv_ids":      [item["conv_id"]],
+                    "cat":           item["cat"],
+                    "folder_path":   item["folder_path"],
+                    "folder_name":   key,
+                    "mbl":           item.get("mbl"),
+                    "secondary_ref": item.get("secondary_ref"),
+                }
+            else:
+                grouped[key]["conv_ids"].append(item["conv_id"])
+                if item.get("secondary_ref"):
+                    grouped[key]["secondary_ref"] = item["secondary_ref"]
+        return list(grouped.values())
+
+   
+        
+    # NEW
     def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
-
-        # Deduplicate: track folder_names already uploaded this batch
-        uploaded_folders: set[str] = set()
-
         for item in items:
-            if self._stop_evt.is_set(): break
+            if self._stop_evt.is_set():
+                break
+
             query = item.get("mbl") or item.get("folder_name")
-            if not query: continue
+            if not query:
+                continue
+
+            folder_name = item["folder_name"]
+            conv_ids    = item["conv_ids"]
+
             if query.startswith("OE"):
                 query = normalize_oi_reference(query)
-                tracker.update_status(CAT, item["conv_id"], "Skipped")
+                for cid in conv_ids:
+                    tracker.update_status(CAT, cid, "Skipped")
                 continue
 
-            folder_name = item.get("folder_name") or query
-            if folder_name in uploaded_folders:
-                log.info(
-                    f"[{SERVICE_KEY}] Skipping duplicate folder '{folder_name}' "
-                    f"(conv_id={item['conv_id'][:20]}…) — already uploaded this batch"
+            # Cross-batch dedup: skip only if ALL conv_ids are already covered
+            already_uploaded = all(
+                tracker.is_uploaded_elsewhere(
+                    CAT, folder_name=folder_name,
+                    mbl=item.get("mbl"), exclude_conv_id=cid,
                 )
-                tracker.update_status(CAT, item["conv_id"], "uploaded")
-                continue
-
-            if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name, mbl=item.get("mbl"),
-                                              exclude_conv_id=item["conv_id"]):
-                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email")
-                tracker.update_status(CAT, item["conv_id"], "uploaded")
-                uploaded_folders.add(folder_name)
+                for cid in conv_ids
+            )
+            if already_uploaded:
+                log.info(
+                    f"[{SERVICE_KEY}] Skipping '{folder_name}' — "
+                    f"already uploaded to Jordex under a previous batch"
+                )
+                for cid in conv_ids:
+                    tracker.update_status(CAT, cid, "uploaded")
                 continue
 
             success, used_ref, rows_found = search_jordex_with_fallback(
@@ -248,7 +284,7 @@ class InvoiceCarrierService:
                 outlook_page=outlook_page,
                 primary_ref=query,
                 secondary_ref=item.get("secondary_ref"),
-                conv_id=item["conv_id"],
+                conv_id=conv_ids[0],
                 tracker=tracker,
                 cat=CAT,
                 service_key=SERVICE_KEY,
@@ -262,20 +298,21 @@ class InvoiceCarrierService:
             try:
                 while row_index < 10:
                     success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
-                    if not success: break
+                    if not success:
+                        break
                     inv_file_map = build_invoice_carrier_file_map(item["folder_path"])
                     upload_attachments(jordex_page, item["folder_path"], doc_type, display_name, file_map=inv_file_map)
                     go_back(jordex_page)
                     uploaded = True
                     self._uploaded += 1
                     row_index += 1
-                    if rows_found <= row_index: break
+                    if rows_found <= row_index:
+                        break
             except Exception as e:
                 log.error(f"[{SERVICE_KEY}] Error during upload loop for {query}: {e}", exc_info=True)
             finally:
                 if uploaded:
-                    tracker.update_status(CAT, item["conv_id"], "uploaded")
-                    uploaded_folders.add(folder_name)
+                    for cid in conv_ids:
+                        tracker.update_status(CAT, cid, "uploaded")
                 else:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
-

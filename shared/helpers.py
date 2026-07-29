@@ -508,21 +508,44 @@ def normalize_oi_reference(raw: str) -> str:
       - If it starts with "01" (zero + one) followed by 5+ digits → likely "OI"
       - If it starts with "0i" → replace with "OI"
       - Preserve anything that already starts with "OI" or "OE"
-      - Strip whitespace and hyphens
- 
+      - Any hyphen (spaced or not) or whitespace separates the OI reference
+        from an unrelated secondary reference — keep only the first token
+        (e.g. "OI2624915 - 4500288589" and "012624915-4500288589" both
+        → OI2624915, not one merged number)
+      - EXCEPTION: "OI-2619032" (bare prefix, hyphen, digits, nothing else)
+        is a single split reference and gets rejoined
+
     Examples:
-      "012619032"  → "OI2619032"
-      "0I2619032"  → "OI2619032"
-      "OI2619032"  → "OI2619032"  (no change)
-      "OE2614817"  → "OE2614817"  (no change)
-      " 012619039" → "OI2619039"
-      "0i2619034"  → "OI2619034"
+      "012619032"            → "OI2619032"
+      "0I2619032"             → "OI2619032"
+      "OI2619032"             → "OI2619032"  (no change)
+      "OE2614817"             → "OE2614817"  (no change)
+      " 012619039"            → "OI2619039"
+      "0i2619034"              → "OI2619034"
+      "OI2624915 - 4500288589" → "OI2624915"
+      "012624915-4500288589"   → "OI2624915"
+      "OI-2619032"             → "OI2619032"
     """
     if not raw:
         return raw
- 
-    cleaned = raw.strip().replace("-", "").replace(" ", "")
- 
+
+    raw = raw.strip()
+    # Split on ANY hyphen or run of whitespace — in every real-world case seen,
+    # a hyphen here separates the OI reference from an unrelated secondary
+    # reference (client/SAP PO number), not an internal part of the OI number.
+    tokens = [t for t in re.split(r'[\s-]+', raw) if t]
+    if not tokens:
+        return raw
+
+    first_token = tokens[0]
+    # Exception: a bare prefix like "OI"/"OE"/"0I"/"01"/"O1" got split off from
+    # its own digits by a hyphen with no space (e.g. "OI-2619032") — rejoin.
+    if (len(tokens) > 1 and tokens[1].isdigit()
+            and re.fullmatch(r'oi|oe|0i|01|o1', first_token, re.IGNORECASE)):
+        first_token = first_token + tokens[1]
+
+    cleaned = first_token
+
     # Already correct
     if re.match(r'^O[IE]\d', cleaned, re.IGNORECASE):
         return cleaned[:2].upper() + cleaned[2:]

@@ -258,7 +258,11 @@ def build_invoice_carrier_file_map(folder_path: str) -> dict:
             log.warning(f"Could not build invoice file map: {e}")
 
     # Fallback for any missing PDFs
-    pdf_files = glob.glob(os.path.join(folder_path, "*.[pP][dD][fF]"))
+    UPLOAD_EXTENSIONS = ("*.[pP][dD][fF]", "*.[jJ][pP][gG]", "*.[jJ][pP][eE][gG]", "*.[pP][nN][gG]")
+    pdf_files = [
+        f for ext in UPLOAD_EXTENSIONS
+        for f in glob.glob(os.path.join(folder_path, ext))
+    ]
     for pdf_path in pdf_files:
         filename = os.path.basename(pdf_path)
         if filename not in file_map:
@@ -324,7 +328,11 @@ def build_customer_docs_file_map(folder_path: str) -> dict:
     import glob, json, os
  
     file_map = {}
-    pdf_files = glob.glob(os.path.join(folder_path, "*.[pP][dD][fF]"))
+    UPLOAD_EXTENSIONS = ("*.[pP][dD][fF]", "*.[jJ][pP][gG]", "*.[jJ][pP][eE][gG]", "*.[pP][nN][gG]")
+    pdf_files = [
+        f for ext in UPLOAD_EXTENSIONS
+        for f in glob.glob(os.path.join(folder_path, ext))
+    ]
  
     for pdf_path in pdf_files:
         filename = os.path.basename(pdf_path)
@@ -371,10 +379,10 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
     Go to Documents tab, upload PDFs from folder_path to Jordex.
 
     Duplicate detection strategy (two layers):
-    
+
     1. FILENAME CHECK (for files that keep original name, e.g. Customer_Docs):
        If "HBL_FSNBS2604650.pdf" already exists in the table with today's date → skip.
-       
+
     2. HASH CHECK (for files that get renamed, e.g. Invoice carrier, AN, DO):
        Downloads existing file from Jordex, computes SHA-256, compares with local.
        Same hash = exact duplicate → skip.
@@ -387,6 +395,13 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
         display_name:  Default display name shown in Jordex after upload.
         file_map:      Optional dict {filename: (doc_type, display_name)} for per-file
                        type/name overrides.
+
+    Returns:
+        bool: True if every file was either already present (duplicate) or its
+              Save dialog was confirmed to close after saving; False if any file
+              failed to upload/save or the Documents tab couldn't be opened.
+              NOTE: existing callers ignore this return value, so adding it does
+              not change their behavior — it's purely additive.
     """
     log.info(f"Opening Documents tab to upload as '{document_type}' (name='{display_name}')...")
     try:
@@ -398,12 +413,18 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
         apply_zoom(page)
     except Exception as e:
         log.warning(f"Documents tab not found: {e}")
-        return
+        return False
 
-    pdf_files = sorted(glob.glob(os.path.join(folder_path, "*.[pP][dD][fF]")))
+    UPLOAD_EXTENSIONS = ("*.[pP][dD][fF]", "*.[jJ][pP][gG]", "*.[jJ][pP][eE][gG]", "*.[pP][nN][gG]")
+    pdf_files = sorted(
+        f for ext in UPLOAD_EXTENSIONS
+        for f in glob.glob(os.path.join(folder_path, ext))
+    )
     if not pdf_files:
-        log.info(f"No PDFs found in {folder_path} to upload.")
-        return
+        log.info(f"No uploadable files found in {folder_path}.")
+        return True
+
+    all_ok = True
 
     # Build a lowercase lookup for file_map so matching is case-insensitive
     file_map_lower = {}
@@ -491,6 +512,7 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
 
         if not plus_btn:
             log.warning(f"  Upload button not found for '{filename}'.")
+            all_ok = False
             continue
 
         # ── Set file via file chooser ────────────────────────────────
@@ -498,10 +520,11 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
             with page.expect_file_chooser(timeout=5000) as fc_info:
                 plus_btn.click(timeout=5000)
             fc_info.value.set_files(pdf_path)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(5000)
         except Exception as e:
             log.warning(f"  Failed to set file '{filename}': {e}")
             page.keyboard.press("Escape")
+            all_ok = False
             continue
 
         # Wait for upload dialog
@@ -585,12 +608,16 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
             log.info(f"  Comment set: '{actual_comment}'")
 
         # ── Save ─────────────────────────────────────────────────────
+        # NOTE: a "Save"-labeled button existing and being .click()'d does NOT
+        # mean the save succeeded — a disabled button (e.g. file still
+        # uploading) silently no-ops on .click(). We verify below by checking
+        # whether the dialog actually closed, instead of trusting this alone.
         saved = page.evaluate("""() => {
             const dialog = [...document.querySelectorAll('.el-dialog')].find(d => d.offsetParent !== null);
             if (!dialog) return false;
             const btns = dialog.querySelectorAll('button');
             for (const b of btns) {
-                if (b.innerText.trim().includes('Save')) { b.click(); return true; }
+                if (b.innerText.trim().includes('Save') && !b.disabled) { b.click(); return true; }
             }
             return false;
         }""")
@@ -604,9 +631,26 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
                     page.wait_for_timeout(1000)
             except:
                 pass
-            log.info(f"  OK Uploaded: '{filename}' as '{actual_name}'")
+
+            # ── Verify the dialog actually closed ──────────────────────
+            # If it's still open, the save was blocked (validation error,
+            # still-uploading file, session hiccup, etc.) — don't claim success.
+            dialog_still_open = page.evaluate("""() => {
+                const dialog = [...document.querySelectorAll('.el-dialog')].find(d => d.offsetParent !== null);
+                return !!dialog;
+            }""")
+
+            if dialog_still_open:
+                log.warning(f"  Save dialog still open after Save for '{filename}' — NOT confirmed uploaded.")
+                all_ok = False
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+            else:
+                log.info(f"  OK Uploaded: '{filename}' as '{actual_name}'")
         else:
-            log.warning(f"  FAILED to click Save for '{filename}'.")
+            log.warning(f"  FAILED to click Save for '{filename}' (button missing or disabled).")
+            all_ok = False
             page.keyboard.press("Escape")
 
     log.info("Finished uploading documents.")
+    return all_ok

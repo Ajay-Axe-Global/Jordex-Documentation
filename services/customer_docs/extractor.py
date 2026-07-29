@@ -339,24 +339,45 @@ def _keyword_fallback(pdf_path: str) -> dict:
     }
 
 
+def _looks_like_bl_or_oi(ref: str) -> bool:
+    """True if ref looks like a real SCAC-prefixed BL number or an OI reference —
+    i.e. something Jordex can actually be searched by. A 3-letter carrier-internal
+    code like "DRA5532" does NOT qualify."""
+    return bool(ref) and (
+        (re.match(r'^[A-Z]{4}', ref) and not ref.isdigit()) or re.match(r'^OI\d{4,}', ref)
+    )
+
+
 def _resolve_folder_name(doc_type: str, reference_number: str, container_no: str) -> str | None:
+    ref = None
     if reference_number:
-        ref = re.sub(r'\s+', '', reference_number).upper()
-        if len(ref) >= 6:
-            if doc_type in ("ADDITIONAL FILES",):
-                # Additional files: only accept refs that look like BL/OI numbers
-                if (re.match(r'^[A-Z]{4}', ref) and not ref.isdigit()) or re.match(r'^OI\d{4,}', ref):
-                    return ref
-            elif doc_type == "BOOKING CONFIRMATION":
-                # Booking confirmations: accept booking numbers (can be all digits)
-                return ref
-            else:
-                return ref
+        r = re.sub(r'\s+', '', reference_number).upper()
+        if len(r) >= 6:
+            ref = r
+
+    container = None
     if container_no:
         c = re.sub(r'\s+', '', container_no).upper()
         if re.fullmatch(r'[A-Z]{4}\d{7}', c):
-            return c
-    return None
+            container = c
+
+    if doc_type == "BOOKING CONFIRMATION":
+        # Booking confirmations: accept booking numbers (can be all digits)
+        return ref or container
+
+    if doc_type in ("ADDITIONAL FILES", "ARRIVAL NOTICE"):
+        # These doc types don't carry their own BL number — reference_number here
+        # is often just a carrier-internal AN/notice code (e.g. "DRA5532"), which
+        # Jordex can't be searched by. Only trust it if it actually looks like a
+        # real BL/OI reference; otherwise the container number is the far more
+        # meaningful Jordex search key.
+        if ref and _looks_like_bl_or_oi(ref):
+            return ref
+        return container or ref
+
+    # HBL/MBL, invoices, debit notes, packing lists: reference_number IS the
+    # document's own number (extracted per Step 3 of the prompt) — trust it as-is.
+    return ref or container
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -547,6 +568,24 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
         if prefix4 in _KNOWN_SCAC_PREFIXES:
             log.info("  SCAC prefix '%s' → upgrading HBL → MBL", prefix4)
             doc_type = "MASTER BILL OF LADING"
+
+    # ── Direct-MBL safety net: prepend SCAC if missing ───────────────
+    # The two blocks above only fix the reference when Gemini first said HBL
+    # and got upgraded to MBL. If Gemini already returned MASTER BILL OF
+    # LADING directly (e.g. a CMA CGM waybill numbered "GQL0462680" with no
+    # "CMDU" prefix), reference_number never passes through that upgrade
+    # path, so it stayed unprefixed. Catch that case here too.
+    if doc_type == "MASTER BILL OF LADING" and reference_number and carrier_name:
+        prefix4 = reference_number[:4].upper()
+        if prefix4 not in _KNOWN_SCAC_PREFIXES:
+            for carrier_key, scac in _CARRIER_TO_SCAC.items():
+                if carrier_key in carrier_name:
+                    reference_number = scac + reference_number
+                    log.info(
+                        "  Direct MBL missing SCAC — carrier '%s' → prepended %s → %s",
+                        carrier_name, scac, reference_number,
+                    )
+                    break
 
     # ── Build result ─────────────────────────────────────────────────
     result["doc_type"] = doc_type

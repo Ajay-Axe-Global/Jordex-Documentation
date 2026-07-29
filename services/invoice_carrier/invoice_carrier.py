@@ -134,6 +134,7 @@ class InvoiceCarrierService:
 
             pdf_files   = [f for f in temp_files if f.lower().endswith(".pdf")]
             folder_groups: dict[str, list] = {}
+            duplicate_folder = None
 
             for pdf_path in pdf_files:
                 extraction  = extract_invoice_carrier(pdf_path, gemini_model=gemini_model)
@@ -159,6 +160,7 @@ class InvoiceCarrierService:
                         existing = [d.get("invoice_no") for d in (old if isinstance(old, list) else [old])]
                         if inv_no in existing:
                             log.info(f"[{SERVICE_KEY}] Duplicate invoice {inv_no}, skipping")
+                            duplicate_folder = folder_name
                             continue
                     except Exception: pass
 
@@ -208,6 +210,9 @@ class InvoiceCarrierService:
                         "mbl":           mbl_val,
                         "secondary_ref": sec_ref,
                     })
+
+            if not folder_groups and duplicate_folder:
+                tracker.mark(CAT, cid, subject, duplicate_folder, [], "skipped_duplicate")
 
             cleanup_temp(temp_files)
 
@@ -271,13 +276,28 @@ class InvoiceCarrierService:
                 for cid in conv_ids
             )
             if already_uploaded:
-                log.info(
-                    f"[{SERVICE_KEY}] Skipping '{folder_name}' — "
-                    f"already uploaded to Jordex under a previous batch"
+                # ★ FIX: Check if NEW files exist that weren't uploaded before.
+                local_files = set(
+                    f for f in os.listdir(item["folder_path"])
+                    if f.lower().endswith(".pdf")
                 )
-                for cid in conv_ids:
-                    tracker.update_status(CAT, cid, "uploaded")
-                continue
+                previously_uploaded = tracker.get_uploaded_files(CAT, folder_name)
+                new_files = local_files - previously_uploaded
+
+                if not new_files:
+                    log.info(
+                        f"[{SERVICE_KEY}] Skipping '{folder_name}' — "
+                        f"already uploaded to Jordex and no new files"
+                    )
+                    for cid in conv_ids:
+                        tracker.update_status(CAT, cid, "uploaded")
+                    continue
+                else:
+                    log.info(
+                        f"[{SERVICE_KEY}] Re-uploading '{folder_name}' — "
+                        f"{len(new_files)} new file(s) since last upload: {new_files}"
+                    )
+                    # Fall through to Jordex search + upload below
 
             success, used_ref, rows_found = search_jordex_with_fallback(
                 jordex_page=jordex_page,

@@ -153,3 +153,21 @@ class Tracker:
     def all_stats(self) -> dict:
         from config import LABELS
         return {svc: self.stats(cat) for _, cat, _, svc in LABELS}
+
+    def get_uploaded_files(self, cat: str, folder_name: str) -> set:
+        """
+        Return filenames already uploaded to Jordex for a given folder_name.
+        Used to detect NEW files that arrived after a previous upload.
+        """
+        files = set()
+        folder_norm = (folder_name or "").strip().upper()
+        if not folder_norm:
+            return files
+        with _LOCK:
+            self.reload()
+            for cid, info in self.data.get(cat, {}).items():
+                if info.get("status") != "uploaded":
+                    continue
+                if (info.get("folder_name") or "").strip().upper() == folder_norm:
+                    files.update(info.get("files", []))
+        return files

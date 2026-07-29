@@ -177,11 +177,17 @@ class CustomerDocsService:
 
             cleanup_temp(temp_files)
 
-            # secondary_ref: try reference_number from classification, then container_no
+            # secondary_ref: whichever of container_no / reference_number was NOT
+            # already used as the primary (folder_name), so the fallback search
+            # actually tries a different value instead of repeating the primary.
             sec_ref = None
             if cust_results:
                 for r in cust_results:
-                    sec_ref = r.get("reference_number") or r.get("container_no")
+                    primary = r.get("folder_name")
+                    for candidate in (r.get("container_no"), r.get("reference_number")):
+                        if candidate and candidate != primary:
+                            sec_ref = candidate
+                            break
                     if sec_ref:
                         break
             
@@ -261,13 +267,19 @@ class CustomerDocsService:
                     success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
                     if not success: break
                     cust_file_map = build_customer_docs_file_map(item["folder_path"])
-                    upload_attachments(
+                    row_ok = upload_attachments(
                         jordex_page, item["folder_path"], doc_type, display_name,
                         file_map=cust_file_map,
                     )
                     go_back(jordex_page)
-                    uploaded = True
-                    self._uploaded += 1
+                    if row_ok:
+                        uploaded = True
+                        self._uploaded += 1
+                    else:
+                        log.warning(
+                            f"[{SERVICE_KEY}] Upload not confirmed for row {row_index} "
+                            f"(query={query}) — will retry next run"
+                        )
                     row_index += 1
                     if rows_found <= row_index: break
             except Exception as e:

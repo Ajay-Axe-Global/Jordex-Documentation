@@ -5,7 +5,7 @@ import hashlib
 import tempfile
 import logging
 from datetime import datetime
-from .browser import apply_zoom
+from .browser import apply_zoom, dismiss_update_popup
 
 log = logging.getLogger("jordex.documents")
 
@@ -33,7 +33,7 @@ CUSTOMER_DOC_TYPE_MAP = {
     "HOUSE BILL OF LADING":  ("House BL",              "HBL",                  ""),
     "MASTER BILL OF LADING": ("Master BL",             "MBL",                  ""),
     "COMMERCIAL INVOICE":    ("Commercial Invoice",    "Commercial Invoice",   ""),
-    "AGENT INVOICE":         ("Agent Invoice",         "Agent Invoice",        ""),
+    "AGENT INVOICE":         ("Additional Files",      "Additional Files",     "Agent Invoice"),
     "BOOKING CONFIRMATION":  ("Booking Confirmation",  "Booking Confirmation", ""),
     "PACKING LIST":          ("Packing List",          "Packing List",         ""),
     "DEBIT NOTE":            ("Additional Files",      "Additional Files",     "Debit Note"),
@@ -224,12 +224,18 @@ def get_today_existing_filenames(page):
         for (const row of rows) {
             const cells = row.querySelectorAll('td, [role="cell"]');
             if (cells.length < 3) continue;
-            const name = (cells[1]?.innerText || '').trim().toLowerCase();
+            // Jordex table: col 0 = filename, col 1 = type/name, col 2 = date
+            // Check both col 0 and col 1 in case the table layout varies
             const date = (cells[2]?.innerText || '').trim();
-            if ((date === today1 || date === today2) && name) {
-                results.push(name);
+            if (date !== today1 && date !== today2) continue;
+            for (let i = 0; i <= 1; i++) {
+                const name = (cells[i]?.innerText || '').trim().toLowerCase();
+                if (name && (name.endsWith('.pdf') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.png'))) {
+                    results.push(name);
+                }
             }
         }
+        console.log("Existing filenames today:", results);
         return results;
     }""", [today_padded, today_no_pad]) or []
 
@@ -499,6 +505,12 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
 
         log.info(f"  Uploading '{filename}' as type='{actual_type}' name='{actual_name}'...")
 
+        # ── Guard: dismiss update popup before each upload attempt ───
+        # If the Jordex update popup appeared while we were processing
+        # previous files, it will silently block the file chooser from
+        # opening. Catching it here prevents wasting a retry cycle.
+        dismiss_update_popup(page, service_key="upload_attachments")
+
         # ── Find + button ────────────────────────────────────────────
         plus_btn = None
         for sel in ["button.upload-button", "button:has(.el-icon-plus)"]:
@@ -633,14 +645,46 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
                 pass
 
             # ── Verify the dialog actually closed ──────────────────────
-            # If it's still open, the save was blocked (validation error,
-            # still-uploading file, session hiccup, etc.) — don't claim success.
-            dialog_still_open = page.evaluate("""() => {
-                const dialog = [...document.querySelectorAll('.el-dialog')].find(d => d.offsetParent !== null);
-                return !!dialog;
-            }""")
+            # El-UI dialogs may close by: (a) removing from DOM entirely, or
+            # (b) setting display:none/opacity:0 (CSS animation ~300ms).
+            # wait_for(state="hidden") throws if the element is REMOVED from DOM,
+            # which we must also treat as success (dialog is definitely gone).
+            page.wait_for_timeout(1500)   # let animation finish first
+
+            dialog_still_open = True
+            try:
+                is_gone = page.evaluate("""() => {
+                    const dialogs = [...document.querySelectorAll('.el-dialog')];
+                    // If no dialogs at all → definitely closed
+                    if (dialogs.length === 0) return true;
+                    // If ALL visible dialogs are gone → closed
+                    const visible = dialogs.filter(d => d.offsetParent !== null);
+                    return visible.length === 0;
+                }""")
+                if is_gone:
+                    dialog_still_open = False
+                else:
+                    # Dialog still in DOM and visible — wait a bit more for slow saves
+                    page.wait_for_timeout(2000)
+                    is_gone2 = page.evaluate("""() => {
+                        const visible = [...document.querySelectorAll('.el-dialog')]
+                            .filter(d => d.offsetParent !== null);
+                        return visible.length === 0;
+                    }""")
+                    dialog_still_open = not is_gone2
+            except Exception:
+                dialog_still_open = True  # JS failed → assume stuck
 
             if dialog_still_open:
+                # Check if the Jordex update popup is the reason the dialog
+                # didn't close — if so, reload and let the next run re-upload.
+                if dismiss_update_popup(page, service_key="upload_attachments/save"):
+                    log.warning(
+                        f"  Update popup was active during save of '{filename}' — "
+                        f"page reloaded, file will be re-attempted on next run."
+                    )
+                    all_ok = False
+                    break  # abort remaining files in this batch; page is now clean
                 log.warning(f"  Save dialog still open after Save for '{filename}' — NOT confirmed uploaded.")
                 all_ok = False
                 page.keyboard.press("Escape")

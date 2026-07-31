@@ -77,6 +77,8 @@ class Tracker:
         status = entry.get("status", "")
         if status in self._DONE_STATUSES:
             return True
+        if status == "partial_upload":
+            return False
         if status == "downloaded":
             return entry.get("retry_count", 0) >= 1
         # Any other unknown status → treat as done (safe default)
@@ -138,6 +140,15 @@ class Tracker:
             self.reload()
             if conv_id in self.data.get(cat, {}):
                 self.data[cat][conv_id]["status"] = status
+                self.save()
+
+    def add_uploaded_folder(self, cat: str, conv_id: str, folder_name: str):
+        with _LOCK:
+            self.reload()
+            if conv_id in self.data.get(cat, {}):
+                folders = self.data[cat][conv_id].setdefault("uploaded_folders", [])
+                if folder_name not in folders:
+                    folders.append(folder_name)
                 self.save()
 
     def stats(self, cat: str) -> dict:

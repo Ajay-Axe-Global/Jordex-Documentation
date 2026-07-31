@@ -432,7 +432,7 @@ def _file_md5(filepath: str) -> str:
 def move_file_to_folder(tmp_path: str, dest_dir: str) -> str | None:
     """
     Move a temp file to dest_dir with MD5 duplicate detection.
-    Returns saved filename, or None if skipped as exact duplicate.
+    Returns the saved filename (or the existing filename if skipped as exact duplicate).
     """
     os.makedirs(dest_dir, exist_ok=True)
     tmp_md5 = _file_md5(tmp_path)
@@ -440,7 +440,7 @@ def move_file_to_folder(tmp_path: str, dest_dir: str) -> str | None:
         ep = os.path.join(dest_dir, existing)
         if os.path.isfile(ep) and _file_md5(ep) == tmp_md5:
             log.info("    Skipped (duplicate of %s): %s", existing, os.path.basename(tmp_path))
-            return None
+            return existing
 
     fname = os.path.basename(tmp_path)
     dest = os.path.join(dest_dir, fname)
@@ -686,27 +686,112 @@ def should_skip_multi_attachment(page, max_allowed: int = 1) -> bool:
 
 def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
     """
-    Mark an email as unread in Outlook using Ctrl+U.
+    Mark an email as unread in Outlook without opening it.
 
-    Assumes the email is already in the currently open folder (which it
-    always is, since we process emails from the folder we navigated to).
+    IMPORTANT: Never use click_row() here — that opens the email in the reading
+    pane which marks it as Read again, undoing the action.
 
-    Args:
-        outlook_page: The Outlook Playwright page
-        conv_id:      The data-convid of the email to mark unread
-
-    Returns:
-        True if successfully marked unread, False otherwise
+    Strategy:
+      1. Right-click the row → context menu → "Mark as unread"
+      2. Hover the row → click the envelope icon button that appears
+      3. Last resort: select row then press 'u'
     """
     try:
-        if not click_row(outlook_page, conv_id):
-            log.warning("  mark_as_unread: could not select email %s", conv_id)
-            return False
-        outlook_page.wait_for_timeout(500)
-        outlook_page.keyboard.press("Control+u")
-        outlook_page.wait_for_timeout(500)
-        log.info("  Marked as UNREAD: %s", conv_id)
-        return True
+        outlook_page.bring_to_front()
+
+        # Locate the row without clicking it (clicking = opens = marks as Read)
+        sel = f"#MailList div[role='option'][data-convid='{conv_id}']"
+
+        # Scroll row into view if needed
+        try:
+            row = outlook_page.locator(sel).first
+            row.wait_for(state="visible", timeout=3000)
+        except Exception:
+            # Scroll to top and try scrolling down to find it
+            try:
+                outlook_page.locator(
+                    "#MailList div[data-virtuoso-scroller='true']"
+                ).first.evaluate("el => el.scrollTo(0, 0)")
+                outlook_page.wait_for_timeout(500)
+            except Exception:
+                pass
+            for _ in range(30):
+                try:
+                    row = outlook_page.locator(sel).first
+                    if row.is_visible(timeout=500):
+                        break
+                except Exception:
+                    pass
+                _scroll(outlook_page)
+            else:
+                log.warning("  mark_as_unread: row not found in list for %s", conv_id)
+                return False
+
+        # ── Strategy 1: Right-click → context menu ───────────────────
+        try:
+            row = outlook_page.locator(sel).first
+            row.click(button="right", timeout=3000)
+            outlook_page.wait_for_timeout(500)
+
+            # Context menu item — English: "Mark as unread", Dutch: "Markeren als ongelezen"
+            menu_item = outlook_page.locator(
+                "li[role='menuitem']:has-text('unread'), "
+                "li[role='menuitem']:has-text('ongelezen'), "
+                "div[role='menuitem']:has-text('unread'), "
+                "div[role='menuitem']:has-text('ongelezen')"
+            ).first
+            if menu_item.is_visible(timeout=1500):
+                menu_item.click()
+                outlook_page.wait_for_timeout(500)
+                log.info("  Marked as UNREAD via right-click menu: %s", conv_id)
+                return True
+            else:
+                # Dismiss the context menu and try next strategy
+                outlook_page.keyboard.press("Escape")
+                outlook_page.wait_for_timeout(300)
+        except Exception:
+            try:
+                outlook_page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+        # ── Strategy 2: Hover → envelope icon button ─────────────────
+        try:
+            row = outlook_page.locator(sel).first
+            row.hover(timeout=2000)
+            outlook_page.wait_for_timeout(400)
+
+            # Button appears on hover — English: "Mark as unread", Dutch: "Markeren als ongelezen"
+            btn = row.locator(
+                "button[title*='unread'], button[title*='ongelezen']"
+            ).first
+            if btn.is_visible(timeout=1000):
+                btn.click()
+                outlook_page.wait_for_timeout(500)
+                log.info("  Marked as UNREAD via hover button: %s", conv_id)
+                return True
+        except Exception:
+            pass
+
+        # ── Strategy 3: Focus the list without opening email, press 'u' ──
+        # Click the row's CHECKBOX (if visible) — that selects without opening
+        try:
+            checkbox = outlook_page.locator(sel).locator(
+                "input[type='checkbox'], div[role='checkbox']"
+            ).first
+            if checkbox.is_visible(timeout=1000):
+                checkbox.click()
+                outlook_page.wait_for_timeout(300)
+                outlook_page.keyboard.press("u")
+                outlook_page.wait_for_timeout(500)
+                log.info("  Marked as UNREAD via checkbox+u: %s", conv_id)
+                return True
+        except Exception:
+            pass
+
+        log.warning("  mark_as_unread: all strategies failed for %s", conv_id)
+        return False
+
     except Exception as e:
         log.warning("  mark_as_unread FAILED for %s: %s", conv_id, e)
         return False
@@ -715,6 +800,32 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 #  Jordex search with fallback
 # ══════════════════════════════════════════════════════════════════════
+def is_valid_jordex_search_ref(ref: str) -> bool:
+    """
+    Check if a reference is a valid Jordex search string:
+      1. OI Number (starts with OI, OE, 0I, 01 followed by 4+ digits)
+      2. MBL / SCAC (4 letters followed by alphanumeric, total length >= 10)
+      3. Container No (4 letters followed by 7 digits)
+    """
+    import re
+    if not ref:
+        return False
+    ref = str(ref).strip().upper()
+    
+    # 1. OI Number
+    if re.match(r'^(OI|OE|0I|01)\d{4,}$', ref):
+        return True
+        
+    # 2. Container No (4 letters + 7 digits)
+    if re.match(r'^[A-Z]{4}\d{7}$', ref):
+        return True
+        
+    # 3. MBL / SCAC format (4 letters + alphanumerics, len >= 10)
+    if re.match(r'^[A-Z]{4}', ref) and len(ref) >= 10:
+        return True
+        
+    return False
+
 def search_jordex_with_fallback(
     jordex_page,
     outlook_page,
@@ -734,26 +845,40 @@ def search_jordex_with_fallback(
     This eliminates the double-search problem (25s wasted per item).
     """
     from jordex.browser import go_back
+    
+    tried_refs = []
  
     if primary_ref:
-        log.info("[%s] Jordex search PRIMARY: '%s'", service_key, primary_ref)
-        success, rows_found = search_fn(jordex_page, primary_ref, row_index=0)
-        if success and rows_found > 0:
-            go_back(jordex_page)           # ★ go back so while loop can re-open
-            return True, primary_ref, rows_found
-        log.warning("[%s] PRIMARY not found: '%s'", service_key, primary_ref)
+        if not is_valid_jordex_search_ref(primary_ref):
+            log.warning("[%s] PRIMARY ref '%s' has invalid format — skipping search", service_key, primary_ref)
+        else:
+            tried_refs.append(primary_ref)
+            log.info("[%s] Jordex search PRIMARY: '%s'", service_key, primary_ref)
+            success, rows_found = search_fn(jordex_page, primary_ref, row_index=0)
+            if success and rows_found > 0:
+                go_back(jordex_page)           # ★ go back so while loop can re-open
+                return True, primary_ref, rows_found
+            log.warning("[%s] PRIMARY not found: '%s'", service_key, primary_ref)
  
     if secondary_ref and secondary_ref != primary_ref:
-        log.info("[%s] Jordex search SECONDARY: '%s'", service_key, secondary_ref)
-        success, rows_found = search_fn(jordex_page, secondary_ref, row_index=0)
-        if success and rows_found > 0:
-            log.info("[%s] SECONDARY found: '%s'", service_key, secondary_ref)
-            go_back(jordex_page)           # ★ go back so while loop can re-open
-            return True, secondary_ref, rows_found
-        log.warning("[%s] SECONDARY not found: '%s'", service_key, secondary_ref)
+        if not is_valid_jordex_search_ref(secondary_ref):
+            log.warning("[%s] SECONDARY ref '%s' has invalid format — skipping search", service_key, secondary_ref)
+        else:
+            tried_refs.append(secondary_ref)
+            log.info("[%s] Jordex search SECONDARY: '%s'", service_key, secondary_ref)
+            success, rows_found = search_fn(jordex_page, secondary_ref, row_index=0)
+            if success and rows_found > 0:
+                log.info("[%s] SECONDARY found: '%s'", service_key, secondary_ref)
+                go_back(jordex_page)           # ★ go back so while loop can re-open
+                return True, secondary_ref, rows_found
+            log.warning("[%s] SECONDARY not found: '%s'", service_key, secondary_ref)
  
-    tried = " / ".join(filter(None, [primary_ref, secondary_ref]))
-    log.warning("[%s] NOT FOUND in Jordex (%s) → marking email unread", service_key, tried)
+    if tried_refs:
+        tried = " / ".join(tried_refs)
+        log.warning("[%s] NOT FOUND in Jordex (%s) → marking email unread", service_key, tried)
+    else:
+        log.warning("[%s] NO VALID REFS found to search in Jordex → marking email unread", service_key)
+        
     if conv_id and outlook_page:
         mark_as_unread(outlook_page, conv_id)
     if tracker and conv_id and cat:

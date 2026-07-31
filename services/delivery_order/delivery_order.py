@@ -531,6 +531,11 @@ class DeliveryOrderService:
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 continue
 
+            previously_uploaded = tracker.data.get(CAT, {}).get(item.get("conv_id"), {}).get("uploaded_folders", [])
+            if folder_name in previously_uploaded:
+                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded in a previous run")
+                continue
+
             if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name, mbl=item.get("mbl"),
                                               exclude_conv_id=item.get("conv_id")):
                 log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email")
@@ -608,6 +613,7 @@ class DeliveryOrderService:
                     break
  
             if uploaded:
+                tracker.add_uploaded_folder(CAT, item.get("conv_id"), folder_name)
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 uploaded_folders.add(folder_name)
 
@@ -616,7 +622,11 @@ class DeliveryOrderService:
         # status written earlier for a sibling item in the same email.
         for cid in missing_return_conv_ids:
             mark_as_unread(outlook_page, cid)
-            tracker.update_status(CAT, cid, "no_return_info")
+            folders = tracker.data.get(CAT, {}).get(cid, {}).get("uploaded_folders", [])
+            if len(folders) > 0:
+                tracker.update_status(CAT, cid, "partial_upload")
+            else:
+                tracker.update_status(CAT, cid, "no_return_info")
 
     # ══════════════════════════════════════════════════════════════════
     #  DESTINATION FILL — View Routing → 3. Destination

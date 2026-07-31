@@ -262,8 +262,26 @@ class CustomerDocsService:
 
             row_index = 0
             uploaded  = False
+
+            # Only iterate multiple rows if the search reference is a reliable
+            # OI number or SCAC-prefixed BL (e.g. "OI2617257", "HLCU...").
+            # If the search fell back to a short/partial secondary_ref
+            # (e.g. "1406"), uploading to all rows would broadcast the document
+            # to random shipments that don't belong to this email.
+            import re as _re
+            _ref_is_reliable = bool(
+                _re.match(r'^OI\d{4,}', used_ref, _re.IGNORECASE) or
+                (_re.match(r'^[A-Z]{4}', used_ref) and len(used_ref) >= 10)
+            )
+            _max_rows = 10 if _ref_is_reliable else 1
+            if not _ref_is_reliable:
+                log.info(
+                    f"[{SERVICE_KEY}] Ref '{used_ref}' is not a reliable OI/BL — "
+                    f"uploading to row 0 only (preventing broadcast to unrelated shipments)"
+                )
+
             try:
-                while row_index < 10:
+                while row_index < _max_rows:
                     success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
                     if not success: break
                     cust_file_map = build_customer_docs_file_map(item["folder_path"])
@@ -290,3 +308,8 @@ class CustomerDocsService:
                     uploaded_folders.add(folder_name)
                 else:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
+                    try:
+                        mark_as_unread(outlook_page, item["conv_id"])
+                        log.info(f"[{SERVICE_KEY}] Marked '{query}' unread for retry next run")
+                    except Exception as e:
+                        log.warning(f"[{SERVICE_KEY}] Could not mark unread for {query}: {e}")

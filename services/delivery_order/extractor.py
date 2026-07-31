@@ -202,7 +202,9 @@ PICKUP:
 - address = the name from "Full Delivery Pickup Terminal" row.
 - reference per container = the "Pin" column from the Equipment table.
   → If Pin is BLANK/EMPTY → reference = "" (empty string).
-  → NEVER use "PCS" for Maersk pickup. Only actual pin or "".
+  → CRITICAL: Do NOT extract Cargo Weight (e.g. "12904.000 KGS" or any number ending in KGS) as the Pin. If you only see weight, the Pin is blank ("").
+  → Normally, NEVER use "PCS" for Maersk pickup. Use the actual Pin or "".
+  → EXCEPTION: If the RETURN address (Empty Container Depot) contains "Star Container", then the PICKUP reference MUST be "PCS".
 
 RETURN:
 - address = the name from "Empty Container Depot" row.

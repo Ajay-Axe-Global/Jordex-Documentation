@@ -123,6 +123,19 @@ If the header/title says ANY of:
   doc_title: use the exact header (e.g. "Cargo Manifest")
   reference_number: extract the MB/L number if present.
   Do NOT proceed to Step 2. This is NOT a BL.
+
+── CARGO RELEASE NOTICE / RELEASE NOTICE ──
+CRITICAL: A CARGO RELEASE NOTICE (also called "Release Notice", "Cargo Release",
+"PIN Release", "Container Release") is a carrier administrative notice informing that
+cargo has been released for pickup. It is NOT a Bill of Lading even if it carries a
+B/L number and is printed on carrier letterhead (e.g. Evergreen Line, Maersk, CMA CGM).
+If the header/title/body says ANY of:
+  "CARGO RELEASE NOTICE", "RELEASE NOTICE", "CARGO RELEASE",
+  "PIN RELEASE", "CONTAINER RELEASE", "RELEASE ADVISE", "RELEASE ADVICE"
+  → classify as: "ADDITIONAL FILES"
+  doc_title: use the exact header (e.g. "Cargo Release Notice")
+  reference_number: extract the B/L number if present.
+  CRITICAL: Do NOT proceed to Step 2. This is NOT a Bill of Lading.
  
 ── CERTIFICATE OF ORIGIN ──
 If the header says "CERTIFICATE OF ORIGIN", "C/O", "GSP FORM A":
@@ -195,7 +208,11 @@ CRITICAL CONSIGNEE RULES:
   - JORDEX in Notify Party, Delivery Agent, or anywhere else does NOT count as the Consignee.
   - ONLY the CONSIGNEE box determines MBL vs HBL.
   - EXCEPTION FOR LOGOS/CARRIERS: A prominent carrier/NVOCC logo (e.g. BEE LOGISTICS, Hapag-Lloyd, ZIM, etc.) at the top does NOT make it an MBL. If the Consignee is NOT Jordex, you MUST classify it as a HOUSE BILL OF LADING, regardless of the logo.
-  - EXCEPTION FOR FORWARDERS: If the document explicitly says it is issued by a Freight Forwarder (e.g. "MRF INTERNATIONAL FORWARDING", "KUEHNE+NAGEL", "FIATA"), it is ALWAYS a HOUSE BILL OF LADING. Master Bills are ONLY issued by actual ocean carriers (MSC, Maersk, etc).
+  - EXCEPTION FOR FORWARDERS: If the document is issued by a Freight Forwarder or NVOCC, it is ALWAYS a HOUSE BILL OF LADING. Master Bills are ONLY issued by actual ocean carriers (MSC, Maersk, etc.).
+    Known freight forwarders that ALWAYS produce HBLs (never MBLs):
+    "GREEN LOGISTICS", "GREENX LOGISTICS", "GREENX LOGISTICS CO.", "GREENX LOGISTICS CO., LTD",
+    "MRF INTERNATIONAL FORWARDING", "KUEHNE+NAGEL", "FIATA", "BEE LOGISTICS".
+  - CRITICAL: If you see the GREEN LOGISTICS or GREENX LOGISTICS logo or name ANYWHERE on the document — even prominently at the top — classify it as HOUSE BILL OF LADING. Do NOT upgrade to MBL.
 
 =====================================================================
 STEP 3 — EXTRACT REFERENCE NUMBER AND DOC TITLE
@@ -295,6 +312,15 @@ def _keyword_fallback(pdf_path: str) -> dict:
         elif re.search(r'\bPACKING\s+LIST\b', text_upper):
             doc_type = "PACKING LIST"
             doc_title = "Packing List"
+        elif re.search(r'\bCARGO\s+RELEASE|\bRELEASE\s+NOTICE|\bPIN\s+RELEASE|\bCONTAINER\s+RELEASE|\bRELEASE\s+ADVI[SC]E\b', text_upper):
+            doc_type = "ADDITIONAL FILES"
+            # Grab first matching phrase as title
+            for phrase in ("CARGO RELEASE NOTICE", "RELEASE NOTICE", "CARGO RELEASE", "PIN RELEASE", "CONTAINER RELEASE"):
+                if phrase in text_upper:
+                    doc_title = phrase.title()
+                    break
+            else:
+                doc_title = "Cargo Release Notice"
         elif re.search(r'\bARRIVAL\s+NOTICE\b|\bNOTICE\s+OF\s+ARRIVAL\b', text_upper):
             doc_type = "ARRIVAL NOTICE"
             doc_title = "Arrival Notice"
@@ -416,6 +442,13 @@ _NORMALISE = {
     "CMR CONSIGNMENT NOTE": "ADDITIONAL FILES",
     "VRACHTBRIEF": "ADDITIONAL FILES",
     "TRANSPORT DOCUMENT": "ADDITIONAL FILES",
+    "CARGO RELEASE NOTICE": "ADDITIONAL FILES",
+    "CARGO RELEASE": "ADDITIONAL FILES",
+    "RELEASE NOTICE": "ADDITIONAL FILES",
+    "PIN RELEASE": "ADDITIONAL FILES",
+    "CONTAINER RELEASE": "ADDITIONAL FILES",
+    "RELEASE ADVICE": "ADDITIONAL FILES",
+    "RELEASE ADVISE": "ADDITIONAL FILES",
     "UNKNOWN": "ADDITIONAL FILES",
 }
 
@@ -499,6 +532,16 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
                 reference_number = normalize_oi_reference(reference_number)
                 
             container_no = (parsed.get("container_no") or "").strip().upper() or None
+            
+            # If Gemini missed the container number, try extracting via regex
+            if not container_no:
+                _txt = _extract_text(pdf_path)
+                if _txt:
+                    cont_match = re.search(r'\b([A-Z]{4})(\d{7})\b', _txt.upper())
+                    if cont_match:
+                        container_no = cont_match.group(1) + cont_match.group(2)
+                        log.info("  Regex fallback extracted container_no: %s", container_no)
+
             doc_title = (parsed.get("doc_title") or "").strip() or None
             confidence = (parsed.get("confidence") or "high").strip().lower()
             carrier_name = (parsed.get("carrier_name") or "").strip().upper() or None
@@ -551,19 +594,53 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
         doc_type = "ADDITIONAL FILES"
 
     # ── Ocean carrier detection → upgrade HBL → MBL + prepend SCAC ──
-    if doc_type == "HOUSE BILL OF LADING" and carrier_name:
-        for carrier_key, scac in _CARRIER_TO_SCAC.items():
-            if carrier_key in carrier_name:
-                log.info("  Ocean carrier '%s' detected → upgrading HBL → MBL", carrier_name)
-                doc_type = "MASTER BILL OF LADING"
-                # Prepend SCAC if reference doesn't already have one
-                if reference_number and reference_number[:4] not in _KNOWN_SCAC_PREFIXES:
-                    reference_number = scac + reference_number
-                    log.info("  Prepended SCAC %s → %s", scac, reference_number)
-                break
+    # Only upgrade genuine Bill of Lading documents. If the doc_title indicates
+    # this is a carrier NOTICE / RELEASE / MANIFEST (i.e. not actually a BL),
+    # skip the upgrade even if an ocean carrier logo is present on the page.
+    _NON_BL_TITLE_PATTERNS = re.compile(
+        r'\bRELEASE\b|\bMANIFEST\b|\bNOTICE\b|\bFREETIME\b|\bDETENTION\b|\bDEMURRAGE\b',
+        re.IGNORECASE,
+    )
+    _is_non_bl_title = bool(doc_title and _NON_BL_TITLE_PATTERNS.search(doc_title))
+
+    # Known freight forwarders / NVOCCs — NEVER upgrade these to MBL, even if
+    # their logo appears prominently on the document.  They issue HBLs only.
+    _KNOWN_FORWARDERS = {
+        "GREEN LOGISTICS", "GREENX LOGISTICS", "GREENX LOGISTICS CO",
+        "MRF INTERNATIONAL FORWARDING", "KUEHNE+NAGEL", "BEE LOGISTICS",
+    }
+    _is_forwarder = carrier_name and any(fw in carrier_name for fw in _KNOWN_FORWARDERS)
+
+    if doc_type == "HOUSE BILL OF LADING" and carrier_name and not _is_non_bl_title:
+        if _is_forwarder:
+            log.info(
+                "  Carrier '%s' is a known FORWARDER/NVOCC → keeping HBL, NOT upgrading to MBL",
+                carrier_name,
+            )
+        else:
+            for carrier_key, scac in _CARRIER_TO_SCAC.items():
+                if carrier_key in carrier_name:
+                    log.info("  Ocean carrier '%s' detected → upgrading HBL → MBL", carrier_name)
+                    doc_type = "MASTER BILL OF LADING"
+                    # Prepend SCAC if reference doesn't already have one
+                    if reference_number and reference_number[:4] not in _KNOWN_SCAC_PREFIXES:
+                        reference_number = scac + reference_number
+                        log.info("  Prepended SCAC %s → %s", scac, reference_number)
+                    break
+    elif doc_type == "HOUSE BILL OF LADING" and carrier_name and _is_non_bl_title:
+        log.info(
+            "  Ocean carrier '%s' detected but doc_title='%s' suggests non-BL notice "
+            "→ NOT upgrading to MBL, classifying as ADDITIONAL FILES",
+            carrier_name, doc_title,
+        )
+        doc_type = "ADDITIONAL FILES"
 
     # ── Secondary MBL check via SCAC prefix ──────────────────────────
-    if doc_type == "HOUSE BILL OF LADING" and reference_number:
+    # SKIP this check if the document was issued by a known forwarder/NVOCC.
+    # A Green Logistics HBL will naturally carry an HLCU-prefixed carrier BL
+    # number in its reference field — that prefix belongs to the ocean carrier,
+    # NOT to Green Logistics, so it must NOT trigger an MBL upgrade.
+    if doc_type == "HOUSE BILL OF LADING" and reference_number and not _is_forwarder:
         prefix4 = reference_number[:4].upper()
         if prefix4 in _KNOWN_SCAC_PREFIXES:
             log.info("  SCAC prefix '%s' → upgrading HBL → MBL", prefix4)

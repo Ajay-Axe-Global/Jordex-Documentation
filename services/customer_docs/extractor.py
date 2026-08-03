@@ -664,6 +664,22 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
                     )
                     break
 
+    # ── BKK- prefix safety net: force HOUSE BILL OF LADING ────────────
+    # Bangkok-based freight forwarders (e.g. "Amazing Logistics and Supply
+    # Chain Co., Ltd") issue FIATA multimodal B/Ls numbered "BKK-xxxxxxxx".
+    # Gemini sometimes classifies these as MASTER BILL OF LADING even though
+    # a forwarder issued them. A BKK- prefixed number is never a real ocean
+    # carrier's Master B/L number (those carry the carrier's own SCAC
+    # prefix), so force it back to HOUSE BILL OF LADING regardless of what
+    # the upgrade logic above decided.
+    if doc_type == "MASTER BILL OF LADING" and reference_number and reference_number.upper().startswith("BKK-"):
+        log.info(
+            "  Reference '%s' starts with BKK- (forwarder-issued FIATA B/L) "
+            "→ forcing MASTER BILL OF LADING → HOUSE BILL OF LADING",
+            reference_number,
+        )
+        doc_type = "HOUSE BILL OF LADING"
+
     # ── Build result ─────────────────────────────────────────────────
     result["doc_type"] = doc_type
     result["reference_number"] = reference_number

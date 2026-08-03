@@ -75,8 +75,13 @@ TERMINAL_SHORTCODES = {
     "BTT MULTIMODAL CONTAINER SOLUTIONS": "BTT",
     "BTT MULTIMODAL CONTAINER":           "BTT",
     "BTT MULTIMODAL":                     "BTT",
-    
-
+    "RST ZUIDZIJDE" :                      "RSTZU",
+    "MWT":                              "Westzijde 60",
+    "WAALHAVEN BOTLEK TERMINAL B.V":    "WAALHAVEN BOTLEK",
+    "BARGE TERMINAL BORN B.V.":         "BARGE TERMINAL BORN",
+    "DR Depot Antwerpen"               :"DR Depots B.V.B.A",
+    "PSA MPET Quay 1742":               "Deurganck Terminal Quays",
+    "PSA MPET 1742":                  "Deurganck Terminal Quays",
 }
 
 # Pre-sorted longest key first so "ECT DELTA TERMINAL BV / DDE" matches before "ECT DELTA TERMINAL"
@@ -282,6 +287,22 @@ class DeliveryOrderService:
         )
         return existing
 
+    def _container_set(self, ext: dict) -> set:
+        """All container numbers this single extraction covers (own containers
+        list plus any pickup/return per-container references), normalized."""
+        result = set()
+        for c in ext.get("containers") or []:
+            cno = c.get("container_no") if isinstance(c, dict) else c
+            if cno:
+                result.add(str(cno).strip().upper())
+        for section_key in ("pickup", "return"):
+            section = ext.get(section_key) or {}
+            for ref in section.get("references", []) or []:
+                if isinstance(ref, dict):
+                    cno = (ref.get("container_no") or "").strip().upper()
+                    if cno:
+                        result.add(cno)
+        return result
 
     def _process_multi_pdfs(self, pdf_files, all_temp_files, base, subject, cid, pw=None) -> list:
         """
@@ -349,10 +370,11 @@ class DeliveryOrderService:
                     "extraction": None,      # will hold the DO extraction (not ack)
                     "pdfs": [],
                     "ack_pdfs": [],          # NEW: acknowledgement PDFs
+                    "pdf_containers": {},    # tmp_path -> set(container_no) owned by THIS pdf
                 }
-    
+
             doc_subtype = ext.get("doc_subtype", "delivery_order")
-    
+
             if doc_subtype in ("acknowledgement", "other"):
                 folder_groups[folder_name]["ack_pdfs"].append(pdf_path)
                 log.info(f"[{SERVICE_KEY}] '{os.path.basename(pdf_path)}' is {doc_subtype} → Additional Files")
@@ -363,6 +385,10 @@ class DeliveryOrderService:
             else:
                 # Actual Delivery Order → full extraction
                 folder_groups[folder_name]["pdfs"].append(pdf_path)
+                # Record which containers THIS specific pdf covers, before
+                # it gets folded into the group's merged extraction below —
+                # needed later to route this file to the right Jordex row.
+                folder_groups[folder_name]["pdf_containers"][pdf_path] = self._container_set(ext)
                 # Merge extraction: combine containers + references from all DOs
                 if folder_groups[folder_name]["extraction"] is None:
                     folder_groups[folder_name]["extraction"] = ext
@@ -385,13 +411,15 @@ class DeliveryOrderService:
     
             # Move DO files
             saved_do = []
+            do_file_containers = {}
             for tmp in group["pdfs"]:
                 if not os.path.exists(tmp):
                     continue
                 s = move_file_to_folder(tmp, final_dir)
                 if s:
                     saved_do.append(s)
-    
+                    do_file_containers[os.path.basename(s)] = group.get("pdf_containers", {}).get(tmp, set())
+
             # Move Acknowledgement files
             saved_ack = []
             for tmp in group["ack_pdfs"]:
@@ -424,6 +452,7 @@ class DeliveryOrderService:
                 "mbl":           mbl_val,
                 "files":         saved_do + saved_ack,
                 "do_files":      saved_do,
+                "do_file_containers": do_file_containers,
                 "ack_files":     saved_ack,
                 "oi_number":     None,
                 "extraction":    ext,
@@ -514,6 +543,10 @@ class DeliveryOrderService:
         # flagged unread AFTER the loop so it isn't overwritten by an
         # "uploaded" status from a sibling item in the same email
         missing_return_conv_ids: set[str] = set()
+        # conv_ids that had at least one DO file that never matched any
+        # Jordex row's containers (distinct cause from missing_return —
+        # flagged separately so tracker status stays diagnostic)
+        no_row_match_conv_ids: set[str] = set()
 
         for item in items:
             if self._stop_evt.is_set():
@@ -568,54 +601,103 @@ class DeliveryOrderService:
             if not success:
                 continue
 
+            # do_file_containers: which container(s) each source PDF covers
+            # (built per-PDF in _process_multi_pdfs). A single combined PDF
+            # can legitimately need uploading to MULTIPLE Jordex rows — e.g.
+            # one DO covering 6 containers, each container living on its own
+            # separate shipment row in Jordex. So there is no "already placed,
+            # skip it now" concept here: every row gets offered every file
+            # whose containers overlap that row, every time, and Jordex's own
+            # same-day filename/hash dedup (in upload_attachments) is what
+            # prevents a true duplicate if a row is ever revisited.
+            do_file_containers = item.get("do_file_containers", {}) or {}
+            all_do_files = item.get("do_files", [])
+            has_do_extraction = bool(
+                item.get("extraction")
+                and (item["extraction"].get("pickup") or item["extraction"].get("return"))
+                and item["extraction"].get("doc_subtype") != "acknowledgement"
+            )
+
             row_index = 0
             uploaded = False
+            checked_any_row = False
+            ack_uploaded = False
+            uploaded_files_this_item: set[str] = set()
             while row_index < 10:
                 success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
                 if not success:
                     break
- 
+                checked_any_row = True
+
                 # ── Destination fill: ONLY for actual delivery orders ────
                 extraction = item.get("extraction")
-                if extraction and (extraction.get("pickup") or extraction.get("return")):
-                    # Only fill if this is a real DO extraction (not acknowledgement)
-                    if extraction.get("doc_subtype") != "acknowledgement":
-                        try:
-                            self._fill_destination(jordex_page, extraction)
-                        except Exception as e:
-                            log.error(f"[{SERVICE_KEY}] Destination fill failed: {e}")
- 
-                # ── Upload DO files as "Container release" / "DO" ────────
-                do_files = item.get("do_files", [])
-                if do_files:
-                    # Build a file_map so only DO files get uploaded with correct type
-                    # upload_attachments will pick up PDFs from folder_path
+                matched_containers: set = set()
+                if has_do_extraction:
+                    try:
+                        matched_containers = self._fill_destination(jordex_page, extraction)
+                    except Exception as e:
+                        log.error(f"[{SERVICE_KEY}] Destination fill failed: {e}")
+                        matched_containers = set()
+                row_matched = (not has_do_extraction) or bool(matched_containers)
+
+                if not row_matched:
+                    log.info(
+                        f"[{SERVICE_KEY}] Row {row_index} has no container from this DO "
+                        f"— skipping upload for '{folder_name}'"
+                    )
+                    go_back(jordex_page)
+                    row_index += 1
+                    if rows_found <= row_index:
+                        break
+                    continue
+
+                # ── Upload only the DO files that belong on THIS row ──────
+                # A file's ownership is known from do_file_containers. If
+                # ownership is unknown for a file (older/merged extraction
+                # with no per-container data), fall back to placing it on
+                # every matched row.
+                do_files_for_row = [
+                    f for f in all_do_files
+                    if not do_file_containers.get(os.path.basename(f))
+                    or (do_file_containers.get(os.path.basename(f)) & matched_containers)
+                ]
+                if do_files_for_row:
                     upload_attachments(
                         jordex_page, item["folder_path"],
                         doc_type, display_name,
-                        file_map=self._build_do_file_map(do_files, doc_type, display_name),
+                        file_map=self._build_do_file_map(do_files_for_row, doc_type, display_name),
                     )
- 
-                # ── Upload Acknowledgement files as "Additional Files" ───
+                    uploaded_files_this_item.update(do_files_for_row)
+
+                # ── Upload Acknowledgement files once, on the first row ───
+                # that receives anything (they aren't tied to a container).
                 ack_files = item.get("ack_files", [])
-                if ack_files:
+                if ack_files and not ack_uploaded and (do_files_for_row or not all_do_files):
                     upload_attachments(
                         jordex_page, item["folder_path"],
                         "Additional Files", None,  # keep original filename
                         file_map=self._build_ack_file_map(ack_files),
                     )
- 
+                    ack_uploaded = True
+
                 go_back(jordex_page)
-                uploaded = True
-                self._uploaded += 1
+                if do_files_for_row or ack_uploaded:
+                    uploaded = True
+                    self._uploaded += 1
                 row_index += 1
                 if rows_found <= row_index:
                     break
- 
+
             if uploaded:
                 tracker.add_uploaded_folder(CAT, item.get("conv_id"), folder_name)
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 uploaded_folders.add(folder_name)
+            elif checked_any_row:
+                log.warning(
+                    f"[{SERVICE_KEY}] No Jordex row matched any container for '{folder_name}' "
+                    f"— flagging email for manual review"
+                )
+                no_row_match_conv_ids.add(item.get("conv_id"))
 
         # ── Flag emails with missing return address/ref for manual review ──
         # Runs after the main loop so it isn't clobbered by an "uploaded"
@@ -627,6 +709,19 @@ class DeliveryOrderService:
                 tracker.update_status(CAT, cid, "partial_upload")
             else:
                 tracker.update_status(CAT, cid, "no_return_info")
+
+        # ── Flag emails where one or more DO files never matched a Jordex
+        # row's containers — distinct cause from missing_return above, kept
+        # as its own status so tracker.json stays diagnostic. Runs last so
+        # it wins if a conv_id triggered both flags in the same batch.
+        for cid in no_row_match_conv_ids:
+            mark_as_unread(outlook_page, cid)
+            folders = tracker.data.get(CAT, {}).get(cid, {}).get("uploaded_folders", [])
+            uploaded_files_map = tracker.data.get(CAT, {}).get(cid, {}).get("uploaded_files", {})
+            if folders or any(uploaded_files_map.values()):
+                tracker.update_status(CAT, cid, "partial_row_match")
+            else:
+                tracker.update_status(CAT, cid, "no_matching_row")
 
     # ══════════════════════════════════════════════════════════════════
     #  DESTINATION FILL — View Routing → 3. Destination
@@ -671,7 +766,7 @@ class DeliveryOrderService:
  
         if not pickup_address and not default_return_addr and not return_lookup:
             log.info(f"[{SERVICE_KEY}] No destination data to fill — skipping")
-            return
+            return set()
  
         # ── Build set of containers we have data for ─────────────────
         known_containers = set()
@@ -695,7 +790,7 @@ class DeliveryOrderService:
  
         # ── Open View Routing ────────────────────────────────────────
         if not self._open_view_routing(page):
-            return
+            return set()
  
         # ── Wait for sidebar ────────────────────────────────────────
         try:
@@ -712,7 +807,7 @@ class DeliveryOrderService:
         log.info(f"[{SERVICE_KEY}] Sidebar has {sidebar_count} container block(s)")
  
         # ── Process only containers we have data for ─────────────────
-        filled_any = False
+        matched_containers = set()
         for idx in range(sidebar_count):
             if self._stop_evt.is_set():
                 break
@@ -796,11 +891,13 @@ class DeliveryOrderService:
  
             # ── Save after each container ────────────────────────────
             self._save_routing(page)
-            filled_any = True
- 
+            if sidebar_cno:
+                matched_containers.add(sidebar_cno)
+
         # ── Go back to shipment detail ──────────────────────────────
         self._go_back_from_routing(page)
-        log.info(f"[{SERVICE_KEY}] Destination fill complete (filled={filled_any})")
+        log.info(f"[{SERVICE_KEY}] Destination fill complete (filled={bool(matched_containers)})")
+        return matched_containers
 
 
     def _click_sidebar_container(self, page: Page, idx: int, container_no: str):

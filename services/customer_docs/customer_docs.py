@@ -5,7 +5,7 @@ Handles "04.Customer Docs" Outlook label.
 Owns its own Playwright instances with isolated profiles.
 Classifies every PDF individually using Gemini.
 """
-import os, json, logging, threading, time
+import os, json, glob, logging, threading, time
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
@@ -217,6 +217,42 @@ class CustomerDocsService:
             except Exception as e:
                 log.warning(f"  Classification save failed {source}: {e}")
 
+    def _count_bl_types(self, folder_path: str) -> tuple[int, int]:
+        """Count HBL/MBL docs for this shipment by reading the saved
+        <stem>_classification.json files (one per uploaded PDF)."""
+        hbl_count = mbl_count = 0
+        for json_path in glob.glob(os.path.join(folder_path, "*_classification.json")):
+            try:
+                with open(json_path) as f:
+                    doc_type = (json.load(f).get("doc_type") or "").strip().upper()
+            except Exception:
+                continue
+            if doc_type == "HOUSE BILL OF LADING":
+                hbl_count += 1
+            elif doc_type == "MASTER BILL OF LADING":
+                mbl_count += 1
+        return hbl_count, mbl_count
+
+    def _check_carrier_bl_fields(self, jordex_page) -> bool:
+        """
+        On the currently-open shipment detail page, click the Carrier tab
+        and check whether Master BL / House BL number fields are populated.
+        Returns True if either field is empty (needs manual review).
+        """
+        try:
+            jordex_page.get_by_role("tab", name="Carrier").click()
+            jordex_page.wait_for_timeout(1500)
+            master_val = jordex_page.locator("#masterBLNumber").input_value().strip()
+            house_val  = jordex_page.locator("#houseBLNumber").input_value().strip()
+            log.info(
+                f"[{SERVICE_KEY}]   Carrier tab: masterBLNumber='{master_val}' "
+                f"houseBLNumber='{house_val}'"
+            )
+            return not master_val or not house_val
+        except Exception as e:
+            log.warning(f"[{SERVICE_KEY}]   Could not read Carrier tab BL fields: {e}")
+            return False
+
     def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
@@ -262,6 +298,14 @@ class CustomerDocsService:
 
             row_index = 0
             uploaded  = False
+            carrier_fields_empty = False
+
+            # If this shipment has at least one HBL AND at least one MBL among
+            # its docs, verify after upload that Jordex's Carrier tab actually
+            # shows both B/L numbers — catches cases where the docs attached
+            # fine but the shipment record itself wasn't populated correctly.
+            hbl_count, mbl_count = self._count_bl_types(item["folder_path"])
+            check_carrier_tab = hbl_count >= 1 and mbl_count >= 1
 
             # Only iterate multiple rows if the search reference is a reliable
             # OI number or SCAC-prefixed BL (e.g. "OI2617257", "HLCU...").
@@ -289,6 +333,14 @@ class CustomerDocsService:
                         jordex_page, item["folder_path"], doc_type, display_name,
                         file_map=cust_file_map,
                     )
+                    if row_ok and check_carrier_tab:
+                        if self._check_carrier_bl_fields(jordex_page):
+                            carrier_fields_empty = True
+                            log.warning(
+                                f"[{SERVICE_KEY}] Carrier tab BL field(s) empty for "
+                                f"'{folder_name}' (row {row_index}) despite "
+                                f"{hbl_count} HBL + {mbl_count} MBL doc(s) uploaded"
+                            )
                     go_back(jordex_page)
                     if row_ok:
                         uploaded = True
@@ -303,7 +355,20 @@ class CustomerDocsService:
             except Exception as e:
                 log.error(f"[{SERVICE_KEY}] Error during upload loop for {query}: {e}", exc_info=True)
             finally:
-                if uploaded:
+                if uploaded and carrier_fields_empty:
+                    # Docs are attached (don't re-upload next run), but the
+                    # shipment's Carrier tab wasn't populated — needs a human.
+                    tracker.update_status(CAT, item["conv_id"], "carrier_fields_empty")
+                    uploaded_folders.add(folder_name)
+                    try:
+                        mark_as_unread(outlook_page, item["conv_id"])
+                        log.info(
+                            f"[{SERVICE_KEY}] Marked '{query}' unread — Carrier tab "
+                            f"BL field(s) empty, needs manual review"
+                        )
+                    except Exception as e:
+                        log.warning(f"[{SERVICE_KEY}] Could not mark unread for {query}: {e}")
+                elif uploaded:
                     tracker.update_status(CAT, item["conv_id"], "uploaded")
                     uploaded_folders.add(folder_name)
                 else:

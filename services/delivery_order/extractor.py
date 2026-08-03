@@ -230,10 +230,21 @@ PICKUP:
   → If PIN is present → use it.
   → If PIN is blank or says "Portbase" → use "PCS".
 
-RETURN:
+RETURN — EACH CONTAINER ROW CAN HAVE A DIFFERENT EMPTY RETURN LOCATION:
 - address = "EMPTY RETURN LOCATION" column in the container table.
-  Example: "Euromax Terminal Maasvlaktesweg 951"
-- reference per container = "TURN IN REFERENCE" column.
+  This column is PER-ROW, not shared — different container rows in the
+  SAME table can show DIFFERENT depot addresses. For example:
+    Row 1 (container TCNU3140038): "Euromax Terminal Maasvlaktesweg 951"
+    Row 2 (container CSGU6227420): "United Waalhaven Terminals BV (Gate 2)"
+    Row 3 (container CSNU8829240): "United Waalhaven Terminals BV (Gate 2)"
+  Do NOT copy row 1's address onto every container. Read EACH container's
+  own row and use THAT row's EMPTY RETURN LOCATION value for that specific
+  container — in the references array, every entry's "address" must come
+  from its own row, never copied from a different container's row.
+  The top-level return.address should be the FIRST row's depot (or leave
+  empty if the rows differ).
+- reference per container = "TURN IN REFERENCE" column, read from that
+  SAME container's own row.
   If it lists multiple modes (e.g. "BY TRUCK=TRUCKCOSMT; BARGE=BARGECOSMT; RAIL=..."):
   → Extract ONLY the TRUCK value (e.g. "TRUCKCOSMT").
   → Ignore barge/rail values.
@@ -280,40 +291,103 @@ PICKUP:
   → If blank or no PIN field → use "PCS".
  
 RETURN:
-- address = "EMPTY RETURN LOCATION" section (middle, below container table).
+- address = ALWAYS the "EMPTY RETURN LOCATION" section value (middle, below
+  container table) — for EVERY container, no exceptions. REMARKS never
+  changes the address.
   Example: "Rotterdam Container Terminal, Missouriweg 17"
-- reference per container: Read the "REMARKS" section carefully.
- 
-  REMARKS FORMAT — each line maps a container SIZE/TYPE to a return rule:
-    "20GP = UWT DEPOT 2-REFERENCE:?CONTAINER NUMBER"
+
+  JSON STRUCTURE — THIS APPLIES TO BOTH PLACES ADDRESS APPEARS:
+    return.address                        → "Rotterdam Container Terminal, Missouriweg 17"
+    return.references[0].address          → "Rotterdam Container Terminal, Missouriweg 17"
+    return.references[1].address          → "Rotterdam Container Terminal, Missouriweg 17"
+    ...every entry, same value, no exceptions.
+  Do NOT write a REMARKS depot name (e.g. "RCT Kramer Delta", "Euromax",
+  "UWT Depot 2") into ANY address field — not the top-level one, not any
+  references[].address. Those depot names are used ONLY to decide the
+  reference value below. If you find yourself about to write a different
+  depot name into an address field, stop — that is always wrong for OOLU.
+
+- reference per container: Read the "REMARKS" section carefully. REMARKS
+  ONLY determines the reference value — it never changes any address field.
+
+  REMARKS FORMAT — each line maps a container SIZE/TYPE to a reference rule.
+  Spacing/punctuation around "=", "-", ":" varies between documents — treat
+  these as equivalent, all meaning the same thing:
+    "20GP + 20RF = UWT DEPOT 2 - REFERENCE :?CONTAINER NUMBER"
     "40GP = EUROMAX"
-    "40HQ = RCT Kramer Delta-CONTAINER NUMBER"
-    "45HQ = UWT MAASVLAKTE-REFERENCE: CONTAINER NUMBER"
- 
-  HOW TO READ EACH LINE:
+    "40HQ = RCT Kramer Delta - CONTAINER NUMBER"
+    "40HQ=RCT Kramer Delta-CONTAINER NUMBER"
+    "45HQ = UWT MAASVLAKTE ? REFERENCE: CONTAINER NUMBER"
+
+  HOW TO READ EACH LINE (for REFERENCE ONLY):
   1. Match the container's SIZE/TYPE (from the table: 20GP, 40GP, 40HQ, etc.)
-  2. The text after "=" has TWO possible formats:
-     a) "DEPOT NAME-REFERENCE: CONTAINER NUMBER" or "DEPOT NAME-CONTAINER NUMBER"
-        → reference = the container's ACTUAL container number (e.g. "TGBU4744557")
-        → also update this container's return address to the depot named here
-     b) "DEPOT NAME" only (no dash, no "CONTAINER NUMBER", no "REFERENCE:")
-        → reference = "" (empty — just a depot name, no reference instruction)
-        → update this container's return address to this depot name
-  3. If no line matches this container's SIZE/TYPE → reference = ""
- 
+     to a REMARKS line.
+  2. CHECK THE DEPOT NAME MATCHES "EMPTY RETURN LOCATION" before doing
+     anything else. Compare the depot named in the matched REMARKS line to
+     the "EMPTY RETURN LOCATION" text as PLAIN TEXT — do NOT guess at
+     real-world abbreviations, aliases, or "these are actually the same
+     port" reasoning. Different depot/terminal names (even ones that sound
+     similar, e.g. "RCT Kramer Delta" vs "Rotterdam Container Terminal")
+     are DIFFERENT facilities unless the name in EMPTY RETURN LOCATION
+     substantially appears in the REMARKS depot name (or vice versa).
+     a) If the names substantially match → continue to step 3 to decide
+        the reference value.
+     b) If the REMARKS depot name is a DIFFERENT, unrelated name than
+        "EMPTY RETURN LOCATION" (e.g. remarks says "EUROMAX" or "RCT
+        Kramer Delta" but EMPTY RETURN LOCATION says "Rotterdam Container
+        Terminal") → reference = "" (empty). Do NOT apply the REMARKS
+        reference rule when the depot doesn't match — the remarks table
+        can be generic/boilerplate that doesn't apply to this specific
+        shipment's actual return location.
+  3. Only once step 2 confirms a match, check if the matched line contains
+     the phrase "CONTAINER NUMBER" anywhere after the "=" — ignore spacing,
+     hyphens, "?", or "REFERENCE:" around it, they're just formatting
+     noise. Do a loose text search for "CONTAINER NUMBER" in that line,
+     not an exact-punctuation match.
+     a) If "CONTAINER NUMBER" appears anywhere in the matched line
+        → reference = the container's ACTUAL container number
+          (e.g. container FCIU9722468 → reference = "FCIU9722468")
+     b) If the matched line has a depot name only, with no "CONTAINER
+        NUMBER" wording at all
+        → reference = "" (empty)
+  4. If no REMARKS line matches this container's SIZE/TYPE at all
+     → reference = ""
+
   CRITICAL: "CONTAINER NUMBER" is a LITERAL instruction meaning
   "use the actual container number as the reference value".
-  It is NOT a placeholder for you to ignore.
- 
-  Example with container TGBU4744557 (40HQ):
-    "40HQ = RCT Kramer Delta-CONTAINER NUMBER"
-    → return address for this container = "RCT Kramer Delta"
-    → return reference = "TGBU4744557"
- 
-  Example with container XXXX1234567 (40GP):
-    "40GP = EUROMAX"
-    → return address for this container = "EUROMAX"
-    → return reference = "" (no reference instruction given)
+  It is NOT a placeholder for you to ignore, and it is NEVER copied
+  literally as the string "CONTAINER NUMBER" — always substitute the real
+  container number.
+
+  Example — MATCH — container TGBU4744557 (40HQ), EMPTY RETURN LOCATION =
+  "Rotterdam Container Terminal, Missouriweg 17", remarks line
+  "40HQ = Rotterdam Container Terminal - CONTAINER NUMBER" (same name
+  appears in both):
+    → return.address = "Rotterdam Container Terminal, Missouriweg 17"
+    → return.references[].address (this container's entry) =
+        "Rotterdam Container Terminal, Missouriweg 17"  (same, unchanged)
+    → return.references[].reference (this container's entry) = "TGBU4744557"
+
+  Example — NO MATCH — container CSGU7150657 (40HQ), EMPTY RETURN LOCATION
+  = "Rotterdam Container Terminal, Missouriweg 17", remarks line
+  "40HQ = RCT Kramer Delta - CONTAINER NUMBER" ("RCT Kramer Delta" is a
+  different, unrelated depot name — do NOT assume it means the same
+  terminal):
+    → return.address = "Rotterdam Container Terminal, Missouriweg 17"
+    → return.references[].address (this container's entry) =
+        "Rotterdam Container Terminal, Missouriweg 17"  (same, unchanged —
+        NOT "RCT Kramer Delta")
+    → return.references[].reference (this container's entry) = ""
+        (depot name doesn't match EMPTY RETURN LOCATION — rule not applied)
+
+  Example — NO MATCH — container XXXX1234567 (40GP), remarks line
+  "40GP = EUROMAX":
+    → return.address = "Rotterdam Container Terminal, Missouriweg 17"
+    → return.references[].address (this container's entry) =
+        "Rotterdam Container Terminal, Missouriweg 17"  (same, unchanged —
+        NOT "EUROMAX")
+    → return.references[].reference (this container's entry) = ""
+        (depot name doesn't match EMPTY RETURN LOCATION — rule not applied)
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -380,6 +454,26 @@ RETURN — THIS TABLE CAN HAVE MULTIPLE ROWS WITH DIFFERENT ADDRESSES:
   → If a Turn-In-Ref value exists → use it exactly.
   → If blank for a specific container → "".
   → If ALL containers have blank Turn-In-Ref → set flag = "forward_to_client".
+
+  CRITICAL — GENERAL RULE for reading a Turn-In-Ref cell: take ONLY the
+  first/primary line of text in that cell as the reference value. If the
+  PDF layout renders a second line directly underneath within the same
+  cell, that second line is stray/unrelated text bleeding into the cell —
+  do NOT append it, do NOT concatenate it, and do NOT guess what it means.
+  Just ignore it and use the first line only.
+  This applies to WHATEVER value appears there — the exact code varies
+  per document, it will not always be the same text. For example, if the
+  cell renders as:
+      CMAREEFER20
+      26
+  → the reference is "CMAREEFER20" only. "26" is discarded, NOT appended
+  (the reference is NOT "CMAREEFER2026").
+  If a different document's cell renders as:
+      FE12618W
+      04
+  → the reference is "FE12618W" only, and "04" is discarded the same way.
+  The rule is always: first line = the value, any further line in the
+  same cell = noise to ignore — regardless of what the actual codes say.
 """
 
 # ─────────────────────────────────────────────────────────────────────

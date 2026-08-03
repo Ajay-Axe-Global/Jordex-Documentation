@@ -576,7 +576,16 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
             log.warning(f"  Could not open Type dropdown for '{filename}'.")
 
         # ── Set display name ─────────────────────────────────────────
-        if actual_name and actual_type != "Customs Clearance":
+        # Always (re)assert a non-empty name after the Type dropdown
+        # selection above — selecting Type can reset Jordex's own default
+        # name field, and leaving it blank causes Save to silently fail
+        # (no doc ends up attached) even though we never explicitly cleared
+        # it ourselves. Fall back to the file's own original name (not a
+        # generic label) when no per-file override was given, so callers
+        # that intentionally pass an empty display_name to keep the
+        # original filename still get a valid, non-empty name.
+        name_to_set = actual_name or os.path.splitext(filename)[0]
+        if actual_type != "Customs Clearance":
             page.evaluate("""([name]) => {
                 const dialog = [...document.querySelectorAll('.el-dialog')]
                     .find(d => d.offsetParent !== null);
@@ -596,7 +605,7 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
                     nameInp.dispatchEvent(new Event('input', {bubbles: true}));
                     nameInp.dispatchEvent(new Event('change', {bubbles: true}));
                 }
-            }""", [actual_name])
+            }""", [name_to_set])
             page.wait_for_timeout(800)
 
         # ── Set comment field (if provided) ──────────────────────────

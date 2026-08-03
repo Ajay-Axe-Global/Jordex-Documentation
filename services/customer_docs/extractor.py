@@ -88,8 +88,18 @@ If the header/title says:
   "Booking Confirmation", "Boekingsbevestiging", "Boekingconfirmatie",
   "Booking Advice", "Shipment Booking Confirmation", "SHIPPING ADVISE"
   → classify as: "BOOKING CONFIRMATION"
-  Reference number: look for "Uw referentie" / "Your reference" / OI number
-  (pattern OI followed by digits, e.g. OI2615762). Use that as reference_number.
+  Reference number priority (use the FIRST one that is actually present):
+    1. "BL/SWB No(s).:" — the carrier's Bill of Lading / Sea Waybill
+       number. This is the real trackable shipment number and takes
+       priority over any internal reference.
+    2. "Uw referentie" / "Your reference" / OI number (pattern OI followed
+       by digits, e.g. OI2615762) — only if the value looks like a real
+       reference code, NOT a free-text customer/shipment name (e.g.
+       "THAI WORLD" is a name, not a reference — skip it).
+    3. "Our Reference" / the carrier's own booking number — last resort.
+  container_no: only set this if an actual container number (4 letters +
+    7 digits, e.g. HLXU1234567) is visibly printed on the page. Do NOT
+    infer, guess, or reuse a BL/booking number as a container number.
 
 ── DEBIT NOTE ──
 If the header says "DEBIT NOTE", "D/N", or "DEBIT ADVICE":
@@ -147,11 +157,23 @@ If the header says "INSURANCE CERTIFICATE", "CARGO INSURANCE":
   → classify as: "ADDITIONAL FILES"
   doc_title: use the exact header text.
  
-── WEIGHT CERTIFICATE / INSPECTION ──
+── WEIGHT CERTIFICATE / INSPECTION / SAFETY CERTIFICATE ──
 If the header says "WEIGHT CERTIFICATE", "INSPECTION CERTIFICATE",
-  "SURVEY REPORT", "FUMIGATION CERTIFICATE", "PHYTOSANITARY CERTIFICATE":
+  "SURVEY REPORT", "FUMIGATION CERTIFICATE", "PHYTOSANITARY CERTIFICATE",
+  "SAFETY CERTIFICATE", "GAS CERTIFICATE", "MEASUREMENT CERTIFICATE", or a
+  generic "CERTIFICATE" issued by a surveyor/inspection/customs-support
+  company about a specific container:
   → classify as: "ADDITIONAL FILES"
   doc_title: use the exact header text.
+  reference_number: look for a "Customer reference number" field FIRST —
+    this is usually the actual carrier BL/booking number (e.g.
+    "MAEU270448365", recognizable by its 4-letter carrier SCAC prefix).
+    Do NOT use the surveyor/inspector's own internal "Order number" /
+    "Job number" / "Case number" — that ID only exists in their system,
+    it is not searchable in Jordex.
+  container_no: look for an "Object number" / "Container No." field — the
+    container being measured/inspected is the container_no
+    (e.g. "TGHU966483-6" → container_no "TGHU9664836").
 
 ── CMR / TRANSPORT DOCUMENT ──
 If the header/title says ANY of:
@@ -217,6 +239,25 @@ CRITICAL CONSIGNEE RULES:
 =====================================================================
 STEP 3 — EXTRACT REFERENCE NUMBER AND DOC TITLE
 =====================================================================
+
+CRITICAL — DO NOT GUESS:
+Only fill reference_number / container_no with a value that is literally
+printed in the document. If no such value is visible or legible, return
+null for that field. NEVER invent, estimate, or reuse an example value
+from these instructions (e.g. do not return "HLXU1234567" or
+"MRSU6620410" — those are illustrative examples only, never real answers).
+
+PRIORITY 0 — Prefer carrier-identifiable references over internal IDs:
+  A document page can show several reference-like fields (e.g. "Order
+  number", "Case number", "Job number", "Customer reference number",
+  "Reference", "Booking number"). When more than one is present, PREFER
+  the value that starts with a known 4-letter ocean-carrier SCAC code
+  (MAEU, HLCU, MSCU, MEDU, ONEY, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU,
+  HDMU, PCIU, WHLC, SUDU) or matches an OI pattern — these are the values
+  Jordex can actually be searched by. A plain internal order/job/case
+  number issued by a customs broker, surveyor, or agent (not the carrier)
+  is NOT a valid reference_number, even if it is the most prominent
+  number on the page.
 
 PRIORITY 1 — Bill of Lading number:
   Look for: "Bill of Lading:", "B/L No.", "BL No.", "Sea Waybill No."
@@ -351,10 +392,11 @@ def _keyword_fallback(pdf_path: str) -> dict:
         if ref_match:
             reference_number = ref_match.group(1).strip().upper()
 
-        # Container number
-        cont_match = re.search(r'\b([A-Z]{4})(\d{7})\b', text_upper)
+        # Container number (allows a space/hyphen before the ISO check digit,
+        # e.g. "TGHU966483-6")
+        cont_match = re.search(r'\b([A-Z]{4})\s?(\d{6})[\s-]?(\d)\b', text_upper)
         if cont_match:
-            container_no = cont_match.group(1) + cont_match.group(2)
+            container_no = cont_match.group(1) + cont_match.group(2) + cont_match.group(3)
 
     return {
         "doc_type": doc_type,
@@ -537,9 +579,9 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
             if not container_no:
                 _txt = _extract_text(pdf_path)
                 if _txt:
-                    cont_match = re.search(r'\b([A-Z]{4})(\d{7})\b', _txt.upper())
+                    cont_match = re.search(r'\b([A-Z]{4})\s?(\d{6})[\s-]?(\d)\b', _txt.upper())
                     if cont_match:
-                        container_no = cont_match.group(1) + cont_match.group(2)
+                        container_no = cont_match.group(1) + cont_match.group(2) + cont_match.group(3)
                         log.info("  Regex fallback extracted container_no: %s", container_no)
 
             doc_title = (parsed.get("doc_title") or "").strip() or None

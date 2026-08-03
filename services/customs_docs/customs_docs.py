@@ -350,6 +350,19 @@ class CustomsDocsService:
                         status = "uploaded_needs_forward"
                         item["forward_reason"] = ", ".join(forward_flags)
                         log.info(f"[{SERVICE_KEY}] OI={query} needs forward: {forward_flags}")
+
+                        # ── Mark email UNREAD so manual user can review & forward ──
+                        try:
+                            mark_as_unread(outlook_page, item["conv_id"])
+                            log.info(
+                                f"[{SERVICE_KEY}] Marked UNREAD for manual forward: "
+                                f"OI={query}, reason={forward_flags}"
+                            )
+                        except Exception as e:
+                            log.warning(
+                                f"[{SERVICE_KEY}] Failed to mark unread for {query}: {e}"
+                            )
+
                     tracker.update_status(CAT, item["conv_id"], status)
                     uploaded_folders.add(folder_name)
                 else:

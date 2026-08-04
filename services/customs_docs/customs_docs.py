@@ -84,7 +84,7 @@ class CustomsDocsService:
                 self.last_run = datetime.now().isoformat()
                 items = self._process_batch(outlook_page, tracker)
                 if items:
-                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
+                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -255,13 +255,16 @@ class CustomsDocsService:
 
         return updated, tax_info
 
-    def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items):
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items, jordex_session=None):
         """
         1. Upload files
         2. Scan Documents tab: both TTW + TAX present?
            - Yes → set task Completed
            - No  → leave task open
         3. If task already Completed → skip
+
+        Returns the current jordex_page, which may be a fresh Page if
+        search_and_open had to hard-restart the browser mid-batch.
         """
         doc_type, _ = JORDEX_MAPPING[CAT]
 
@@ -293,7 +296,7 @@ class CustomsDocsService:
                 continue
 
             query = normalize_oi_reference(query)
-            success, used_ref, rows_found = search_jordex_with_fallback(
+            success, used_ref, rows_found, jordex_page = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
                 primary_ref=query,
@@ -303,6 +306,7 @@ class CustomsDocsService:
                 cat=CAT,
                 service_key=SERVICE_KEY,
                 search_fn=search_and_open,
+                jordex_session=jordex_session,
             )
             if not success:
                 continue
@@ -311,7 +315,9 @@ class CustomsDocsService:
             uploaded = False
             try:
                 while row_index < 10:
-                    success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                    success, rows_found, jordex_page = search_and_open(
+                        jordex_page, used_ref, row_index=row_index, session=jordex_session
+                    )
                     if not success:
                         break
 
@@ -367,6 +373,8 @@ class CustomsDocsService:
                     uploaded_folders.add(folder_name)
                 else:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
+
+        return jordex_page
 
     def _check_both_customs_docs_exist(self, page) -> bool:
         """

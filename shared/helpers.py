@@ -688,18 +688,12 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
     """
     Mark an email as unread in Outlook without opening it.
 
-    IMPORTANT: Never use click_row() here — that opens the email in the reading
-    pane which marks it as Read again, undoing the action.
-
-    Strategy:
-      1. Right-click the row → context menu → "Mark as unread"
-      2. Hover the row → click the envelope icon button that appears
-      3. Last resort: select row then press 'u'
+    Strategy order:
+      1. Right-click row → Escape → Ctrl+U  (most reliable)
+      2. Right-click → context menu → "Mark as unread"
     """
     try:
         outlook_page.bring_to_front()
-
-        # Locate the row without clicking it (clicking = opens = marks as Read)
         sel = f"#MailList div[role='option'][data-convid='{conv_id}']"
 
         # Scroll row into view if needed
@@ -707,7 +701,6 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
             row = outlook_page.locator(sel).first
             row.wait_for(state="visible", timeout=3000)
         except Exception:
-            # Scroll to top and try scrolling down to find it
             try:
                 outlook_page.locator(
                     "#MailList div[data-virtuoso-scroller='true']"
@@ -724,16 +717,37 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
                     pass
                 _scroll(outlook_page)
             else:
-                log.warning("  mark_as_unread: row not found in list for %s", conv_id)
+                log.warning("  mark_as_unread: row not found for %s", conv_id)
                 return False
 
-        # ── Strategy 1: Right-click → context menu ───────────────────
+        # ── Strategy 1: Right-click to focus row → Ctrl+U ───────────
+        try:
+            row = outlook_page.locator(sel).first
+            row.click(button="right", timeout=3000)
+            outlook_page.wait_for_timeout(400)
+            outlook_page.keyboard.press("Escape")
+            outlook_page.wait_for_timeout(300)
+            outlook_page.keyboard.press("Control+u")
+            outlook_page.wait_for_timeout(1000)
+            # Trust Ctrl+U if no exception. Do NOT verify via DOM —
+            # when the row is selected/highlighted Outlook temporarily
+            # hides the unread indicator, causing false negatives.
+            # Fallback strategies then UNDO the Ctrl+U by toggling back.
+            log.info("  Marked as UNREAD via Ctrl+U: %s", conv_id)
+            return True
+        except Exception as e:
+            log.warning("  Ctrl+U strategy failed: %s", e)
+            try:
+                outlook_page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+        # ── Strategy 2: Right-click → context menu ───────────────────
         try:
             row = outlook_page.locator(sel).first
             row.click(button="right", timeout=3000)
             outlook_page.wait_for_timeout(500)
 
-            # Context menu item — English: "Mark as unread", Dutch: "Markeren als ongelezen"
             menu_item = outlook_page.locator(
                 "li[role='menuitem']:has-text('unread'), "
                 "li[role='menuitem']:has-text('ongelezen'), "
@@ -746,7 +760,6 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
                 log.info("  Marked as UNREAD via right-click menu: %s", conv_id)
                 return True
             else:
-                # Dismiss the context menu and try next strategy
                 outlook_page.keyboard.press("Escape")
                 outlook_page.wait_for_timeout(300)
         except Exception:
@@ -754,40 +767,6 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
                 outlook_page.keyboard.press("Escape")
             except Exception:
                 pass
-
-        # ── Strategy 2: Hover → envelope icon button ─────────────────
-        try:
-            row = outlook_page.locator(sel).first
-            row.hover(timeout=2000)
-            outlook_page.wait_for_timeout(400)
-
-            # Button appears on hover — English: "Mark as unread", Dutch: "Markeren als ongelezen"
-            btn = row.locator(
-                "button[title*='unread'], button[title*='ongelezen']"
-            ).first
-            if btn.is_visible(timeout=1000):
-                btn.click()
-                outlook_page.wait_for_timeout(500)
-                log.info("  Marked as UNREAD via hover button: %s", conv_id)
-                return True
-        except Exception:
-            pass
-
-        # ── Strategy 3: Focus the list without opening email, press 'u' ──
-        # Click the row's CHECKBOX (if visible) — that selects without opening
-        try:
-            checkbox = outlook_page.locator(sel).locator(
-                "input[type='checkbox'], div[role='checkbox']"
-            ).first
-            if checkbox.is_visible(timeout=1000):
-                checkbox.click()
-                outlook_page.wait_for_timeout(300)
-                outlook_page.keyboard.press("u")
-                outlook_page.wait_for_timeout(500)
-                log.info("  Marked as UNREAD via checkbox+u: %s", conv_id)
-                return True
-        except Exception:
-            pass
 
         log.warning("  mark_as_unread: all strategies failed for %s", conv_id)
         return False
@@ -836,54 +815,62 @@ def search_jordex_with_fallback(
     cat: str = "",
     service_key: str = "",
     search_fn=None,
+    jordex_session=None,
 ) -> tuple:
     """
     Validate which ref exists in Jordex WITHOUT keeping the row open.
- 
+
     CHANGE: After finding a match, calls go_back() immediately so the
     while loop in _upload_to_jordex can do the actual opens cleanly.
     This eliminates the double-search problem (25s wasted per item).
+
+    jordex_session (optional): passed through to search_fn so it can
+    hard-restart the browser (close/reopen/relogin) if the page is found
+    to be genuinely frozen rather than just showing an update popup.
+
+    Returns (success, ref, rows_found, jordex_page) — always returns the
+    current live page, since a hard restart inside search_fn replaces it.
     """
     from jordex.browser import go_back
-    
+
     tried_refs = []
- 
+
     if primary_ref:
         if not is_valid_jordex_search_ref(primary_ref):
             log.warning("[%s] PRIMARY ref '%s' has invalid format — skipping search", service_key, primary_ref)
         else:
             tried_refs.append(primary_ref)
             log.info("[%s] Jordex search PRIMARY: '%s'", service_key, primary_ref)
-            success, rows_found = search_fn(jordex_page, primary_ref, row_index=0)
+            success, rows_found, jordex_page = search_fn(jordex_page, primary_ref, row_index=0, session=jordex_session)
             if success and rows_found > 0:
                 go_back(jordex_page)           # ★ go back so while loop can re-open
-                return True, primary_ref, rows_found
+                return True, primary_ref, rows_found, jordex_page
             log.warning("[%s] PRIMARY not found: '%s'", service_key, primary_ref)
- 
+
     if secondary_ref and secondary_ref != primary_ref:
         if not is_valid_jordex_search_ref(secondary_ref):
             log.warning("[%s] SECONDARY ref '%s' has invalid format — skipping search", service_key, secondary_ref)
         else:
             tried_refs.append(secondary_ref)
             log.info("[%s] Jordex search SECONDARY: '%s'", service_key, secondary_ref)
-            success, rows_found = search_fn(jordex_page, secondary_ref, row_index=0)
+            success, rows_found, jordex_page = search_fn(jordex_page, secondary_ref, row_index=0, session=jordex_session)
             if success and rows_found > 0:
                 log.info("[%s] SECONDARY found: '%s'", service_key, secondary_ref)
                 go_back(jordex_page)           # ★ go back so while loop can re-open
-                return True, secondary_ref, rows_found
+                return True, secondary_ref, rows_found, jordex_page
             log.warning("[%s] SECONDARY not found: '%s'", service_key, secondary_ref)
- 
+
     if tried_refs:
         tried = " / ".join(tried_refs)
         log.warning("[%s] NOT FOUND in Jordex (%s) → marking email unread", service_key, tried)
     else:
         log.warning("[%s] NO VALID REFS found to search in Jordex → marking email unread", service_key)
-        
+
     if conv_id and outlook_page:
         mark_as_unread(outlook_page, conv_id)
     if tracker and conv_id and cat:
         tracker.update_status(cat, conv_id, "jordex_not_found")
-    return False, None, 0
+    return False, None, 0, jordex_page
  
  
 
@@ -973,15 +960,12 @@ def ensure_scac_prefix(reference: str, carrier_code: str) -> str:
  
     # Check 1: starts with a known 4-letter SCAC
     if ref_upper[:4] in KNOWN_SCAC_PREFIXES:
-        # ★ Check 1.5: DOUBLE SCAC — Gemini prepended SCAC to a BL that
-        #   already has a carrier prefix (e.g. HDMU + HDMNLE49370200)
-        #   If removing the first 4 chars still looks like a valid BL
-        #   with a carrier prefix, strip the redundant SCAC.
+        
         remainder = ref_upper[4:]
         if ref_upper[:4] == code_upper:
-            # Same SCAC twice? Check if remainder also starts with a known prefix
-            for bl_prefix in CARRIER_BL_PREFIXES:
-                if remainder.startswith(bl_prefix):
+            
+            for bl_prefix, bl_scac in CARRIER_BL_PREFIXES.items():
+                if remainder.startswith(bl_prefix) and bl_scac == code_upper:
                     log.info("  Stripping double SCAC: '%s' → '%s' "
                              "(SCAC %s was prepended to BL with prefix %s)",
                              reference, reference[4:], code_upper, bl_prefix)

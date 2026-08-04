@@ -136,10 +136,10 @@ class ArrivalNoticeService:
             while not self._stop_evt.is_set():
                 self.last_run = datetime.now().isoformat()
                 items = self._process_batch(outlook_page, tracker)
-    
+
                 if items:
                     consecutive_empty = 0
-                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
+                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
                 else:
                     consecutive_empty += 1
     
@@ -285,16 +285,20 @@ class ArrivalNoticeService:
                 if extraction.get("reference"):
                     extraction["reference"] = normalize_oi_reference(extraction["reference"])
     
-                # Logical duplicate check
+                # Logical duplicate check — only a TRUE duplicate if it was actually
+                # uploaded to Jordex already. Matching local disk content alone can't
+                # tell "already uploaded" apart from "downloaded but the upload step
+                # never ran" (crash, browser restart, etc.) — the latter must still be
+                # pushed to Jordex, not skipped forever.
                 res_path = os.path.join(base, folder_name, "arrival_notice.json")
-                if os.path.exists(res_path):
+                if os.path.exists(res_path) and tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name):
                     try:
                         with open(res_path) as f:
                             old = json.load(f)
                         if old.get("arrival_date_raw") == extraction.get("arrival_date_raw"):
-                            log.info(f"[{SERVICE_KEY}] Logical duplicate for {folder_name}, skipping")
+                            log.info(f"[{SERVICE_KEY}] Logical duplicate for {folder_name} — already uploaded, skipping")
                             cleanup_temp(temp_files)
-                            tracker.mark(CAT, cid, subject, folder_name, [], "downloaded",
+                            tracker.mark(CAT, cid, subject, folder_name, [], "uploaded",
                                         mbl=folder_name, carrier_code=extraction.get("carrier_code"))
                             continue
                     except Exception:
@@ -338,8 +342,13 @@ class ArrivalNoticeService:
     
         return processed_items
 
-    def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items: list):
-        """Upload downloaded files to Jordex — no double search."""
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items: list, jordex_session=None):
+        """Upload downloaded files to Jordex — no double search.
+
+        Returns the current jordex_page (may be a fresh Page if search_and_open
+        had to hard-restart the browser mid-batch) so the caller's loop stays
+        in sync with the live page.
+        """
         doc_type, display_name = JORDEX_MAPPING[CAT]
         uploaded_folders: set[str] = set()
 
@@ -371,7 +380,7 @@ class ArrivalNoticeService:
                 uploaded_folders.add(folder_name)
                 continue
 
-            success, used_ref, rows_found = search_jordex_with_fallback(
+            success, used_ref, rows_found, jordex_page = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
                 primary_ref=query,
@@ -381,6 +390,7 @@ class ArrivalNoticeService:
                 cat=CAT,
                 service_key=SERVICE_KEY,
                 search_fn=search_and_open,
+                jordex_session=jordex_session,
             )
             if not success:
                 continue
@@ -401,15 +411,25 @@ class ArrivalNoticeService:
 
             try:
                 while row_index < rows_found:
-                    success, current_rows = search_and_open(jordex_page, used_ref, row_index=row_index)
+                    success, current_rows, jordex_page = search_and_open(
+                        jordex_page, used_ref, row_index=row_index, session=jordex_session
+                    )
                     if not success:
                         break
 
                     skip_an = self._check_arrival_date_mismatch(jordex_page, item)
                     if skip_an:
-                        tracker.update_status(CAT, item["conv_id"], "Data Mismatch")
-                        mark_as_unread(outlook_page, item["conv_id"])
-                        mismatch_found = True
+                        # Only flag for review if NO row has succeeded yet this item.
+                        # A mismatch on a later candidate row (rows_found > 1, e.g.
+                        # multiple similar shipments) must not undo an already-
+                        # successful upload from an earlier row — marking the email
+                        # unread here would strand it unread even though the file
+                        # DID reach Jordex and the finally block below will set
+                        # status back to "uploaded".
+                        if not uploaded:
+                            tracker.update_status(CAT, item["conv_id"], "Data Mismatch")
+                            mark_as_unread(outlook_page, item["conv_id"])
+                            mismatch_found = True
                         go_back(jordex_page)
                         break
 
@@ -434,9 +454,19 @@ class ArrivalNoticeService:
                 if uploaded:
                     tracker.update_status(CAT, item["conv_id"], "uploaded")
                     uploaded_folders.add(folder_name)
+                    if fcs_mode:
+                        # FCS/FPS only: handle_fcs_post_upload() does several
+                        # semi-automated Jordex edits (vessel name, arrival/
+                        # devanning dates) that are worth a human glance even
+                        # on success — so mark unread here. Gated on fcs_mode,
+                        # so the normal (non-FCS) Arrival Notice success path,
+                        # and every other label, is untouched.
+                        mark_as_unread(outlook_page, item["conv_id"])
                 elif not mismatch_found:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
-                    
+
+        return jordex_page
+
     def _check_arrival_date_mismatch(self, jordex_page, item: dict) -> bool:
         """
         Return True if Jordex arrival date is OUTSIDE ±5 days of extracted date.

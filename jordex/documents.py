@@ -625,51 +625,130 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
             log.info(f"  Comment set: '{actual_comment}'")
 
         # ── Save ─────────────────────────────────────────────────────
-        # NOTE: a "Save"-labeled button existing and being .click()'d does NOT
-        # mean the save succeeded — a disabled button (e.g. file still
-        # uploading) silently no-ops on .click(). We verify below by checking
-        # whether the dialog actually closed, instead of trusting this alone.
-        saved = page.evaluate("""() => {
-            const dialog = [...document.querySelectorAll('.el-dialog')].find(d => d.offsetParent !== null);
-            if (!dialog) return false;
-            const btns = dialog.querySelectorAll('button');
-            for (const b of btns) {
-                if (b.innerText.trim().includes('Save') && !b.disabled) { b.click(); return true; }
-            }
-            return false;
-        }""")
+          # ── Save ─────────────────────────────────────────────────────
+        # ★ FIX: Playwright native .click() instead of JS .click().
+        # JS element.click() fires synthetic events that may not trigger
+        # Vue/Element UI @click handlers → save silently never fires.
+        saved = False
+        try:
+            save_btn = page.locator(
+                ".el-dialog:visible button:has-text('Save'):not([disabled])"
+            ).first
+            if save_btn.is_visible(timeout=3000):
+                save_btn.click(timeout=5000)
+                saved = True
+            else:
+                save_btn = page.get_by_role("button", name=" Save")
+                if save_btn.is_visible(timeout=2000):
+                    save_btn.click(timeout=5000)
+                    saved = True
+        except Exception as e:
+            log.warning(f"  Save button click failed for '{filename}': {e}")
 
         if saved:
-            page.wait_for_timeout(2500)
+            # ── Wait for success confirmation ────────────────────────
+            # Jordex shows an el-message--info toast with "File(s) saved
+            # successfully". It auto-dismisses in ~3s, so we use
+            # wait_for_selector to catch it the instant it appears.
+            upload_confirmed = False
             try:
-                ok = page.locator("button:has-text('OK'):visible").first
-                if ok.is_visible(timeout=2000):
-                    ok.click()
-                    page.wait_for_timeout(1000)
-            except:
+                page.wait_for_selector(
+                    "div.el-message--info p.el-message__content",
+                    state="visible",
+                    timeout=20000,
+                )
+                # Verify it's the success message (not some other info toast)
+                try:
+                    toast_text = page.locator(
+                        "div.el-message--info p.el-message__content"
+                    ).first.inner_text(timeout=1000)
+                    if "saved success" in toast_text.lower():
+                        upload_confirmed = True
+                        log.info(f"  OK Uploaded (confirmed): '{filename}' as '{actual_name}'")
+                    else:
+                        log.warning(f"  Info toast appeared but text was: '{toast_text}'")
+                except Exception:
+                    # Toast appeared but vanished before we could read it —
+                    # it was there, likely the success message
+                    upload_confirmed = True
+                    log.info(f"  OK Uploaded (toast seen briefly): '{filename}' as '{actual_name}'")
+                page.wait_for_timeout(2000)
+            except Exception:
                 pass
 
-            # ── Verify the dialog actually closed ──────────────────────
-            # El-UI dialogs may close by: (a) removing from DOM entirely, or
-            # (b) setting display:none/opacity:0 (CSS animation ~300ms).
-            # wait_for(state="hidden") throws if the element is REMOVED from DOM,
-            # which we must also treat as success (dialog is definitely gone).
-            page.wait_for_timeout(1500)   # let animation finish first
+            # ── Fallback: if dialog closed, assume upload OK ─────────
+            # The toast auto-dismisses fast and may slip past detection.
+            # If the upload dialog itself is gone, the save went through.
+            if not upload_confirmed:
+                try:
+                    is_dialog_gone = page.evaluate("""() => {
+                        const visible = [...document.querySelectorAll('.el-dialog')]
+                            .filter(d => d.offsetParent !== null);
+                        return visible.length === 0;
+                    }""")
+                    if is_dialog_gone:
+                        upload_confirmed = True
+                        log.info(f"  OK Uploaded (dialog closed): '{filename}' as '{actual_name}'")
+                    else:
+                        page.wait_for_timeout(3000)
+                        is_dialog_gone2 = page.evaluate("""() => {
+                            const visible = [...document.querySelectorAll('.el-dialog')]
+                                .filter(d => d.offsetParent !== null);
+                            return visible.length === 0;
+                        }""")
+                        if is_dialog_gone2:
+                            upload_confirmed = True
+                            log.info(f"  OK Uploaded (dialog closed after wait): '{filename}' as '{actual_name}'")
+                except Exception:
+                    pass
+
+            # ── Check for error toast ────────────────────────────────
+            if not upload_confirmed:
+                try:
+                    error_toast = page.locator(
+                        ".el-message--error:visible, "
+                        ".el-notification--error:visible"
+                    ).first
+                    if error_toast.is_visible(timeout=2000):
+                        error_text = error_toast.inner_text(timeout=1000)
+                        log.error(f"  Jordex ERROR for '{filename}': {error_text}")
+                        all_ok = False
+                        try:
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+                        continue
+                except Exception:
+                    pass
+
+            # ── Handle any OK confirmation dialog ────────────────────
+            # ★ FIX: Only click OK if we already got the success toast.
+            # Otherwise an error dialog's OK button would be dismissed
+            # silently, making a failure look like success.
+            if upload_confirmed:
+                try:
+                    ok = page.locator("button:has-text('OK'):visible").first
+                    if ok.is_visible(timeout=2000):
+                        ok.click()
+                        page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+            # ── Verify dialog closed ─────────────────────────────────
+            page.wait_for_timeout(1500)
 
             dialog_still_open = True
             try:
                 is_gone = page.evaluate("""() => {
                     const dialogs = [...document.querySelectorAll('.el-dialog')];
-                    // If no dialogs at all → definitely closed
                     if (dialogs.length === 0) return true;
-                    // If ALL visible dialogs are gone → closed
                     const visible = dialogs.filter(d => d.offsetParent !== null);
                     return visible.length === 0;
                 }""")
                 if is_gone:
                     dialog_still_open = False
                 else:
-                    # Dialog still in DOM and visible — wait a bit more for slow saves
                     page.wait_for_timeout(2000)
                     is_gone2 = page.evaluate("""() => {
                         const visible = [...document.querySelectorAll('.el-dialog')]
@@ -678,24 +757,25 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
                     }""")
                     dialog_still_open = not is_gone2
             except Exception:
-                dialog_still_open = True  # JS failed → assume stuck
+                dialog_still_open = True
 
             if dialog_still_open:
-                # Check if the Jordex update popup is the reason the dialog
-                # didn't close — if so, reload and let the next run re-upload.
                 if dismiss_update_popup(page, service_key="upload_attachments/save"):
                     log.warning(
                         f"  Update popup was active during save of '{filename}' — "
                         f"page reloaded, file will be re-attempted on next run."
                     )
                     all_ok = False
-                    break  # abort remaining files in this batch; page is now clean
+                    break
                 log.warning(f"  Save dialog still open after Save for '{filename}' — NOT confirmed uploaded.")
                 all_ok = False
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
             else:
-                log.info(f"  OK Uploaded: '{filename}' as '{actual_name}'")
+                if not upload_confirmed:
+                    log.warning(f"  UNVERIFIED upload: '{filename}' — dialog closed but "
+                                f"success toast was not seen")
+                    all_ok = False
         else:
             log.warning(f"  FAILED to click Save for '{filename}' (button missing or disabled).")
             all_ok = False
@@ -703,3 +783,81 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
 
     log.info("Finished uploading documents.")
     return all_ok
+    #     # NOTE: a "Save"-labeled button existing and being .click()'d does NOT
+    #     # mean the save succeeded — a disabled button (e.g. file still
+    #     # uploading) silently no-ops on .click(). We verify below by checking
+    #     # whether the dialog actually closed, instead of trusting this alone.
+    #     saved = page.evaluate("""() => {
+    #         const dialog = [...document.querySelectorAll('.el-dialog')].find(d => d.offsetParent !== null);
+    #         if (!dialog) return false;
+    #         const btns = dialog.querySelectorAll('button');
+    #         for (const b of btns) {
+    #             if (b.innerText.trim().includes('Save') && !b.disabled) { b.click(); return true; }
+    #         }
+    #         return false;
+    #     }""")
+
+    #     if saved:
+    #         page.wait_for_timeout(2500)
+    #         try:
+    #             ok = page.locator("button:has-text('OK'):visible").first
+    #             if ok.is_visible(timeout=2000):
+    #                 ok.click()
+    #                 page.wait_for_timeout(1000)
+    #         except:
+    #             pass
+
+    #         # ── Verify the dialog actually closed ──────────────────────
+    #         # El-UI dialogs may close by: (a) removing from DOM entirely, or
+    #         # (b) setting display:none/opacity:0 (CSS animation ~300ms).
+    #         # wait_for(state="hidden") throws if the element is REMOVED from DOM,
+    #         # which we must also treat as success (dialog is definitely gone).
+    #         page.wait_for_timeout(1500)   # let animation finish first
+
+    #         dialog_still_open = True
+    #         try:
+    #             is_gone = page.evaluate("""() => {
+    #                 const dialogs = [...document.querySelectorAll('.el-dialog')];
+    #                 // If no dialogs at all → definitely closed
+    #                 if (dialogs.length === 0) return true;
+    #                 // If ALL visible dialogs are gone → closed
+    #                 const visible = dialogs.filter(d => d.offsetParent !== null);
+    #                 return visible.length === 0;
+    #             }""")
+    #             if is_gone:
+    #                 dialog_still_open = False
+    #             else:
+    #                 # Dialog still in DOM and visible — wait a bit more for slow saves
+    #                 page.wait_for_timeout(2000)
+    #                 is_gone2 = page.evaluate("""() => {
+    #                     const visible = [...document.querySelectorAll('.el-dialog')]
+    #                         .filter(d => d.offsetParent !== null);
+    #                     return visible.length === 0;
+    #                 }""")
+    #                 dialog_still_open = not is_gone2
+    #         except Exception:
+    #             dialog_still_open = True  # JS failed → assume stuck
+
+    #         if dialog_still_open:
+    #             # Check if the Jordex update popup is the reason the dialog
+    #             # didn't close — if so, reload and let the next run re-upload.
+    #             if dismiss_update_popup(page, service_key="upload_attachments/save"):
+    #                 log.warning(
+    #                     f"  Update popup was active during save of '{filename}' — "
+    #                     f"page reloaded, file will be re-attempted on next run."
+    #                 )
+    #                 all_ok = False
+    #                 break  # abort remaining files in this batch; page is now clean
+    #             log.warning(f"  Save dialog still open after Save for '{filename}' — NOT confirmed uploaded.")
+    #             all_ok = False
+    #             page.keyboard.press("Escape")
+    #             page.wait_for_timeout(500)
+    #         else:
+    #             log.info(f"  OK Uploaded: '{filename}' as '{actual_name}'")
+    #     else:
+    #         log.warning(f"  FAILED to click Save for '{filename}' (button missing or disabled).")
+    #         all_ok = False
+    #         page.keyboard.press("Escape")
+
+    # log.info("Finished uploading documents.")
+    # return all_ok

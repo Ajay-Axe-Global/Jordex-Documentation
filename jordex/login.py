@@ -281,3 +281,25 @@ class JordexSession:
                 self.pw.stop()
             except Exception:
                 pass
+
+    def hard_restart(self):
+        """
+        Fully close and relaunch the browser for this label, then log back in
+        and land on the shipment list.
+
+        Used when the page is frozen/unresponsive in a way page.reload() can't
+        fix (no update popup, search input just never appears). Reuses the
+        same persistent profile dir, so the saved Jordex/Azure session cookies
+        usually avoid a fresh MFA prompt.
+        """
+        log.warning(f"[{self.service_key}] Hard restart: closing browser...")
+        try:
+            if self.context:
+                self.context.close()
+        except Exception as e:
+            log.warning(f"[{self.service_key}] hard_restart: error closing context: {e}")
+        self.context = None
+        self.page    = None
+
+        log.warning(f"[{self.service_key}] Hard restart: reopening browser...")
+        return self.start()

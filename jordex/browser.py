@@ -234,7 +234,18 @@ def normalize_dashboard_filters(page, timeout=3000):
     except Exception as e:
         log.warning(f"Filter normalization issue: {e}")
 
-def search_and_open(page, query, row_index=0):
+def search_and_open(page, query, row_index=0, session=None):
+    """
+    session (optional): the JordexSession that owns `page`. When the page
+    stalls with no update popup to dismiss (genuinely frozen browser), this
+    is used to hard-restart the browser (close + reopen + relogin) instead
+    of retrying forever against a dead page. Passed through by every label
+    service, so this recovery applies uniformly across all labels.
+
+    Returns (success, total_matching_rows, page) — `page` is returned because
+    a hard restart replaces the underlying Playwright Page object; callers
+    must use the returned page for any further calls.
+    """
     # ── Guard: dismiss Jordex update popup before doing anything ─────
     # The popup silently breaks search input, dialogs and navigation.
     # Detecting it here (at the entry to every search) means we recover
@@ -258,8 +269,13 @@ def search_and_open(page, query, row_index=0):
 
     filled = False
     search_start = _time.monotonic()
+    attempt = 0
+    max_attempts = 7
+    hard_restarts = 0
+    MAX_HARD_RESTARTS = 2  # avoid looping forever if Jordex itself is down
 
-    for attempt in range(1, 8):
+    while attempt < max_attempts:
+        attempt += 1
         # ── 30-second stall guard ────────────────────────────────────
         # If we've been trying to fill the search input for >30s without
         # success, the page is likely frozen (update popup or JS hang).
@@ -273,8 +289,27 @@ def search_and_open(page, query, row_index=0):
             if dismiss_update_popup(page, service_key="search_and_open/stall"):
                 normalize_dashboard_filters(page)
                 search_start = _time.monotonic()  # reset timer after recovery
+            elif session is not None and hard_restarts < MAX_HARD_RESTARTS:
+                hard_restarts += 1
+                log.warning(
+                    "[%s] search_and_open: no popup found — page genuinely broken. "
+                    "Closing and reopening browser (restart %d/%d)...",
+                    session.service_key, hard_restarts, MAX_HARD_RESTARTS,
+                )
+                try:
+                    page = session.hard_restart()
+                    normalize_dashboard_filters(page)
+                    attempt = 0  # fresh attempt budget on the restarted browser
+                    log.info("[%s] search_and_open: browser reopened — resuming search for '%s'",
+                              session.service_key, query)
+                except Exception as e:
+                    log.error("[%s] search_and_open: hard restart failed: %s", session.service_key, e)
+                search_start = _time.monotonic()  # reset timer either way
+            elif session is not None:
+                log.error("[%s] search_and_open: still broken after %d hard restarts — giving up",
+                           session.service_key, hard_restarts)
             else:
-                log.warning("search_and_open: no popup found — page may be genuinely broken")
+                log.warning("search_and_open: no popup found and no session to hard-restart — page may be genuinely broken")
 
         for sel in [
             "input.el-input__inner[placeholder='Search']",
@@ -297,7 +332,7 @@ def search_and_open(page, query, row_index=0):
     
     if not filled:
         log.error("Search input not found.")
-        return False, 0
+        return False, 0, page
 
     page.wait_for_timeout(500)
     _wait_loading(page)
@@ -332,7 +367,7 @@ def search_and_open(page, query, row_index=0):
     if not target_row:
         if row_index == 0:
             log.warning(f"Shipment {query} not found in Jordex.")
-        return False, 0
+        return False, 0, page
 
     for retry in range(2):
         try:
@@ -341,14 +376,14 @@ def search_and_open(page, query, row_index=0):
             page.wait_for_load_state("load", timeout=30000)
             page.wait_for_timeout(2000)
             apply_zoom(page)
-            return True, total_matching_rows
+            return True, total_matching_rows, page
         except Exception as e:
             if retry == 0:
                 log.warning(f"Failed to open shipment row on first try: {e}. Retrying...")
                 page.wait_for_timeout(2000)
             else:
                 log.error(f"Failed to open shipment row after retry: {e}")
-                return False, 0
+                return False, 0, page
 
 def go_back(page):
     log.info("Going back to shipment list...")

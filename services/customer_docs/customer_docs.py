@@ -85,7 +85,7 @@ class CustomerDocsService:
                 self.last_run = datetime.now().isoformat()
                 items = self._process_batch(outlook_page, tracker)
                 if items:
-                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
+                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -253,7 +253,9 @@ class CustomerDocsService:
             log.warning(f"[{SERVICE_KEY}]   Could not read Carrier tab BL fields: {e}")
             return False
 
-    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list, jordex_session=None):
+        """Returns the current jordex_page, which may be a fresh Page if
+        search_and_open had to hard-restart the browser mid-batch."""
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
 
@@ -282,7 +284,7 @@ class CustomerDocsService:
                 continue
 
             query = normalize_oi_reference(query)
-            success, used_ref, rows_found = search_jordex_with_fallback(
+            success, used_ref, rows_found, jordex_page = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
                 primary_ref=query,
@@ -292,6 +294,7 @@ class CustomerDocsService:
                 cat=CAT,
                 service_key=SERVICE_KEY,
                 search_fn=search_and_open,
+                jordex_session=jordex_session,
             )
             if not success:
                 continue
@@ -326,7 +329,9 @@ class CustomerDocsService:
 
             try:
                 while row_index < _max_rows:
-                    success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                    success, rows_found, jordex_page = search_and_open(
+                        jordex_page, used_ref, row_index=row_index, session=jordex_session
+                    )
                     if not success: break
                     cust_file_map = build_customer_docs_file_map(item["folder_path"])
                     row_ok = upload_attachments(
@@ -378,3 +383,5 @@ class CustomerDocsService:
                         log.info(f"[{SERVICE_KEY}] Marked '{query}' unread for retry next run")
                     except Exception as e:
                         log.warning(f"[{SERVICE_KEY}] Could not mark unread for {query}: {e}")
+
+        return jordex_page

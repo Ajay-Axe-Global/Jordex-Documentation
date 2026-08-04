@@ -450,6 +450,16 @@ def _navigate_to_destination_tab_in_routing(page: Page) -> bool:
         return False
 
 
+def _dialog_is_open(page: Page, timeout_ms: int = 2500) -> bool:
+    """Check whether an address/select dialog is actually visible."""
+    try:
+        return page.locator(
+            "[role='dialog'], .el-dialog, .el-dialog__wrapper:not([style*='display: none'])"
+        ).first.is_visible(timeout=timeout_ms)
+    except Exception:
+        return False
+
+
 def _click_add_address_button_in_routing(page: Page) -> bool:
     """
     Click the add/open-address-book button in the Destination tab.
@@ -458,7 +468,11 @@ def _click_add_address_button_in_routing(page: Page) -> bool:
       A) page.get_by_role("button","").get_by_role("button").nth(3)
       B) locator("#pane-destination > ... > .address-select-toolbar > button:nth-child(2)")
 
-    We try both plus a JS fallback.
+    Neither selector is reliable on its own — on a shipment with NO existing
+    address yet (empty-state toolbar), selector A can land on the wrong
+    element and click "succeeds" without ever opening a dialog. So we verify
+    a dialog actually appeared after each attempt, and fall through to the
+    next strategy instead of trusting the click alone.
     """
     # Strategy A: full long CSS selector from codegen
     try:
@@ -471,47 +485,53 @@ def _click_add_address_button_in_routing(page: Page) -> bool:
         ).first
         if btn.is_visible(timeout=3000):
             btn.click()
-            page.wait_for_timeout(2000)
-            log.info("  FCS: Add address button clicked (selector A)")
-            return True
+            page.wait_for_timeout(1500)
+            if _dialog_is_open(page):
+                log.info("  FCS: Add address button clicked (selector A)")
+                return True
+            log.info("  FCS: Selector A clicked but no dialog opened — trying JS fallback")
     except Exception:
         pass
 
-    # Strategy B: scoped to #pane-destination, find any toolbar button
+    # Strategy B: scoped to #pane-destination, try each candidate toolbar
+    # button in turn until one actually opens a dialog (instead of
+    # assuming the first successful click was the right button).
     try:
-        clicked = page.evaluate("""() => {
+        candidates = page.evaluate("""() => {
             const pane = document.querySelector('#pane-destination');
-            if (!pane) return false;
-            // All buttons in address-select-toolbar
+            if (!pane) return 0;
             const toolbarBtns = [...pane.querySelectorAll(
                 '.address-select-toolbar button, .address-select__toolbar button'
             )].filter(b => b.offsetParent !== null);
-            if (toolbarBtns.length >= 2) {
-                // nth(1) = second button (add/open address book)
-                toolbarBtns[1].click(); return true;
-            }
-            if (toolbarBtns.length === 1) {
-                toolbarBtns[0].click(); return true;
-            }
-            // Last resort: any + or add button
-            const allBtns = [...pane.querySelectorAll('button')]
-                .filter(b => b.offsetParent !== null);
-            const plusBtn = allBtns.find(b => {
+            if (toolbarBtns.length) { window.__fcsToolbarBtns = toolbarBtns; return toolbarBtns.length; }
+            const allBtns = [...pane.querySelectorAll('button')].filter(b => b.offsetParent !== null);
+            const plusBtns = allBtns.filter(b => {
                 const icon = b.querySelector('i.el-icon-plus, i.el-icon-circle-plus');
                 const txt = b.textContent.trim();
                 return icon || txt === '+' || txt.toLowerCase() === 'add';
             });
-            if (plusBtn) { plusBtn.click(); return true; }
-            return false;
+            window.__fcsToolbarBtns = plusBtns;
+            return plusBtns.length;
         }""")
-        if clicked:
-            page.wait_for_timeout(2000)
-            log.info("  FCS: Add address button clicked (JS fallback)")
-            return True
+
+        # Prefer index 1 (second button) first since that matched historically,
+        # then fall back to trying every other candidate.
+        order = list(range(candidates))
+        if 1 in order:
+            order.remove(1)
+            order.insert(0, 1)
+
+        for idx in order:
+            page.evaluate("(i) => { const b = window.__fcsToolbarBtns[i]; if (b) b.click(); }", idx)
+            page.wait_for_timeout(1500)
+            if _dialog_is_open(page):
+                log.info("  FCS: Add address button clicked (JS fallback, index %d)", idx)
+                return True
+
     except Exception as e:
         log.warning("  FCS: _click_add_address_button_in_routing JS failed: %s", e)
 
-    log.warning("  FCS: Could not find Add Address button in Destination tab")
+    log.warning("  FCS: Could not find Add Address button in Destination tab (no dialog opened)")
     return False
 
 
@@ -787,6 +807,108 @@ def _save_address_dialog(page: Page):
         log.warning("  FCS: _save_address_dialog fallback failed: %s", e)
 
 
+def _read_current_devanning_date(page: Page) -> str:
+    """
+    Read the current 'Available from' (Devanning) date on the Destination tab.
+
+    Per live Playwright codegen recording, this is the 3rd 'Start'-placeholder
+    input in DOM order across the whole routing sidebar (Origin, Lane,
+    Destination each have one — Destination's is index 2):
+      page.get_by_placeholder("Start").nth(2)
+    """
+    try:
+        val = page.get_by_placeholder("Start").nth(2).input_value(timeout=3000)
+        return (val or "").strip()
+    except Exception:
+        return ""
+
+
+def _update_devanning_date_in_destination(page: Page, devanning_date: str) -> bool:
+    """
+    Update the 'Available from' (Devanning) date field on the Destination tab.
+
+    Exact flow captured via live Playwright codegen on the Destination tab:
+      page.get_by_placeholder("Start").nth(2).click()
+      page.get_by_placeholder("Select date").click()
+      page.get_by_role("button", name="OK").click()
+
+    devanning_date: DD/MM/YY or DD/MM/YYYY → normalized to DD/MM/YY for typing,
+    since Jordex's Destination-tab date field only accepts that literal
+    dd/mm/yy text (unlike the picker's underlying ISO storage format) —
+    typing an ISO string here silently fails to register even though the
+    click/save steps still "succeed".
+    """
+    if not devanning_date:
+        return False
+
+    parts = devanning_date.split("/")
+    if len(parts) != 3:
+        log.warning("  FCS: Invalid devanning_date format: '%s'", devanning_date)
+        return False
+
+    day, month, year = parts
+    if len(year) == 4:
+        year = year[-2:]
+    date_dmy = f"{day.zfill(2)}/{month.zfill(2)}/{year.zfill(2)}"
+
+    log.info("  FCS: Setting devanning date (Available from) → %s (dd/mm/yy: %s)", devanning_date, date_dmy)
+
+    try:
+        # Codegen: page.get_by_placeholder("Start").nth(2).click()
+        start_input = page.get_by_placeholder("Start").nth(2)
+        start_input.wait_for(state="visible", timeout=5000)
+        start_input.click()
+        page.wait_for_timeout(800)
+
+        # Codegen: page.get_by_placeholder("Select date").click()
+        # Element-UI's date input is readonly to native typing, so we set the
+        # value via JS the same way the Lane tab arrival date does — but with
+        # the literal dd/mm/yy string Jordex expects, not ISO.
+        filled = page.evaluate("""(dateVal) => {
+            const inputs = [...document.querySelectorAll('input.el-input__inner')]
+                .filter(i => (i.placeholder === 'Select date' || i.placeholder === 'Start')
+                          && i.offsetParent !== null);
+            if (!inputs.length) return false;
+            const inp = inputs[inputs.length - 1];
+            inp.focus();
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            setter.call(inp, dateVal);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        }""", date_dmy)
+
+        if not filled:
+            log.warning("  FCS: Devanning 'Select date' input not found")
+            return False
+
+        page.wait_for_timeout(500)
+
+        # Codegen: page.get_by_role("button", name="OK").click()
+        try:
+            ok_btn = page.get_by_role("button", name="OK").first
+            if ok_btn.is_visible(timeout=2000):
+                ok_btn.click()
+                page.wait_for_timeout(600)
+            else:
+                page.evaluate("""() => {
+                    const btns = [...document.querySelectorAll('button')]
+                        .filter(b => b.textContent.trim() === 'OK' && b.offsetParent !== null);
+                    if (btns.length) btns[btns.length - 1].click();
+                }""")
+                page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+        log.info("  FCS: Devanning date set to %s", date_dmy)
+        return True
+
+    except Exception as e:
+        log.warning("  FCS: _update_devanning_date_in_destination failed: %s", e)
+        return False
+
+
 def _save_destination_tab(page: Page) -> bool:
     """Save the Destination tab after adding the warehouse address."""
     # Try the floated toolbar save button (long selector from original code)
@@ -944,32 +1066,29 @@ def handle_fcs_post_upload(page: Page, extraction: dict) -> bool:
       ① Main page → Carrier tab → update vessel name → Save
       ② Open View Routing
       ③ Inside routing → Lane tab → update Arrival date → Save
-      ④ Inside routing → Destination tab → add warehouse address → Save
+      ④ Inside routing → Destination tab → update Devanning ("Available
+         from") date → Save
       ⑤ Go back from routing
+
+    NOTE: Warehouse-address creation is intentionally NOT performed here.
+    The helper functions for it (_click_add_address_button_in_routing,
+    _handle_address_dialog, etc.) remain below in case it's needed again.
 
     Args:
         page:       Playwright page on the shipment detail (after AN upload)
         extraction: dict from extract_arrival_notice with keys:
-                      vessel_name, arrival_date,
-                      warehouse_name, address_line_1, postal_code, city, country
+                      vessel_name, arrival_date, devanning_date
 
     Returns:
         True if at least one update succeeded
     """
     any_success = False
 
-    vessel_name  = (extraction.get("vessel_name") or "").strip()
-    arrival_date = (extraction.get("arrival_date") or "").strip()
-    warehouse = {
-        "warehouse_name": extraction.get("warehouse_name"),
-        "address_line_1": extraction.get("address_line_1"),
-        "postal_code":    extraction.get("postal_code"),
-        "city":           extraction.get("city"),
-        "country":        extraction.get("country"),
-    }
-    has_warehouse = any(v for v in warehouse.values() if v)
+    vessel_name    = (extraction.get("vessel_name") or "").strip()
+    arrival_date   = (extraction.get("arrival_date") or "").strip()
+    devanning_date = (extraction.get("devanning_date") or "").strip()
 
-    if not vessel_name and not arrival_date and not has_warehouse:
+    if not vessel_name and not arrival_date and not devanning_date:
         log.info("  FCS: No additional data to update")
         return False
 
@@ -983,7 +1102,7 @@ def handle_fcs_post_upload(page: Page, extraction: dict) -> bool:
             log.warning("  FCS: [Step 1] Vessel name update failed — continuing")
 
     # ── ② Open View Routing ─────────────────────────────────────────────
-    if not (arrival_date or has_warehouse):
+    if not (arrival_date or devanning_date):
         return any_success
 
     log.info("  FCS: [Step 2] Opening View Routing...")
@@ -1013,27 +1132,26 @@ def handle_fcs_post_upload(page: Page, extraction: dict) -> bool:
         else:
             log.warning("  FCS: [Step 3] Could not open Lane tab")
 
-    # ── ④ Destination tab: warehouse address (only if not already added) ─
-    if has_warehouse:
-        log.info("  FCS: [Step 4] Checking warehouse address on Destination tab...")
+    # ── ④ Destination tab: devanning ("Available from") date only ───────
+    if devanning_date:
+        log.info("  FCS: [Step 4] Opening Destination tab...")
         if _navigate_to_destination_tab_in_routing(page):
-            existing_names = _read_current_warehouse_names(page)
-            wh_name = (warehouse.get("warehouse_name") or "").strip()
-            log.info("  FCS: [Step 4] Existing addresses: %s", existing_names)
+            current_dev_date = _read_current_devanning_date(page)
+            log.info("  FCS: [Step 4] Devanning current='%s' expected='%s'",
+                     current_dev_date, devanning_date)
 
-            if _warehouse_already_added(existing_names, wh_name):
-                log.info("  FCS: [Step 4] Warehouse '%s' already present — skipping ✓", wh_name)
+            if _arrival_date_matches(current_dev_date, devanning_date):
+                log.info("  FCS: [Step 4] Devanning date already matches — skipping ✓")
             else:
-                log.info("  FCS: [Step 4] Not found — adding warehouse address...")
-                if _click_add_address_button_in_routing(page):
-                    if _handle_address_dialog(page, warehouse):
-                        _save_destination_tab(page)
+                log.info("  FCS: [Step 4] Mismatch — updating devanning date...")
+                if _update_devanning_date_in_destination(page, devanning_date):
+                    if _save_destination_tab(page):
                         any_success = True
-                        log.info("  FCS: [Step 4] Warehouse address added ✓")
+                        log.info("  FCS: [Step 4] Devanning date updated ✓")
                     else:
-                        log.warning("  FCS: [Step 4] Address dialog fill failed")
+                        log.warning("  FCS: [Step 4] Destination save failed")
                 else:
-                    log.warning("  FCS: [Step 4] Add address button not found")
+                    log.warning("  FCS: [Step 4] Devanning date fill failed")
         else:
             log.warning("  FCS: [Step 4] Could not open Destination tab")
 

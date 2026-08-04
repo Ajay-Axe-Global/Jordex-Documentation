@@ -88,7 +88,7 @@ class InvoiceCarrierService:
                 items = self._process_batch(outlook_page, tracker)
                 if items:
                     merged = self._merge_by_folder(items)
-                    self._upload_to_jordex(jordex_page, outlook_page, tracker, merged)
+                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, merged, jordex_session)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -135,6 +135,7 @@ class InvoiceCarrierService:
             pdf_files   = [f for f in temp_files if f.lower().endswith(".pdf")]
             folder_groups: dict[str, list] = {}
             duplicate_folder = None
+            requeued_any = False
 
             for pdf_path in pdf_files:
                 extraction  = extract_invoice_carrier(pdf_path, gemini_model=gemini_model)
@@ -151,18 +152,48 @@ class InvoiceCarrierService:
 
                 inv_no = extraction.get("invoice_no")
 
-                # Duplicate check
+                # Has this exact invoice_no already been downloaded before for this folder?
                 res_path = os.path.join(base, folder_name, "result.json")
+                already_downloaded = False
                 if os.path.exists(res_path) and inv_no:
                     try:
                         with open(res_path) as f:
                             old = json.load(f)
                         existing = [d.get("invoice_no") for d in (old if isinstance(old, list) else [old])]
-                        if inv_no in existing:
-                            log.info(f"[{SERVICE_KEY}] Duplicate invoice {inv_no}, skipping")
-                            duplicate_folder = folder_name
-                            continue
-                    except Exception: pass
+                        already_downloaded = inv_no in existing
+                    except Exception:
+                        pass
+
+                if already_downloaded:
+                    # Only a TRUE duplicate if it actually reached Jordex. Checking local
+                    # disk alone can't tell "already uploaded" apart from "downloaded but
+                    # the upload step never ran" (crash, browser restart, etc.) — the
+                    # latter must still be pushed to Jordex, not skipped forever.
+                    if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name):
+                        log.info(f"[{SERVICE_KEY}] Duplicate invoice {inv_no} for '{folder_name}' — already uploaded, skipping")
+                        duplicate_folder = folder_name
+                    else:
+                        log.warning(
+                            f"[{SERVICE_KEY}] Invoice {inv_no} for '{folder_name}' was downloaded "
+                            f"before but never reached Jordex — re-queuing for upload (no re-download)"
+                        )
+                        final_dir = os.path.join(base, folder_name)
+                        existing_files = sorted(
+                            f for f in os.listdir(final_dir) if f.lower().endswith(".pdf")
+                        ) if os.path.isdir(final_dir) else []
+                        tracker.mark(CAT, cid, subject, folder_name, existing_files, "downloaded",
+                                     mbl=folder_name, secondary_ref=extraction.get("secondary_ref"))
+                        self._processed += 1
+                        processed_items.append({
+                            "conv_id":       cid,
+                            "cat":           CAT,
+                            "folder_path":   final_dir,
+                            "folder_name":   folder_name,
+                            "mbl":           folder_name,
+                            "secondary_ref": extraction.get("secondary_ref"),
+                        })
+                        requeued_any = True
+                    continue
 
                 if folder_name not in folder_groups:
                     folder_groups[folder_name] = []
@@ -211,7 +242,7 @@ class InvoiceCarrierService:
                         "secondary_ref": sec_ref,
                     })
 
-            if not folder_groups and duplicate_folder:
+            if not folder_groups and duplicate_folder and not requeued_any:
                 tracker.mark(CAT, cid, subject, duplicate_folder, [], "skipped_duplicate")
 
             cleanup_temp(temp_files)
@@ -247,7 +278,9 @@ class InvoiceCarrierService:
    
         
     # NEW
-    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list, jordex_session=None):
+        """Returns the current jordex_page, which may be a fresh Page if
+        search_and_open had to hard-restart the browser mid-batch."""
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
         for item in items:
@@ -299,7 +332,7 @@ class InvoiceCarrierService:
                     )
                     # Fall through to Jordex search + upload below
 
-            success, used_ref, rows_found = search_jordex_with_fallback(
+            success, used_ref, rows_found, jordex_page = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
                 primary_ref=query,
@@ -309,6 +342,7 @@ class InvoiceCarrierService:
                 cat=CAT,
                 service_key=SERVICE_KEY,
                 search_fn=search_and_open,
+                jordex_session=jordex_session,
             )
             if not success:
                 continue
@@ -317,14 +351,21 @@ class InvoiceCarrierService:
             uploaded  = False
             try:
                 while row_index < 10:
-                    success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                    success, rows_found, jordex_page = search_and_open(
+                        jordex_page, used_ref, row_index=row_index, session=jordex_session
+                    )
                     if not success:
                         break
                     inv_file_map = build_invoice_carrier_file_map(item["folder_path"])
-                    upload_attachments(jordex_page, item["folder_path"], doc_type, display_name, file_map=inv_file_map)
+                    upload_ok = upload_attachments(jordex_page, item["folder_path"], doc_type, display_name, file_map=inv_file_map)
+                    if not upload_ok:
+                        log.warning(f"[{SERVICE_KEY}] upload_attachments returned False for {query} row {row_index}")
+                    # Give Jordex server time to persist before navigating away
+                    jordex_page.wait_for_timeout(2000)
                     go_back(jordex_page)
-                    uploaded = True
-                    self._uploaded += 1
+                    if upload_ok:
+                        uploaded = True
+                        self._uploaded += 1
                     row_index += 1
                     if rows_found <= row_index:
                         break
@@ -336,3 +377,5 @@ class InvoiceCarrierService:
                         tracker.update_status(CAT, cid, "uploaded")
                 else:
                     log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
+
+        return jordex_page

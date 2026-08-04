@@ -164,7 +164,7 @@ class DeliveryOrderService:
                 self.last_run = datetime.now().isoformat()
                 items = self._process_batch(outlook_page, tracker, pw=pw)
                 if items:
-                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
+                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -527,12 +527,15 @@ class DeliveryOrderService:
         log.info(f"[{SERVICE_KEY}]   No shortcode match for '{name}' — using default search")
         return None
     
-    def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items):
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items, jordex_session=None):
         """
         Upload to Jordex with doc-subtype awareness:
           - DO files → "Container release" / "DO" (existing behavior)
           - Acknowledgement files → "Additional Files" / original filename
           - Destination fill → ONLY if extraction exists (i.e. actual DO)
+
+        Returns the current jordex_page, which may be a fresh Page if
+        search_and_open had to hard-restart the browser mid-batch.
         """
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
@@ -587,7 +590,7 @@ class DeliveryOrderService:
 
             query = normalize_oi_reference(query)
 
-            success, used_ref, rows_found = search_jordex_with_fallback(
+            success, used_ref, rows_found, jordex_page = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
                 primary_ref=query,
@@ -597,6 +600,7 @@ class DeliveryOrderService:
                 cat=CAT,
                 service_key=SERVICE_KEY,
                 search_fn=search_and_open,
+                jordex_session=jordex_session,
             )
             if not success:
                 continue
@@ -624,7 +628,9 @@ class DeliveryOrderService:
             ack_uploaded = False
             uploaded_files_this_item: set[str] = set()
             while row_index < 10:
-                success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                success, rows_found, jordex_page = search_and_open(
+                    jordex_page, used_ref, row_index=row_index, session=jordex_session
+                )
                 if not success:
                     break
                 checked_any_row = True
@@ -722,6 +728,8 @@ class DeliveryOrderService:
                 tracker.update_status(CAT, cid, "partial_row_match")
             else:
                 tracker.update_status(CAT, cid, "no_matching_row")
+
+        return jordex_page
 
     # ══════════════════════════════════════════════════════════════════
     #  DESTINATION FILL — View Routing → 3. Destination

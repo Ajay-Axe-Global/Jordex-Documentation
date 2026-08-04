@@ -84,7 +84,7 @@ class BookingService:
                 self.last_run = datetime.now().isoformat()
                 items = self._process_batch(outlook_page, tracker)
                 if items:
-                    self._upload_to_jordex(jordex_page, outlook_page, tracker, items)
+                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -161,7 +161,9 @@ class BookingService:
 
         return processed_items
 
-    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list):
+    def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list, jordex_session=None):
+        """Returns the current jordex_page, which may be a fresh Page if
+        search_and_open had to hard-restart the browser mid-batch."""
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
 
@@ -189,7 +191,7 @@ class BookingService:
                 uploaded_folders.add(folder_name)
                 continue
 
-            success, used_ref, rows_found = search_jordex_with_fallback(
+            success, used_ref, rows_found, jordex_page = search_jordex_with_fallback(
                 jordex_page=jordex_page,
                 outlook_page=outlook_page,
                 primary_ref=query,
@@ -199,6 +201,7 @@ class BookingService:
                 cat=CAT,
                 service_key=SERVICE_KEY,
                 search_fn=search_and_open,
+                jordex_session=jordex_session,
             )
             if not success:
                 continue
@@ -206,7 +209,9 @@ class BookingService:
             row_index = 0
             uploaded  = False
             while row_index < 10:
-                success, rows_found = search_and_open(jordex_page, used_ref, row_index=row_index)
+                success, rows_found, jordex_page = search_and_open(
+                    jordex_page, used_ref, row_index=row_index, session=jordex_session
+                )
                 if not success: break
                 upload_attachments(jordex_page, item["folder_path"], doc_type, display_name)
                 go_back(jordex_page)
@@ -218,4 +223,6 @@ class BookingService:
             if uploaded:
                 tracker.update_status(CAT, item["conv_id"], "uploaded")
                 uploaded_folders.add(folder_name)
+
+        return jordex_page
 

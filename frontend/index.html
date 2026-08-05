@@ -228,6 +228,10 @@
     .stat-issue-row .t { color:var(--text2); font-family:monospace; white-space:nowrap; }
     .stat-issue-row .m { color:var(--text); word-break:break-word; }
     .stat-issue-row.WARNING .t { color:var(--warning); }
+
+    /* Log browser (full-page, opened from a Statistics stat-card) */
+    .lb-cat-btn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .stat-issue-row.INFO .t { color:#60a5fa; }
     .stat-issue-row.ERROR   .t { color:var(--danger); }
     .stat-empty { font-size:11px; color:var(--text2); padding:6px 0; }
     .tree-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; vertical-align: middle; box-shadow: 0 0 4px rgba(0,0,0,0.2); flex-shrink: 0; }
@@ -517,6 +521,30 @@
     <div class="stats-grid" id="statsGrid">
       <div class="stat-empty">Loading…</div>
     </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       LOG BROWSER (full page, opened by clicking a Statistics card)
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="tab-logbrowser" class="tab-panel" style="flex-direction:column;overflow:hidden;padding:22px;gap:14px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <button class="btn btn-outline" onclick="backToStatistics()">&larr; Back</button>
+        <div class="section-title" style="margin-bottom:0;" id="lb-title">Logs</div>
+      </div>
+      <input type="text" id="lb-search" placeholder="Search entire log..."
+             style="padding:6px 10px;border-radius:4px;border:1px solid #2d3748;background:var(--surface);color:var(--text);outline:none;font-size:0.9rem;min-width:240px;"
+             oninput="onLogBrowserSearchInput()" />
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-outline lb-cat-btn active" data-cat="all"        onclick="setLogCategory('all')">All</button>
+      <button class="btn btn-outline lb-cat-btn"        data-cat="extraction" onclick="setLogCategory('extraction')">Extraction</button>
+      <button class="btn btn-outline lb-cat-btn"        data-cat="upload"     onclick="setLogCategory('upload')">Upload</button>
+      <button class="btn btn-outline lb-cat-btn"        data-cat="unread"     onclick="setLogCategory('unread')">Unread</button>
+      <button class="btn btn-outline lb-cat-btn"        data-cat="errors"     onclick="setLogCategory('errors')">Errors</button>
+    </div>
+    <div id="lb-list" style="flex:1;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:6px 14px;"></div>
+    <div id="lb-pagination" style="display:flex;justify-content:center;align-items:center;gap:6px;"></div>
   </div>
 
 <script>
@@ -993,16 +1021,11 @@
     );
 
     grid.innerHTML = keys.map(key => {
-      const s = services[key] || { INFO: 0, WARNING: 0, ERROR: 0, recent_issues: [] };
+      const s = services[key] || { INFO: 0, WARNING: 0, ERROR: 0 };
       const title = LABEL_BY_KEY[key] || key;
-      const issuesHtml = s.recent_issues.length
-        ? s.recent_issues.slice().reverse().map(i =>
-            `<div class="stat-issue-row ${esc(i.level)}"><span class="t">${esc(i.time)}</span><span class="m">${esc(i.message)}</span></div>`
-          ).join('')
-        : '<div class="stat-empty">No warnings or errors for this day.</div>';
 
       return `
-        <div class="stat-card" onclick="this.classList.toggle('expanded')">
+        <div class="stat-card" onclick="openLogBrowser('${key}')">
           <div class="stat-card-head">
             <div class="stat-card-title">${esc(title)}</div>
           </div>
@@ -1011,9 +1034,96 @@
             <div class="stat-count warn"><span class="n">${s.WARNING}</span><span class="l">Warn</span></div>
             <div class="stat-count err"><span class="n">${s.ERROR}</span><span class="l">Error</span></div>
           </div>
-          <div class="stat-issues">${issuesHtml}</div>
+          <div style="margin-top:10px;font-size:11px;color:var(--text2);">Click to view full log &rarr;</div>
         </div>`;
     }).join('');
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  LOG BROWSER (full-page, per-label, paginated, server-side search)
+  // ═══════════════════════════════════════════════════
+
+  const LB_PAGE_SIZE = 50;
+  let logBrowser = { key: null, category: "all", search: "", page: 1, total: 0 };
+
+  function openLogBrowser(key) {
+    logBrowser = { key, category: "all", search: "", page: 1, total: 0 };
+    document.getElementById("lb-title").textContent = LABEL_BY_KEY[key] || key;
+    document.getElementById("lb-search").value = "";
+    document.querySelectorAll(".lb-cat-btn").forEach(b => b.classList.toggle("active", b.dataset.cat === "all"));
+
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    document.getElementById("tab-logbrowser").classList.add("active");
+
+    loadLogBrowser();
+  }
+
+  function backToStatistics() {
+    switchTab("statistics");
+  }
+
+  function setLogCategory(cat) {
+    logBrowser.category = cat;
+    logBrowser.page = 1;
+    document.querySelectorAll(".lb-cat-btn").forEach(b => b.classList.toggle("active", b.dataset.cat === cat));
+    loadLogBrowser();
+  }
+
+  let _lbSearchDebounce = null;
+  function onLogBrowserSearchInput() {
+    clearTimeout(_lbSearchDebounce);
+    _lbSearchDebounce = setTimeout(() => {
+      logBrowser.search = document.getElementById("lb-search").value;
+      logBrowser.page = 1;
+      loadLogBrowser();
+    }, 300);
+  }
+
+  function goLogBrowserPage(p) {
+    logBrowser.page = p;
+    loadLogBrowser();
+  }
+
+  async function loadLogBrowser() {
+    const listEl = document.getElementById("lb-list");
+    listEl.innerHTML = '<div class="stat-empty">Loading…</div>';
+
+    const dateVal = document.getElementById("statsDate").value || new Date().toISOString().slice(0, 10);
+    const params = new URLSearchParams({
+      date: dateVal, service: logBrowser.key, category: logBrowser.category,
+      page: logBrowser.page, page_size: LB_PAGE_SIZE,
+    });
+    if (logBrowser.search) params.set("search", logBrowser.search);
+
+    try {
+      const res  = await fetch("/api/logs/browse?" + params.toString());
+      const data = await res.json();
+      logBrowser.total = data.total || 0;
+      renderLogBrowserRows(data.lines || []);
+      renderLogBrowserPagination();
+    } catch (e) {
+      listEl.innerHTML = '<div class="stat-empty" style="color:var(--danger)">Failed to load logs</div>';
+    }
+  }
+
+  function renderLogBrowserRows(lines) {
+    const listEl = document.getElementById("lb-list");
+    listEl.innerHTML = lines.length
+      ? lines.map(l =>
+          `<div class="stat-issue-row ${esc(l.level)}"><span class="t">${esc(l.time)}</span><span class="m">${esc(l.message)}</span></div>`
+        ).join('')
+      : '<div class="stat-empty">No matching log lines.</div>';
+  }
+
+  function renderLogBrowserPagination() {
+    const el = document.getElementById("lb-pagination");
+    const totalPages = Math.max(1, Math.ceil(logBrowser.total / LB_PAGE_SIZE));
+    if (logBrowser.page > totalPages) logBrowser.page = totalPages;
+    el.innerHTML = `
+      <button class="btn btn-outline" ${logBrowser.page <= 1 ? "disabled" : ""} onclick="goLogBrowserPage(${logBrowser.page - 1})">&laquo; Prev</button>
+      <span style="padding:0 10px;color:var(--text2);font-size:12px;">Page ${logBrowser.page} of ${totalPages} (${logBrowser.total} total)</span>
+      <button class="btn btn-outline" ${logBrowser.page >= totalPages ? "disabled" : ""} onclick="goLogBrowserPage(${logBrowser.page + 1})">Next &raquo;</button>
+    `;
   }
 
   // ═══════════════════════════════════════════════════

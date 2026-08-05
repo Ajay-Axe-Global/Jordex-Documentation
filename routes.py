@@ -38,6 +38,22 @@ VALID_SERVICES = {"arrival_notice", "invoice_carrier", "customs_docs",
 LOG_LINE_RE       = re.compile(r"^(\d{2}:\d{2}:\d{2}) \[(\w+)\] \[(\w+)\] (.*)$")
 SELF_TAG_PREFIX_RE = re.compile(r"^\[\w+\]\s*")
 
+# ── Category filters for the Statistics-tab log browser ────────────────
+# "errors" is handled separately (LEVEL in WARNING/ERROR); the rest match
+# against the message text of lines seen across the six services' logs.
+CATEGORY_PATTERNS = {
+    "extraction": re.compile(
+        r'gemini|extract|classif|doc_type|carrier detected|upgrading|downgrading|call 1|call 2',
+        re.IGNORECASE,
+    ),
+    "upload": re.compile(
+        r'upload|jordex search|search (primary|secondary)|skipping duplicate|'
+        r'already uploaded|re-uploading|searching for .* in jordex',
+        re.IGNORECASE,
+    ),
+    "unread": re.compile(r'unread|not found in jordex', re.IGNORECASE),
+}
+
 
 def _log_file_for_date(date_str: str) -> str:
     if date_str == date_cls.today().isoformat():
@@ -199,6 +215,63 @@ async def get_log_raw(
                 lines.append(line)
 
     return JSONResponse({"date": date_str, "service": service, "lines": lines[-limit:]})
+
+
+@router.get("/api/logs/browse")
+async def browse_logs(
+    date: Optional[str] = Query(None),
+    service: Optional[str] = Query(None),
+    category: str = Query("all"),
+    search: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    """
+    Paginated, filterable log browser backing the Statistics tab's
+    per-label full-page log view. Category and search are both applied
+    against the WHOLE day's log for that service BEFORE pagination, so
+    search covers the entire log, not just whatever page is on screen.
+    Newest lines first.
+    """
+    date_str = date or date_cls.today().isoformat()
+    path = _log_file_for_date(date_str)
+
+    cat_re      = CATEGORY_PATTERNS.get(category)
+    search_lower = search.lower().strip() if search else None
+
+    matches = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.rstrip("\n")
+                m = LOG_LINE_RE.match(line)
+                if not m:
+                    continue
+                ts, level, svc, msg = m.groups()
+                if service and svc != service:
+                    continue
+                if category == "errors":
+                    if level not in ("WARNING", "ERROR"):
+                        continue
+                elif cat_re and not cat_re.search(msg):
+                    continue
+                if search_lower and search_lower not in line.lower():
+                    continue
+                matches.append({
+                    "time": ts, "level": level, "service": svc,
+                    "message": SELF_TAG_PREFIX_RE.sub("", msg),
+                })
+
+    matches.reverse()  # newest first
+    total = len(matches)
+    start = (page - 1) * page_size
+    page_items = matches[start:start + page_size]
+
+    return JSONResponse({
+        "date": date_str, "service": service, "category": category,
+        "search": search or "", "total": total, "page": page,
+        "page_size": page_size, "lines": page_items,
+    })
 
 
 @router.get("/api/output")

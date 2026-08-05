@@ -118,6 +118,29 @@ class OutlookSession:
                 pass
         log.info(f"[{self.service_key}] Browser closed")
 
+    def hard_restart(self) -> Page:
+        """
+        Fully close and relaunch the browser for this label's Outlook
+        session, then log back in and land back on the mail UI.
+
+        Used when the page is frozen/unresponsive in a way page.reload()
+        and goto('about:blank') can't fix (e.g. a crashed/hung renderer
+        process — the underlying browser tab itself, not Outlook's DOM).
+        Reuses the same persistent profile_dir, so saved cookies usually
+        avoid a fresh MFA prompt. Mirrors JordexSession.hard_restart().
+        """
+        log.warning(f"[{self.service_key}] Hard restart: closing browser...")
+        try:
+            if self._context:
+                self._context.close()
+        except Exception as e:
+            log.warning(f"[{self.service_key}] hard_restart: error closing context: {e}")
+        self._context = None
+        self._page    = None
+
+        log.warning(f"[{self.service_key}] Hard restart: reopening browser...")
+        return self.start()
+
     @property
     def page(self) -> Page:
         return self._page

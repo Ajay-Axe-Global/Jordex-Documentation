@@ -774,18 +774,22 @@ def _maersk_text_fallback(text: str, containers: list) -> dict:
                     break
             break
 
+    is_star = bool(return_addr and "star container" in return_addr.lower())
+
     # Maersk default: if no haulage instruction ref found
     if not return_ref:
-        if return_addr and "star container" in return_addr.lower():
-            return_ref = "MAERSKSTACK"
-        else:
-            return_ref = "MAEMT"
+        return_ref = "MAERSKSTACK" if is_star else "MAEMT"
 
-    pickup_refs = [{"container_no": c, "reference": "", "address": pickup_addr} for c in containers]
+    # Pickup ref: normally blank in the text fallback (no Pin parsing here),
+    # except forced PCS when return is a Star Container depot — same rule
+    # as _maersk_clean_refs applies to the Gemini extraction path.
+    pickup_ref = "PCS" if is_star else ""
+
+    pickup_refs = [{"container_no": c, "reference": pickup_ref, "address": pickup_addr} for c in containers]
     return_refs = [{"container_no": c, "reference": return_ref, "address": return_addr} for c in containers]
 
     return {
-        "pickup": {"address": pickup_addr, "reference_mode": "per_container", "reference": "", "references": pickup_refs},
+        "pickup": {"address": pickup_addr, "reference_mode": "per_container", "reference": pickup_ref, "references": pickup_refs},
         "return": {"address": return_addr, "reference_mode": "per_container", "reference": "", "references": return_refs},
         "flag": "",
     }
@@ -967,8 +971,9 @@ def _apply_safety_net(scac: str, result: dict) -> dict:
         return result
 
     if scac == "MAEU":
-        # Pickup: only actual pin or ""
-        _maersk_clean_refs(pickup)
+        # Pickup: only actual pin or "" — except forced PCS when the
+        # return depot is a Star Container location (see _maersk_clean_refs).
+        _maersk_clean_refs(pickup, ret)
         # Return: default MAEMT if empty, MAERSKSTACK if Star Container
         _maersk_return_default(ret)
 
@@ -1020,16 +1025,35 @@ def _has_any_reference(section: dict) -> bool:
     return any(r.get("reference") for r in section.get("references", []))
 
 
-def _maersk_clean_refs(section: dict):
-    """Maersk pickup: only actual pin. Remove any fabricated defaults."""
-    bad = {"PCS", "MAEMT", "MAERSKSTACK", "PORTBASE", "NONE", "NULL"}
-    r = (section.get("reference") or "").strip().upper()
+def _maersk_clean_refs(pickup: dict, ret: dict):
+    """
+    Maersk pickup: only actual pin, or "" if blank — remove any fabricated
+    default (PCS/MAEMT/MAERSKSTACK/etc.) Gemini may have guessed.
+
+    EXCEPTION: if the return depot ("Empty Container Depot") is a "Star
+    Container" location, Maersk requires a Portbase (PCS) lookup for
+    pickup too — in that case "PCS" is the CORRECT value, not a fabricated
+    default, so it must be kept/forced rather than stripped.
+    Deterministic enforcement of the rule stated in CARRIER_PROMPTS["MAEU"]
+    — done here in code so it holds even if Gemini doesn't apply it itself.
+    """
+    is_star = "star container" in (ret.get("address") or "").lower()
+    bad = {"MAEMT", "MAERSKSTACK", "PORTBASE", "NONE", "NULL"}
+    if not is_star:
+        bad = bad | {"PCS"}
+
+    r = (pickup.get("reference") or "").strip().upper()
     if r in bad:
-        section["reference"] = ""
-    for ref in section.get("references", []):
+        pickup["reference"] = ""
+    for ref in pickup.get("references", []):
         r = (ref.get("reference") or "").strip().upper()
         if r in bad:
             ref["reference"] = ""
+
+    if is_star:
+        pickup["reference"] = "PCS"
+        for ref in pickup.get("references", []):
+            ref["reference"] = "PCS"
 
 
 def _maersk_return_default(section: dict):

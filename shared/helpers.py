@@ -276,18 +276,24 @@ def _download_image_attachment(page, att, temp_dir: str) -> str | None:
         return None
 
  
-def download_attachments_to_temp(page, max_retries: int = 2) -> list[str]:
+def download_attachments_to_temp(page, max_retries: int = 2) -> tuple[list[str], bool]:
     """
     ★ FIX 3 — Download all attachments with retry + menu dismissal.
- 
+
     Changes from original:
       - Retries each attachment up to `max_retries` times on failure
       - Presses Escape between retries to dismiss stale context menus
       - Checks page responsiveness before retrying
       - Returns partial results (files that DID download) instead of
         empty list when some fail
- 
-    Returns list of temp file paths (may be partial on failures).
+      - If the page is found genuinely frozen (both recovery stages in
+        recover_page() fail), stops trying MORE attachments immediately
+        instead of burning through retries on every remaining one, and
+        reports that back via page_stuck so the caller can salvage
+        whatever already downloaded, then fully restart the browser
+        rather than keep hammering a dead page.
+
+    Returns (temp file paths — may be partial on failures, page_stuck).
     """
     # Broaden container selector to catch 'av-container' (used for images)
     ctr = page.locator(
@@ -295,23 +301,24 @@ def download_attachments_to_temp(page, max_retries: int = 2) -> list[str]:
         "#ReadingPaneContainerId div[role='listbox'][aria-label='image attachments'],"
         "#ReadingPaneContainerId div[role='listbox'][aria-label='bijlagen'],"
         "#ReadingPaneContainerId div.av-container"
-        
+
     ).first
     try:
         ctr.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
     except Exception:
-        return []
- 
+        return [], False
+
     atts = ctr.locator("div[role='option']")
     att_count = atts.count()
- 
+
     if att_count == 0:
-        return []
- 
+        return [], False
+
     temp_dir = tempfile.mkdtemp(prefix="outlook_dl_")
     saved = []
     failed_names = []                                          # ★ FIX 3
- 
+    page_stuck = False
+
     for i in range(att_count):
         att = atts.nth(i)
         fname = _att_name(att)
@@ -335,6 +342,7 @@ def download_attachments_to_temp(page, max_retries: int = 2) -> list[str]:
                         if not recovered:
                             log.error("  Page frozen — aborting downloads")
                             failed_names.append(fname)
+                            page_stuck = True
                             break
  
                 att.hover()
@@ -394,12 +402,21 @@ def download_attachments_to_temp(page, max_retries: int = 2) -> list[str]:
         if not downloaded:                                     # ★ FIX 3
             failed_names.append(fname)
             log.error("  GAVE UP on: %s after %d attempts", fname, max_retries + 1)
- 
+
+        if page_stuck:
+            log.error(
+                "  Page is genuinely frozen — stopping this batch's downloads "
+                "(%d/%d attachments not attempted). Caller should salvage "
+                "already-downloaded files, then hard-restart the browser.",
+                att_count - i - 1, att_count,
+            )
+            break
+
     if failed_names:                                           # ★ FIX 3
         log.warning("  Download summary: %d OK, %d FAILED %s",
                      len(saved), len(failed_names), failed_names)
- 
-    return saved
+
+    return saved, page_stuck
  
 
 def _att_name(att) -> str:
@@ -429,10 +446,17 @@ def _file_md5(filepath: str) -> str:
     return h.hexdigest()
 
 
-def move_file_to_folder(tmp_path: str, dest_dir: str) -> str | None:
+def move_file_to_folder(tmp_path: str, dest_dir: str, copy: bool = False) -> str | None:
     """
-    Move a temp file to dest_dir with MD5 duplicate detection.
-    Returns the saved filename (or the existing filename if skipped as exact duplicate).
+    Move (or, if copy=True, copy) a temp file to dest_dir with MD5 duplicate
+    detection. Returns the saved filename (or the existing filename if
+    skipped as exact duplicate).
+
+    copy=True is used when the same source file must be filed into MULTIPLE
+    destination folders (e.g. one invoice PDF covering several MTD/SWB-NO
+    shipment references) — the source stays intact so later calls for the
+    other destinations can still read it. The original temp file is cleaned
+    up separately by cleanup_temp().
     """
     os.makedirs(dest_dir, exist_ok=True)
     tmp_md5 = _file_md5(tmp_path)
@@ -450,7 +474,10 @@ def move_file_to_folder(tmp_path: str, dest_dir: str) -> str | None:
         while os.path.exists(dest):
             dest = os.path.join(dest_dir, f"{b}_{c}{e}")
             c += 1
-    shutil.move(tmp_path, dest)
+    if copy:
+        shutil.copy2(tmp_path, dest)
+    else:
+        shutil.move(tmp_path, dest)
     log.info("    Saved: %s", dest)
     return os.path.basename(dest)
 
@@ -478,6 +505,18 @@ def _sanitize(name: str) -> str:
     return re.sub(r'[_\s]+', '_', c).strip('_. ')[:80]
 
 
+def sanitize_reference_for_path(ref: str) -> str:
+    """
+    Strip filesystem-unsafe characters from a reference before it's used as
+    a folder name. A garbled/invalid reference (e.g. containing "/") must
+    never silently create nested subdirectories via os.path.join — this is
+    a defense-in-depth backstop on top of is_valid_jordex_search_ref().
+    """
+    if not ref:
+        return ref
+    return _sanitize(ref)
+
+
 def subject_folder_fallback(subject: str) -> str:
     """Derive a folder name from the email subject when MBL extraction fails."""
     m = re.search(r'(OI\d{4,})', subject)
@@ -493,6 +532,40 @@ def subject_folder_fallback(subject: str) -> str:
     m = re.search(r'(JI-\d{4}-\d{5,})', subject)
     if m: return m.group(1)
     return _sanitize(subject)
+
+
+def extract_subject_mbl_ref(subject: str) -> str | None:
+    """
+    Extract a carrier MBL/reference number from the email subject.
+
+    Reliably matches the "{invoice_no} JORDEX {seq} {MBL_ref}" template used
+    in Hapag-Lloyd invoice subjects (e.g. "2512090300 JORDEX 001
+    HLCUBKK260512201" -> "HLCUBKK260512201"), and falls back to scanning for
+    any standalone MBL/SCAC-shaped token elsewhere in the subject.
+
+    Used as: (a) a fallback source when PDF extraction returns no reference
+    at all, and (b) an extra Jordex-search fallback tier tried after the
+    PDF-derived reference(s) fail to find a match. Never used to silently
+    override a validly-formatted PDF-derived reference — the document stays
+    the source of truth when it has one.
+    """
+    if not subject:
+        return None
+
+    m = re.search(r'\bJORDEX\s+\d{2,4}\s+([A-Z0-9]{8,})', subject, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # Generic fallback: only accept a token whose first 4 letters are a
+    # KNOWN carrier SCAC — otherwise this would false-positive on other
+    # document reference numbers embedded in the subject (e.g. an internal
+    # Jordex/customs doc code like "NLEC0030608" in a non-Hapag subject),
+    # which is not a shipment reference at all.
+    for token in re.findall(r'\b[A-Z]{4}[A-Z0-9]{6,}\b', subject.upper()):
+        if token[:4] in KNOWN_SCAC_PREFIXES and is_valid_jordex_search_ref(token):
+            return token
+
+    return None
 
 
 def normalize_oi_reference(raw: str) -> str:
@@ -684,6 +757,31 @@ def should_skip_multi_attachment(page, max_allowed: int = 1) -> bool:
 #  Mark email as UNREAD
 # ══════════════════════════════════════════════════════════════════════
 
+def _confirm_unread(outlook_page: Page, sel: str, conv_id: str, label: str) -> bool:
+    """
+    Verify a mark-unread action actually stuck, by checking the row's own
+    unread indicator (div.DLvHz — the same marker collect_unread() reads)
+    AFTER deselecting the row.
+
+    Selection/highlight can hide the indicator while the row is active, so
+    we press Escape first to drop selection before reading the DOM — this
+    avoids the false negatives the old "trust and never verify" approach
+    was written to avoid, without giving up verification entirely.
+    """
+    try:
+        outlook_page.keyboard.press("Escape")
+        outlook_page.wait_for_timeout(600)
+        row = outlook_page.locator(sel).first
+        if row.locator("div.DLvHz").count() > 0:
+            log.info("  Marked as UNREAD via %s (verified): %s", label, conv_id)
+            return True
+        log.warning("  %s did not stick (row still shows read) for %s", label, conv_id)
+        return False
+    except Exception as e:
+        log.warning("  Could not verify unread state via %s for %s: %s", label, conv_id, e)
+        return False
+
+
 def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
     """
     Mark an email as unread in Outlook without opening it.
@@ -691,6 +789,11 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
     Strategy order:
       1. Right-click row → Escape → Ctrl+U  (most reliable)
       2. Right-click → context menu → "Mark as unread"
+
+    Each strategy is verified via _confirm_unread() before returning True —
+    a keypress/click that silently no-ops (focus stolen, Outlook UI lag,
+    etc.) now falls through to the next strategy instead of being trusted
+    blind.
     """
     try:
         outlook_page.bring_to_front()
@@ -729,12 +832,8 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
             outlook_page.wait_for_timeout(300)
             outlook_page.keyboard.press("Control+u")
             outlook_page.wait_for_timeout(1000)
-            # Trust Ctrl+U if no exception. Do NOT verify via DOM —
-            # when the row is selected/highlighted Outlook temporarily
-            # hides the unread indicator, causing false negatives.
-            # Fallback strategies then UNDO the Ctrl+U by toggling back.
-            log.info("  Marked as UNREAD via Ctrl+U: %s", conv_id)
-            return True
+            if _confirm_unread(outlook_page, sel, conv_id, "Ctrl+U"):
+                return True
         except Exception as e:
             log.warning("  Ctrl+U strategy failed: %s", e)
             try:
@@ -757,8 +856,8 @@ def mark_as_unread(outlook_page: Page, conv_id: str) -> bool:
             if menu_item.is_visible(timeout=1500):
                 menu_item.click()
                 outlook_page.wait_for_timeout(500)
-                log.info("  Marked as UNREAD via right-click menu: %s", conv_id)
-                return True
+                if _confirm_unread(outlook_page, sel, conv_id, "right-click menu"):
+                    return True
             else:
                 outlook_page.keyboard.press("Escape")
                 outlook_page.wait_for_timeout(300)
@@ -785,24 +884,33 @@ def is_valid_jordex_search_ref(ref: str) -> bool:
       1. OI Number (starts with OI, OE, 0I, 01 followed by 4+ digits)
       2. MBL / SCAC (4 letters followed by alphanumeric, total length >= 10)
       3. Container No (4 letters followed by 7 digits)
+
+    Fully anchored + alnum-only: a reference containing ANY separator
+    (slash, space, hyphen, etc.) is rejected outright. This closes the
+    hole where a garbled Gemini extraction like "HLCU624W/683632" used to
+    pass this check (starts with 4 letters, len >= 10) and get searched
+    against Jordex's fuzzy search, which could match unrelated shipments.
     """
     import re
     if not ref:
         return False
     ref = str(ref).strip().upper()
-    
+
+    if not re.fullmatch(r'[A-Z0-9]+', ref):
+        return False
+
     # 1. OI Number
-    if re.match(r'^(OI|OE|0I|01)\d{4,}$', ref):
+    if re.fullmatch(r'(OI|OE|0I|01)\d{4,}', ref):
         return True
-        
+
     # 2. Container No (4 letters + 7 digits)
-    if re.match(r'^[A-Z]{4}\d{7}$', ref):
+    if re.fullmatch(r'[A-Z]{4}\d{7}', ref):
         return True
-        
+
     # 3. MBL / SCAC format (4 letters + alphanumerics, len >= 10)
     if re.match(r'^[A-Z]{4}', ref) and len(ref) >= 10:
         return True
-        
+
     return False
 
 def search_jordex_with_fallback(
@@ -810,6 +918,7 @@ def search_jordex_with_fallback(
     outlook_page,
     primary_ref: str,
     secondary_ref: str = None,
+    subject_ref: str = None,
     conv_id: str = None,
     tracker=None,
     cat: str = "",
@@ -827,6 +936,12 @@ def search_jordex_with_fallback(
     jordex_session (optional): passed through to search_fn so it can
     hard-restart the browser (close/reopen/relogin) if the page is found
     to be genuinely frozen rather than just showing an update popup.
+
+    subject_ref (optional): a reference parsed from the email subject
+    (see extract_subject_mbl_ref). Tried LAST, only after primary/secondary
+    (document-derived) refs fail to find a row — the document stays the
+    source of truth; the subject is only a fallback net for when Gemini's
+    extraction was null or wrong.
 
     Returns (success, ref, rows_found, jordex_page) — always returns the
     current live page, since a hard restart inside search_fn replaces it.
@@ -859,6 +974,19 @@ def search_jordex_with_fallback(
                 go_back(jordex_page)           # ★ go back so while loop can re-open
                 return True, secondary_ref, rows_found, jordex_page
             log.warning("[%s] SECONDARY not found: '%s'", service_key, secondary_ref)
+
+    if subject_ref and subject_ref not in (primary_ref, secondary_ref):
+        if not is_valid_jordex_search_ref(subject_ref):
+            log.warning("[%s] SUBJECT ref '%s' has invalid format — skipping search", service_key, subject_ref)
+        else:
+            tried_refs.append(subject_ref)
+            log.info("[%s] Jordex search SUBJECT (fallback): '%s'", service_key, subject_ref)
+            success, rows_found, jordex_page = search_fn(jordex_page, subject_ref, row_index=0, session=jordex_session)
+            if success and rows_found > 0:
+                log.info("[%s] SUBJECT ref found: '%s'", service_key, subject_ref)
+                go_back(jordex_page)           # ★ go back so while loop can re-open
+                return True, subject_ref, rows_found, jordex_page
+            log.warning("[%s] SUBJECT ref not found: '%s'", service_key, subject_ref)
 
     if tried_refs:
         tried = " / ".join(tried_refs)

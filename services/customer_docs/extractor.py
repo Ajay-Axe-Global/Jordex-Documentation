@@ -52,11 +52,27 @@ _CARRIER_TO_SCAC = {
     "HMM":                  "HDMU",
     "HYUNDAI":              "HDMU",
     "COSCO":                "COSU",
-    "PIL":                  "PCIU",
+
     "WAN HAI":              "WHLC",
-    "HAMBURG SUD":          "SUDU",
-    "HAMBURG SÜD":          "SUDU",
+    
 }
+
+# Flat, human-readable list of the known ocean carriers above — injected
+# into the classification prompt (GATE 0) so Gemini checks the issuer
+# against a concrete closed list instead of a vague "actual ocean carrier"
+# instruction. Single source of truth: derived from _CARRIER_TO_SCAC so
+# the prompt can never drift out of sync with the Python-side carrier map.
+#
+# Includes each carrier's SCAC code alongside its name (e.g. "MAERSK
+# (MAEU)") — some carrier documents identify themselves in the masthead
+# ONLY by SCAC code (e.g. a Maersk waybill header reading "SCAC MAEU"
+# with the word "Maersk" appearing nowhere near the logo/title, only
+# buried in fine print). A name-only list caused GATE 0 to fail on those
+# documents and default them to HOUSE BILL OF LADING even when the
+# Consignee was genuinely Jordex.
+_KNOWN_OCEAN_CARRIERS_LIST = ", ".join(
+    f"{name} ({scac})" for name, scac in sorted(_CARRIER_TO_SCAC.items())
+)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -217,20 +233,47 @@ A document IS a Bill of Lading if it has:
 
 IMPORTANT: "SEA WAYBILL" IS a type of Bill of Lading. Do NOT skip it.
 
+── GATE 0 — IDENTIFY THE ISSUER FIRST (do this BEFORE reading the Consignee) ──
+A Master Bill of Lading can ONLY be issued by one of these actual ocean
+carriers — this is a CLOSED list, there are no others:
+  <<CARRIER_LIST>>
+Look at the carrier logo, letterhead, and any "Carrier" field on the page.
+  - If the issuer is NOT one of the carriers listed above (an unfamiliar
+    company name, a freight forwarder, an NVOCC, a trading company, or
+    any name you do not clearly recognize from that list) — the document
+    CANNOT be a Master Bill of Lading, no matter how official, formal, or
+    "master"-looking its layout is.
+    → It MUST be HOUSE BILL OF LADING. Skip Rule A entirely; go to Rule B.
+  - Do NOT infer carrier identity from formatting, letterhead elegance, or
+    the words "Bill of Lading"/"Multimodal Transport" in the title — a
+    forwarder's own house bill often looks just as formal as a carrier's
+    master bill.
+  - If you cannot clearly match the issuer to one of the listed carriers,
+    default to HOUSE BILL OF LADING.
+
 RULE A — MASTER BILL OF LADING (MBL):
-  The CONSIGNEE box MUST contain "JORDEX" (any variation) as the primary consignee.
+  BOTH conditions are required:
+    1. GATE 0 passes — the issuer IS one of the listed ocean carriers.
+    2. The CONSIGNEE box MUST contain "JORDEX" (any variation) as the
+       primary consignee.
   → doc_type = "MASTER BILL OF LADING"
+  Note EDGE CASE :  Sometime Carrier logo there but consginee not Jordex .if carrier matchs then Thats MBL.
 
 RULE B — HOUSE BILL OF LADING (HBL):
-  The CONSIGNEE box is any OTHER company (NOT JORDEX).
+  GATE 0 fails (issuer is not a recognized ocean carrier), OR the
+  CONSIGNEE box is any company other than JORDEX.
   → doc_type = "HOUSE BILL OF LADING"
 
 CRITICAL CONSIGNEE RULES:
   - "FOR DELIVERY, PLEASE APPLY TO" is NOT the consignee.
   - JORDEX in Notify Party, Delivery Agent, or anywhere else does NOT count as the Consignee.
-  - ONLY the CONSIGNEE box determines MBL vs HBL.
+  - Read the CONSIGNEE box independently from the NOTIFY PARTY box — they
+    frequently show the SAME company name right next to each other. Do
+    not let the Notify Party's presence influence your reading of the
+    Consignee box.
+  - ONLY the CONSIGNEE box and GATE 0's issuer check determine MBL vs HBL.
   - EXCEPTION FOR LOGOS/CARRIERS: A prominent carrier/NVOCC logo (e.g. BEE LOGISTICS, Hapag-Lloyd, ZIM, etc.) at the top does NOT make it an MBL. If the Consignee is NOT Jordex, you MUST classify it as a HOUSE BILL OF LADING, regardless of the logo.
-  - EXCEPTION FOR FORWARDERS: If the document is issued by a Freight Forwarder or NVOCC, it is ALWAYS a HOUSE BILL OF LADING. Master Bills are ONLY issued by actual ocean carriers (MSC, Maersk, etc.).
+  - EXCEPTION FOR FORWARDERS: If the document is issued by a Freight Forwarder or NVOCC, it is ALWAYS a HOUSE BILL OF LADING. Master Bills are ONLY issued by actual ocean carriers — see GATE 0.
     Known freight forwarders that ALWAYS produce HBLs (never MBLs):
     "GREEN LOGISTICS", "GREENX LOGISTICS", "GREENX LOGISTICS CO.", "GREENX LOGISTICS CO., LTD",
     "MRF INTERNATIONAL FORWARDING", "KUEHNE+NAGEL", "FIATA", "BEE LOGISTICS".
@@ -289,7 +332,7 @@ OUTPUT — Return ONLY valid JSON. No markdown. No backticks.
   "reference_number": "BL number / booking ref / invoice number or null",
   "container_no": "first container number or null",
   "doc_title": "the main header/title text from the document, or null",
-  "carrier_name": "the shipping line / ocean carrier name from the logo or header, e.g. CMA CGM, MAERSK, MSC, or null if not a BL",
+  "carrier_name": "the ocean carrier name OR its SCAC code, whichever is actually printed/visible on the document — some carriers only show the SCAC code (e.g. 'SCAC MAEU' in the header) with no spelled-out name nearby. ONLY if it matches one of the carriers/codes listed in GATE 0 (e.g. CMA CGM, MAERSK, MAEU, MSC, MEDU), otherwise null — do NOT put a forwarder/NVOCC/unrecognized company name in this field",
   "confidence": "high" or "medium" or "low"
 }
 
@@ -300,6 +343,14 @@ CRITICAL:
 - Freetime/Detention/Demurrage notices are ADDITIONAL FILES, NOT ARRIVAL NOTICE.
 - For ADDITIONAL FILES: still extract the Bill of Lading reference_number if visible.
 - Always extract doc_title regardless of doc_type."""
+
+# Inject the closed carrier list (GATE 0) — kept as a post-hoc .replace()
+# rather than an f-string/`.format()` because the prompt's JSON output
+# template above contains literal `{`/`}` braces that would otherwise need
+# escaping.
+CUSTOMER_DOC_CLASSIFY_PROMPT = CUSTOMER_DOC_CLASSIFY_PROMPT.replace(
+    "<<CARRIER_LIST>>", _KNOWN_OCEAN_CARRIERS_LIST
+)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -676,6 +727,39 @@ def classify_customer_doc(pdf_path: str, gemini_model=None) -> dict:
             carrier_name, doc_title,
         )
         doc_type = "ADDITIONAL FILES"
+
+    # ── Downgrade safety net: MBL requires a real ocean carrier ──────
+    # Master Bills can ONLY be issued by an actual ocean carrier (never a
+    # forwarder/NVOCC/trading company) — mirrors GATE 0 in the prompt.
+    # If Gemini classified this straight as MBL but the carrier_name it
+    # extracted doesn't match any carrier in _CARRIER_TO_SCAC (or no
+    # carrier_name was extracted at all), it cannot legitimately be a
+    # Master Bill — force it back to HOUSE BILL OF LADING. This enforces
+    # the rule deterministically instead of trusting Gemini to have
+    # followed GATE 0 correctly.
+    # A valid SCAC-prefixed reference number counts as alternate proof of
+    # carrier issuance (Gemini sometimes reads the ref correctly but
+    # misses the logo/carrier_name), so it exempts a doc from downgrade.
+    # carrier_name is matched against BOTH the full name and the SCAC code
+    # (e.g. "MAEU") — some carriers (Maersk in particular) only print the
+    # SCAC code in the masthead ("SCAC MAEU"), never the spelled-out name,
+    # so a name-only check was wrongly downgrading genuine Maersk MBLs.
+    if doc_type == "MASTER BILL OF LADING":
+        _matched_carrier = bool(carrier_name and (
+            any(k in carrier_name for k in _CARRIER_TO_SCAC) or
+            any(v in carrier_name for v in _CARRIER_TO_SCAC.values())
+        ))
+        _matched_scac_ref = bool(
+            reference_number and reference_number[:4].upper() in _KNOWN_SCAC_PREFIXES
+        )
+        if not _matched_carrier and not _matched_scac_ref:
+            log.info(
+                "  doc_type=MASTER BILL OF LADING but carrier_name='%s' matches no known "
+                "ocean carrier and ref='%s' has no known SCAC prefix → downgrading to "
+                "HOUSE BILL OF LADING",
+                carrier_name, reference_number,
+            )
+            doc_type = "HOUSE BILL OF LADING"
 
     # ── Secondary MBL check via SCAC prefix ──────────────────────────
     # SKIP this check if the document was issued by a known forwarder/NVOCC.

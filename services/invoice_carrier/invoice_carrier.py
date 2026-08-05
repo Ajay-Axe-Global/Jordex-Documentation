@@ -17,6 +17,7 @@ from shared.helpers import (
     download_attachments_to_temp, move_file_to_folder, cleanup_temp,
     subject_folder_fallback, normalize_oi_reference,
     mark_as_unread, search_jordex_with_fallback,
+    extract_subject_mbl_ref, sanitize_reference_for_path,
 )
 from extractor import extract_oi_from_subject
 from outlook.session import OutlookSession
@@ -41,10 +42,12 @@ class InvoiceCarrierService:
         self._processed = 0
         self._uploaded  = 0
         self.last_run   = None
+        self._outlook_stuck = False
 
     def start(self):
         if self.status == "running":
             return {"ok": False, "message": "Already running"}
+        self.error = None
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"svc-{SERVICE_KEY}")
         self._thread.start()
@@ -89,6 +92,19 @@ class InvoiceCarrierService:
                 if items:
                     merged = self._merge_by_folder(items)
                     jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, merged, jordex_session)
+
+                if self._outlook_stuck:
+                    log.warning(f"[{SERVICE_KEY}] Outlook page was stuck — hard-restarting Outlook browser")
+                    try:
+                        outlook_page = outlook_session.hard_restart()
+                        log.info(f"[{SERVICE_KEY}] Outlook hard restart SUCCEEDED")
+                    except Exception as e:
+                        log.error(f"[{SERVICE_KEY}] Outlook hard restart FAILED: {e}", exc_info=True)
+                        self.error  = f"Outlook hard restart failed: {e}"
+                        self.status = "error"
+                        break
+                    self._outlook_stuck = False
+
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -126,78 +142,114 @@ class InvoiceCarrierService:
                 continue
 
             subject    = get_subject(page) or cid[:40]
-            temp_files = download_attachments_to_temp(page)
+            temp_files, page_stuck = download_attachments_to_temp(page)
+            if page_stuck:
+                # Outlook page is genuinely frozen — finish this email (if
+                # anything was already downloaded), then stop the batch.
+                # _run() hard-restarts the Outlook browser afterward.
+                self._outlook_stuck = True
+                log.warning(f"[{SERVICE_KEY}] Outlook page stuck — finishing this email, then stopping batch early")
 
             if not temp_files:
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "no_attachment")
+                if page_stuck:
+                    break
                 continue
 
             pdf_files   = [f for f in temp_files if f.lower().endswith(".pdf")]
             folder_groups: dict[str, list] = {}
-            duplicate_folder = None
+            duplicate_folders = []
             requeued_any = False
 
+            subject_ref = extract_subject_mbl_ref(subject)
+
             for pdf_path in pdf_files:
-                extraction  = extract_invoice_carrier(pdf_path, gemini_model=gemini_model)
-                folder_name = extraction.get("reference")
+                extraction = extract_invoice_carrier(pdf_path, gemini_model=gemini_model)
 
-                # Normalize OI reference (fix 0/O confusion from LLM)
-                if folder_name:
-                    folder_name = normalize_oi_reference(folder_name)
-                    extraction["reference"] = folder_name
+                # Normalize OI references (fix 0/O confusion from LLM), one PDF
+                # can name MULTIPLE shipment references (e.g. a Hapag-Lloyd
+                # invoice covering 2-3 MTD/SWB-NO shipments) — process every one.
+                # normalize_oi_reference() is a safe no-op for non-OI refs
+                # (e.g. MBL numbers) — applied unconditionally, same as before.
+                references = [
+                    normalize_oi_reference(r) for r in (extraction.get("references") or [])
+                ]
+                extraction["references"] = references
+                extraction["reference"]  = references[0] if references else None
+                extraction["subject_ref"] = subject_ref
 
-                if not folder_name:
+                # Audit-only cross-check: the document stays the source of
+                # truth (including when it has more refs than the subject
+                # shows), this only flags disagreement for manual review.
+                if references and subject_ref and subject_ref not in references:
+                    extraction["flag"] = extraction.get("flag") or "reference_mismatch"
+                    log.warning(
+                        f"[{SERVICE_KEY}] Reference mismatch: doc={references} subject='{subject_ref}'"
+                    )
+
+                if not references:
                     oi = extract_oi_from_subject(subject)
-                    folder_name = normalize_oi_reference(oi) if oi else subject_folder_fallback(subject)
+                    if oi:
+                        references = [normalize_oi_reference(oi)]
+                    elif subject_ref:
+                        references = [subject_ref]
+                    else:
+                        references = [subject_folder_fallback(subject)]
+
+                # Sanitize every candidate folder name — a reference that
+                # slips through with a path separator (e.g. a garbled
+                # "624W/683632") must never create a nested subdirectory.
+                references = [sanitize_reference_for_path(r) for r in references if r]
 
                 inv_no = extraction.get("invoice_no")
 
-                # Has this exact invoice_no already been downloaded before for this folder?
-                res_path = os.path.join(base, folder_name, "result.json")
-                already_downloaded = False
-                if os.path.exists(res_path) and inv_no:
-                    try:
-                        with open(res_path) as f:
-                            old = json.load(f)
-                        existing = [d.get("invoice_no") for d in (old if isinstance(old, list) else [old])]
-                        already_downloaded = inv_no in existing
-                    except Exception:
-                        pass
+                for folder_name in references:
+                    # Has this exact invoice_no already been downloaded before for this folder?
+                    res_path = os.path.join(base, folder_name, "result.json")
+                    already_downloaded = False
+                    if os.path.exists(res_path) and inv_no:
+                        try:
+                            with open(res_path) as f:
+                                old = json.load(f)
+                            existing = [d.get("invoice_no") for d in (old if isinstance(old, list) else [old])]
+                            already_downloaded = inv_no in existing
+                        except Exception:
+                            pass
 
-                if already_downloaded:
-                    # Only a TRUE duplicate if it actually reached Jordex. Checking local
-                    # disk alone can't tell "already uploaded" apart from "downloaded but
-                    # the upload step never ran" (crash, browser restart, etc.) — the
-                    # latter must still be pushed to Jordex, not skipped forever.
-                    if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name):
-                        log.info(f"[{SERVICE_KEY}] Duplicate invoice {inv_no} for '{folder_name}' — already uploaded, skipping")
-                        duplicate_folder = folder_name
-                    else:
-                        log.warning(
-                            f"[{SERVICE_KEY}] Invoice {inv_no} for '{folder_name}' was downloaded "
-                            f"before but never reached Jordex — re-queuing for upload (no re-download)"
-                        )
-                        final_dir = os.path.join(base, folder_name)
-                        existing_files = sorted(
-                            f for f in os.listdir(final_dir) if f.lower().endswith(".pdf")
-                        ) if os.path.isdir(final_dir) else []
-                        tracker.mark(CAT, cid, subject, folder_name, existing_files, "downloaded",
-                                     mbl=folder_name, secondary_ref=extraction.get("secondary_ref"))
-                        self._processed += 1
-                        processed_items.append({
-                            "conv_id":       cid,
-                            "cat":           CAT,
-                            "folder_path":   final_dir,
-                            "folder_name":   folder_name,
-                            "mbl":           folder_name,
-                            "secondary_ref": extraction.get("secondary_ref"),
-                        })
-                        requeued_any = True
-                    continue
+                    if already_downloaded:
+                        # Only a TRUE duplicate if it actually reached Jordex. Checking local
+                        # disk alone can't tell "already uploaded" apart from "downloaded but
+                        # the upload step never ran" (crash, browser restart, etc.) — the
+                        # latter must still be pushed to Jordex, not skipped forever.
+                        if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name):
+                            log.info(f"[{SERVICE_KEY}] Duplicate invoice {inv_no} for '{folder_name}' — already uploaded, skipping")
+                            duplicate_folders.append(folder_name)
+                        else:
+                            log.warning(
+                                f"[{SERVICE_KEY}] Invoice {inv_no} for '{folder_name}' was downloaded "
+                                f"before but never reached Jordex — re-queuing for upload (no re-download)"
+                            )
+                            final_dir = os.path.join(base, folder_name)
+                            existing_files = sorted(
+                                f for f in os.listdir(final_dir) if f.lower().endswith(".pdf")
+                            ) if os.path.isdir(final_dir) else []
+                            tracker.mark(CAT, cid, subject, folder_name, existing_files, "downloaded",
+                                         mbl=folder_name, secondary_ref=extraction.get("secondary_ref"),
+                                         subject_ref=subject_ref)
+                            self._processed += 1
+                            processed_items.append({
+                                "conv_id":       cid,
+                                "cat":           CAT,
+                                "folder_path":   final_dir,
+                                "folder_name":   folder_name,
+                                "mbl":           folder_name,
+                                "secondary_ref": extraction.get("secondary_ref"),
+                                "subject_ref":   subject_ref,
+                            })
+                            requeued_any = True
+                        continue
 
-                if folder_name not in folder_groups:
-                    folder_groups[folder_name] = []
-                folder_groups[folder_name].append({"extraction": extraction, "pdf_path": pdf_path})
+                    folder_groups.setdefault(folder_name, []).append({"extraction": extraction, "pdf_path": pdf_path})
 
             for folder_name, items in folder_groups.items():
                 final_dir   = os.path.join(base, folder_name)
@@ -206,7 +258,11 @@ class InvoiceCarrierService:
                 extractions = []
 
                 for item in items:
-                    saved = move_file_to_folder(item["pdf_path"], final_dir)
+                    # copy=True: the same source PDF may need to be filed into
+                    # several different reference folders when one invoice
+                    # covers multiple shipments — the temp original is cleaned
+                    # up afterward by cleanup_temp() regardless.
+                    saved = move_file_to_folder(item["pdf_path"], final_dir, copy=True)
                     if saved: saved_files.append(saved)
                     ext = item["extraction"]
                     if ext:
@@ -231,7 +287,8 @@ class InvoiceCarrierService:
                     mbl_val = folder_name
                     last_ext = extractions[-1] if extractions else {}
                     sec_ref = last_ext.get("secondary_ref")
-                    tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", mbl=mbl_val, secondary_ref=sec_ref)
+                    tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", mbl=mbl_val,
+                                 secondary_ref=sec_ref, subject_ref=subject_ref)
                     self._processed += 1
                     processed_items.append({
                         "conv_id":       cid,
@@ -240,12 +297,17 @@ class InvoiceCarrierService:
                         "folder_name":   folder_name,
                         "mbl":           mbl_val,
                         "secondary_ref": sec_ref,
+                        "subject_ref":   subject_ref,
                     })
 
-            if not folder_groups and duplicate_folder and not requeued_any:
-                tracker.mark(CAT, cid, subject, duplicate_folder, [], "skipped_duplicate")
+            if not folder_groups and duplicate_folders and not requeued_any:
+                tracker.mark(CAT, cid, subject, duplicate_folders[0], [], "skipped_duplicate",
+                             all_duplicate_folders=duplicate_folders)
 
             cleanup_temp(temp_files)
+
+            if page_stuck:
+                break
 
         return processed_items
 
@@ -268,11 +330,14 @@ class InvoiceCarrierService:
                     "folder_name":   key,
                     "mbl":           item.get("mbl"),
                     "secondary_ref": item.get("secondary_ref"),
+                    "subject_ref":   item.get("subject_ref"),
                 }
             else:
                 grouped[key]["conv_ids"].append(item["conv_id"])
                 if item.get("secondary_ref"):
                     grouped[key]["secondary_ref"] = item["secondary_ref"]
+                if item.get("subject_ref"):
+                    grouped[key]["subject_ref"] = item["subject_ref"]
         return list(grouped.values())
 
    
@@ -337,6 +402,7 @@ class InvoiceCarrierService:
                 outlook_page=outlook_page,
                 primary_ref=query,
                 secondary_ref=item.get("secondary_ref"),
+                subject_ref=item.get("subject_ref"),
                 conv_id=conv_ids[0],
                 tracker=tracker,
                 cat=CAT,

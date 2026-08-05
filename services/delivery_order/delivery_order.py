@@ -115,10 +115,12 @@ class DeliveryOrderService:
         self._processed = 0
         self._uploaded  = 0
         self.last_run   = None
+        self._outlook_stuck = False
 
     def start(self):
         if self.status == "running":
             return {"ok": False, "message": "Already running"}
+        self.error = None
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"svc-{SERVICE_KEY}")
         self._thread.start()
@@ -165,6 +167,19 @@ class DeliveryOrderService:
                 items = self._process_batch(outlook_page, tracker, pw=pw)
                 if items:
                     jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
+
+                if self._outlook_stuck:
+                    log.warning(f"[{SERVICE_KEY}] Outlook page was stuck — hard-restarting Outlook browser")
+                    try:
+                        outlook_page = outlook_session.hard_restart()
+                        log.info(f"[{SERVICE_KEY}] Outlook hard restart SUCCEEDED")
+                    except Exception as e:
+                        log.error(f"[{SERVICE_KEY}] Outlook hard restart FAILED: {e}", exc_info=True)
+                        self.error  = f"Outlook hard restart failed: {e}"
+                        self.status = "error"
+                        break
+                    self._outlook_stuck = False
+
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -206,10 +221,18 @@ class DeliveryOrderService:
                 continue
 
             subject    = get_subject(page) or cid[:40]
-            temp_files = download_attachments_to_temp(page)
+            temp_files, page_stuck = download_attachments_to_temp(page)
+            if page_stuck:
+                # Outlook page is genuinely frozen — finish this email (if
+                # anything was already downloaded), then stop the batch.
+                # _run() hard-restarts the Outlook browser afterward.
+                self._outlook_stuck = True
+                log.warning(f"[{SERVICE_KEY}] Outlook page stuck — finishing this email, then stopping batch early")
 
             if not temp_files:
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "no_attachment")
+                if page_stuck:
+                    break
                 continue
 
             pdf_files = [f for f in temp_files if f.lower().endswith(".pdf")]
@@ -237,6 +260,9 @@ class DeliveryOrderService:
             else:
                 cleanup_temp(temp_files)
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "failed")
+
+            if page_stuck:
+                break
 
         return processed_items
     def _merge_extraction(self, existing: dict, new_ext: dict) -> dict:

@@ -24,24 +24,27 @@ INVOICE_CARRIER_PROMPT = """You are a logistics document parser. This is an INVO
 Return ONLY a valid JSON object (no markdown, no backticks, no extra text):
 
 {
-  "reference": "the primary reference number (B/L, Container, or OI number), or null",
+  "references": ["one or more reference numbers (B/L, Container, OI number, or MTD/SWB reference)"] or [],
   "secondary_ref": "the secondary reference. For Hapag-Lloyd, extract SHIPMENT no (e.g. 13089204) else Container. For others, extract Container. Or null.",
   "invoice_no": "the invoice number printed on the document, or null",
   "carrier_name": "the name of the shipping line or carrier (e.g. CMA CGM), or null",
   "carrier_code": "the 4-letter SCAC carrier code inferred from carrier name or logo (e.g. HLCU, MSKU, CMAU, PNKG), or null"
 }
 
-RULES FOR reference:
-1. PRIORITY 1 (HIGHEST) — OI or OE Number. Look for fields labeled "Your-Reference", "Our Ref", "Reference", or anywhere for a string starting with "OI" or "OE" followed by 5+ digits (e.g., OI2615762). If found, MUST use it.
-2. PRIORITY 2 — B/L Number / Bill of Lading No. Only if NO OI/OE number exists. Usually has carrier prefix + digits.
-3. PRIORITY 3 — Container Number. Exactly 4 uppercase letters + 7 digits.
-4. If the document is from CMA CGM and the B/L number is exactly 10 letters/digits (e.g., VLN0150979), prepend 'CMDU'.
-5. Extract exactly as printed, removing spaces.
-6. Do NOT extract short internal carrier references (like '23461314') as the reference, EXCEPT for Hapag-Lloyd SHIPMENT numbers which go to secondary_ref.
+RULES FOR references:
+1. PRIORITY 1 (HIGHEST) — OI or OE Number. Look for fields labeled "Your-Reference", "Our Ref", "Reference", or anywhere for a string starting with "OI" or "OE" followed by 5+ digits (e.g., OI2615762). If found, this is the ONLY entry in references.
+2. PRIORITY 2 — Hapag-Lloyd "SWB-NO." / "REFERENCES: SHIPPER (MTD)" block. This block can list TWO OR THREE separate MTD reference numbers (e.g. HLCUNG12606TDDM2, HLCUNG12606AUVB6, HLCUNG12606TDDL1) — one invoice can cover multiple shipments. If this block is present, return EVERY reference listed in it as its own separate array entry. Do NOT pick just one and do NOT merge them together.
+3. PRIORITY 3 — B/L Number / Bill of Lading No. Only if NO OI/OE number and NO SWB-NO/REFERENCES block exists. Usually has carrier prefix + digits. Single entry.
+4. PRIORITY 4 — Container Number. Exactly 4 uppercase letters + 7 digits. Single entry.
+5. If the document is from CMA CGM and the B/L number is exactly 10 letters/digits (e.g., VLN0150979), prepend 'CMDU'.
+6. Extract exactly as printed, removing spaces. Each reference must be PURE ALPHANUMERIC — never include "/", "-", spaces, or any other punctuation inside a single reference. If you see what looks like two different codes near each other (e.g. a shipment code next to an unrelated numeric code), they are almost always two DIFFERENT fields, not one reference — do not concatenate them into a single string. If you are not confident a piece of text is a real shipment/B/L/container reference, leave it out of the array rather than guessing.
+7. Do NOT extract short internal carrier references (like '23461314'), charge/line-item codes, dates, or amounts as a reference, EXCEPT for Hapag-Lloyd SHIPMENT numbers which go to secondary_ref, not references.
+8. If nothing on the document qualifies as a reference, return an empty array — do not invent one.
 
 RULES FOR secondary_ref:
 1. If carrier is Hapag-Lloyd: Extract the "SHIPMENT" number (e.g. 13089204) if it exists. If not, extract a Container Number.
 2. For all other carriers: Extract a Container Number.
+3. Must be a single pure-alphanumeric value, same punctuation rule as references.
 
 RULES FOR invoice_no:
 1. Look for fields labeled "Invoice No", "Invoice Number", "Document No", "Inv. No.", "Factuur", "Rechnung", etc.
@@ -115,14 +118,22 @@ def _keyword_fallback(pdf_path: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 def extract_invoice_carrier(pdf_path: str, gemini_model=None) -> dict:
+    """
+    Returns a dict with `references` — a LIST of shipment references, since
+    one Hapag-Lloyd invoice can cover multiple MTD/SWB-NO shipments (see
+    PRIORITY 2 in INVOICE_CARRIER_PROMPT). `reference` is kept as
+    `references[0]` for callers that only care about a single value.
+    """
     log.info(f"  Extracting Invoice Carrier from {os.path.basename(pdf_path)}")
 
     result = {
         "doc_type":     "invoice_carrier",
+        "references":   [],
         "reference":    None,
         "secondary_ref": None,
         "invoice_no":   None,
         "carrier_name": None,
+        "carrier_code": None,
         "source_file":  os.path.basename(pdf_path),
         "extracted_at": datetime.now().isoformat(),
         "flag":         None,
@@ -138,7 +149,7 @@ def extract_invoice_carrier(pdf_path: str, gemini_model=None) -> dict:
                     {"mime_type": "application/pdf", "data": base64.b64encode(pdf_bytes).decode()},
                     INVOICE_CARRIER_PROMPT,
                 ],
-                generation_config={"temperature": 0.0, "max_output_tokens": 150},
+                generation_config={"temperature": 0.0, "max_output_tokens": 200},
             )
 
             raw = resp.text.strip()
@@ -146,48 +157,76 @@ def extract_invoice_carrier(pdf_path: str, gemini_model=None) -> dict:
             raw = re.sub(r'\s*```$', '', raw)
             parsed = json.loads(raw)
 
-            reference    = (parsed.get("reference") or "").strip().upper() or None
+            raw_refs = parsed.get("references")
+            if raw_refs is None:
+                # Defensive: model returned the old singular "reference" key.
+                single = parsed.get("reference")
+                raw_refs = [single] if single else []
+            if not isinstance(raw_refs, list):
+                raw_refs = [raw_refs]
+
             secondary_ref = (parsed.get("secondary_ref") or "").strip().upper() or None
-            invoice_no   = (parsed.get("invoice_no") or "").strip() or None
-            carrier_name = (parsed.get("carrier_name") or "").strip() or None
-            carrier_code = (parsed.get("carrier_code") or "").strip() or None
+            invoice_no    = (parsed.get("invoice_no") or "").strip() or None
+            carrier_name  = (parsed.get("carrier_name") or "").strip() or None
+            carrier_code  = (parsed.get("carrier_code") or "").strip() or None
 
-            # OCR Correction for OI numbers (e.g. 012618725 -> OI2618725)
-            if reference and re.match(r'^(01|0I|O1)\d{5,}$', reference):
-                old_ref = reference
-                reference = "OI" + reference[2:]
-                log.info(f"  Invoice OCR Correction: {old_ref} -> {reference}")
-
-            # Resolve carrier code
             resolved_scac = resolve_carrier_code(carrier_name, carrier_code)
 
-            # Prepend SCAC if reference is a B/L (not an OI/OE number)
-            if reference and resolved_scac and not reference.startswith("OI") and not reference.startswith("OE"):
-                old_ref = reference
-                reference = ensure_scac_prefix(reference, resolved_scac)
-                if reference != old_ref:
-                    log.info("  Invoice Prepended SCAC %s: %s → %s", resolved_scac, old_ref, reference)
+            references = []
+            for r in raw_refs:
+                r = (r or "").strip().upper()
+                if not r:
+                    continue
+                r = re.sub(r'\s+', '', r)
 
-            result["reference"]    = reference
+                # OCR Correction for OI numbers (e.g. 012618725 -> OI2618725)
+                if re.match(r'^(01|0I|O1)\d{5,}$', r):
+                    old_r = r
+                    r = "OI" + r[2:]
+                    log.info(f"  Invoice OCR Correction: {old_r} -> {r}")
+
+                # Reject anything that isn't pure alphanumeric — a garbled
+                # extraction like "624W/683632" must never reach a Jordex
+                # search as a "valid-looking" reference.
+                if not re.fullmatch(r'[A-Z0-9]+', r):
+                    log.warning(f"  Dropping non-alphanumeric extracted reference: '{r}'")
+                    continue
+
+                # Prepend SCAC if reference is a B/L (not an OI/OE number)
+                if resolved_scac and not r.startswith("OI") and not r.startswith("OE"):
+                    old_r = r
+                    r = ensure_scac_prefix(r, resolved_scac)
+                    if r != old_r:
+                        log.info("  Invoice Prepended SCAC %s: %s → %s", resolved_scac, old_r, r)
+
+                references.append(r)
+
+            if secondary_ref:
+                secondary_ref = re.sub(r'\s+', '', secondary_ref)
+                if not re.fullmatch(r'[A-Z0-9]+', secondary_ref):
+                    log.warning(f"  Dropping non-alphanumeric secondary_ref: '{secondary_ref}'")
+                    secondary_ref = None
+
+            result["references"]    = references
+            result["reference"]     = references[0] if references else None
             result["secondary_ref"] = secondary_ref
-            result["invoice_no"]   = invoice_no
-            result["carrier_name"] = carrier_name
-            result["carrier_code"] = carrier_code
-            log.info(f"  Invoice Gemini: ref={reference} sec={secondary_ref} invoice={invoice_no} scac={resolved_scac}")
+            result["invoice_no"]    = invoice_no
+            result["carrier_name"]  = carrier_name
+            result["carrier_code"]  = carrier_code
+            log.info(f"  Invoice Gemini: refs={references} sec={secondary_ref} invoice={invoice_no} scac={resolved_scac}")
 
         except Exception as e:
             log.warning(f"  Invoice Gemini failed: {e}. Keyword fallback.")
             fb = _keyword_fallback(pdf_path)
+            result["references"] = [fb["reference"]] if fb["reference"] else []
             result["reference"]  = fb["reference"]
             result["invoice_no"] = fb["invoice_no"]
             result["flag"]       = "low_confidence"
     else:
         fb = _keyword_fallback(pdf_path)
+        result["references"] = [fb["reference"]] if fb["reference"] else []
         result["reference"]  = fb["reference"]
         result["invoice_no"] = fb["invoice_no"]
         result["flag"]       = "low_confidence"
-
-    if result["reference"]:
-        result["reference"] = re.sub(r'\s+', '', result["reference"])
 
     return result

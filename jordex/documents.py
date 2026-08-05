@@ -374,9 +374,45 @@ def build_customer_docs_file_map(folder_path: str) -> dict:
         file_map[filename] = (jordex_type, display_name, comment)
         log.info("  Customer file map: '%s' → type='%s' name='%s' comment='%s'",
                  filename, jordex_type, display_name, comment)
- 
+
     return file_map
- 
+
+
+def get_container_no_map(folder_path: str) -> dict:
+    """
+    Map filename -> container_no by reading each PDF's companion
+    <stem>_classification.json (produced by classify_customer_doc()).
+
+    Used by Customer Docs to search Jordex PER CONTAINER when one MBL
+    folder has multiple shipment rows in Jordex (one row per container
+    under that MBL) — each file needs to land on its own specific row
+    instead of being broadcast to every row.
+
+    Returns {filename: container_no_or_None}.
+    """
+    container_map = {}
+    UPLOAD_EXTENSIONS = ("*.[pP][dD][fF]", "*.[jJ][pP][gG]", "*.[jJ][pP][eE][gG]", "*.[pP][nN][gG]")
+    pdf_files = [
+        f for ext in UPLOAD_EXTENSIONS
+        for f in glob.glob(os.path.join(folder_path, ext))
+    ]
+
+    for pdf_path in pdf_files:
+        filename = os.path.basename(pdf_path)
+        stem = os.path.splitext(filename)[0]
+        json_path = os.path.join(folder_path, f"{stem}_classification.json")
+        container_no = None
+        if os.path.exists(json_path):
+            try:
+                with open(json_path) as f:
+                    data = json.load(f)
+                container_no = data.get("container_no") or None
+            except Exception as e:
+                log.warning("get_container_no_map: could not read %s: %s", json_path, e)
+        container_map[filename] = container_no
+
+    return container_map
+
 
 # ── Main upload function ──────────────────────────────────────────────
 

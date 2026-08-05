@@ -339,6 +339,7 @@ def search_and_open(page, query, row_index=0, session=None):
 
     total_matching_rows = 0
     target_row = None
+    matched_by_text = False
     for attempt in range(4):
         # 1. Try to find the exact text in row (Works for MBL/OI)
         for sel in [f"tr.shipment-row:has-text('{query}')", f".mf-table tr:has-text('{query}')", f"tr:has-text('{query}')"]:
@@ -348,11 +349,20 @@ def search_and_open(page, query, row_index=0, session=None):
                     total_matching_rows = max(total_matching_rows, len(rows))
                 if len(rows) > row_index:
                     target_row = rows[row_index]
+                    matched_by_text = True
                     break
             except: continue
         if target_row: break
-        
-        # 2. If exact text not found (e.g. Container Search), just pick the row_index-th row in the table
+
+        # 2. If exact text not found (e.g. Container Search, where the row
+        # renders the MBL rather than the container number), fall back to
+        # the row_index-th row of whatever Jordex's own search returned.
+        # NOTE: this is an UNVERIFIED positional match — Jordex's backend
+        # search can be fuzzy, so a garbled/wrong query can surface rows
+        # that don't actually relate to it. Callers must only pass queries
+        # that already passed is_valid_jordex_search_ref() format validation
+        # (search_jordex_with_fallback does this); that's what keeps this
+        # fallback from rubber-stamping garbage references as "found".
         try:
             rows = [r for r in page.locator("tr.shipment-row").all() if r.is_visible(timeout=1000)]
             if len(rows) > 0:
@@ -368,6 +378,13 @@ def search_and_open(page, query, row_index=0, session=None):
         if row_index == 0:
             log.warning(f"Shipment {query} not found in Jordex.")
         return False, 0, page
+
+    if not matched_by_text:
+        log.warning(
+            f"UNVERIFIED positional match for '{query}' (row_index={row_index}) — "
+            f"no row's own text contained the query; opening row {row_index} of "
+            f"{total_matching_rows} from Jordex's search result anyway."
+        )
 
     for retry in range(2):
         try:

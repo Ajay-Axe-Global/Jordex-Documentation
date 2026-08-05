@@ -55,9 +55,20 @@ RULES FOR reference (B/L Number):
 RULES FOR arrival_date_raw:
 1. Search ALL pages for the arrival date. Labels: "ETA", "ETA AT POD", "Est. Arrival Date", "Estimated Time of Arrival", "POD ETA", "Arrival Date".
 2. It may appear WITHOUT a label — e.g. "ETA AT POD: Rotterdam ON: Tuesday, 07 Jul, 2026". Still extract it.
-3. Pick specifically the ARRIVAL date at the final destination — not the issue date and not the departure date.
-4. Copy the date EXACTLY as printed (e.g. "07-JUL-26", "Tuesday, 07 Jul, 2026", "2026-07-07").
-5. If not found, set arrival_date_raw to null.
+3. It may also appear as a SENTENCE rather than a label, with the date sitting in a
+   nearby (often separately boxed) field — e.g. Maersk arrival notices say
+   "The above mentioned cargo is due to arrive aboard subject vessel On or About"
+   with a boxed "Date" field next to/below that sentence holding the actual value
+   (e.g. "2026-08-15"). Treat that boxed date as the arrival_date_raw in this case.
+4. Pick specifically the ARRIVAL date at the final destination — not the issue date and not the departure date.
+5. CRITICAL — NEVER use "Print Date" (or "Printed On", "Date Printed") as the
+   arrival_date_raw. That field is just when the notice document itself was
+   generated/printed, not when the cargo arrives — it is a common false trap
+   because it's often the most clearly labeled date on page 1. If the only
+   date-like field you can find is a Print Date, set arrival_date_raw to null
+   instead of using it.
+6. Copy the date EXACTLY as printed (e.g. "07-JUL-26", "Tuesday, 07 Jul, 2026", "2026-07-07").
+7. If not found, set arrival_date_raw to null.
 
 RULES FOR carrier_name and carrier_code:
 1. Extract the name of the shipping carrier or line.
@@ -224,6 +235,12 @@ _ETA_LABEL_RE = re.compile(
     r'(?:ETA|Est(?:imated)?\.?\s*Arrival\s*Date|Estimated Time of Arrival)[^\n:]*[:\s]+([^\n]{4,30})',
     re.IGNORECASE,
 )
+# Some carriers (e.g. Maersk) phrase the ETA as a sentence instead of a
+# label — "...due to arrive aboard subject vessel On or About" — with the
+# actual date sitting in a nearby field rather than right after a colon.
+_ARRIVE_ON_OR_ABOUT_RE = re.compile(
+    r'due to arrive.{0,120}?on or about', re.IGNORECASE | re.DOTALL,
+)
 
 
 def _extract_text(pdf_path: str) -> str:
@@ -259,6 +276,20 @@ def _regex_fallback(pdf_path: str, result: dict) -> dict:
                 result["arrival_date_raw"] = dm.group(0)
                 result["arrival_date"] = _normalize_date(dm.group(0))
                 break
+
+    # Fallback: sentence-style ETA with the date in a nearby field rather
+    # than right after a label (see _ARRIVE_ON_OR_ABOUT_RE above).
+    if not result.get("arrival_date_raw"):
+        m2 = _ARRIVE_ON_OR_ABOUT_RE.search(text)
+        if m2:
+            window = text[m2.end():m2.end() + 150]
+            for pat in _DATE_PATTERNS:
+                dm = pat.search(window)
+                if dm:
+                    result["arrival_date_raw"] = dm.group(0)
+                    result["arrival_date"] = _normalize_date(dm.group(0))
+                    break
+
     return result
 
 

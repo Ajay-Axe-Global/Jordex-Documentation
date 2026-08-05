@@ -21,7 +21,7 @@ from shared.helpers import (
 from outlook.session import OutlookSession
 from jordex.login import JordexSession
 from jordex.browser import normalize_dashboard_filters, search_and_open, go_back
-from jordex.documents import upload_attachments, build_customer_docs_file_map
+from jordex.documents import upload_attachments, build_customer_docs_file_map, get_container_no_map
 from services.customer_docs.extractor import classify_all_customer_docs
 
 log = logging.getLogger("service.customer_docs")
@@ -40,10 +40,12 @@ class CustomerDocsService:
         self._processed = 0
         self._uploaded  = 0
         self.last_run   = None
+        self._outlook_stuck = False
 
     def start(self):
         if self.status == "running":
             return {"ok": False, "message": "Already running"}
+        self.error = None
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"svc-{SERVICE_KEY}")
         self._thread.start()
@@ -85,7 +87,21 @@ class CustomerDocsService:
                 self.last_run = datetime.now().isoformat()
                 items = self._process_batch(outlook_page, tracker)
                 if items:
-                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
+                    merged = self._merge_by_folder(items)
+                    jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, merged, jordex_session)
+
+                if self._outlook_stuck:
+                    log.warning(f"[{SERVICE_KEY}] Outlook page was stuck — hard-restarting Outlook browser")
+                    try:
+                        outlook_page = outlook_session.hard_restart()
+                        log.info(f"[{SERVICE_KEY}] Outlook hard restart SUCCEEDED")
+                    except Exception as e:
+                        log.error(f"[{SERVICE_KEY}] Outlook hard restart FAILED: {e}", exc_info=True)
+                        self.error  = f"Outlook hard restart failed: {e}"
+                        self.status = "error"
+                        break
+                    self._outlook_stuck = False
+
                 for _ in range(ROUND_ROBIN_BATCH * 2):
                     if self._stop_evt.is_set(): break
                     time.sleep(1)
@@ -123,10 +139,20 @@ class CustomerDocsService:
                 continue
 
             subject    = get_subject(page) or cid[:40]
-            temp_files = download_attachments_to_temp(page)
+            temp_files, page_stuck = download_attachments_to_temp(page)
+            if page_stuck:
+                # Outlook page is genuinely frozen (not a per-email glitch) —
+                # stop downloading more emails this batch. Whatever WAS
+                # already downloaded for this email still gets processed and
+                # uploaded normally below; _run() hard-restarts the Outlook
+                # browser afterward instead of hammering a dead page.
+                self._outlook_stuck = True
+                log.warning(f"[{SERVICE_KEY}] Outlook page stuck — finishing this email, then stopping batch early")
 
             if not temp_files:
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], "no_attachment")
+                if page_stuck:
+                    break
                 continue
 
             pdf_files = [f for f in temp_files if f.lower().endswith((".pdf", ".jpg", ".jpeg", ".png"))]
@@ -201,7 +227,11 @@ class CustomerDocsService:
                 "folder_name":   folder_name,
                 "mbl":           None,
                 "secondary_ref": sec_ref,
+                "saved_files":   saved_files,
             })
+
+            if page_stuck:
+                break
 
         return processed_items
 
@@ -253,34 +283,73 @@ class CustomerDocsService:
             log.warning(f"[{SERVICE_KEY}]   Could not read Carrier tab BL fields: {e}")
             return False
 
+    @staticmethod
+    def _merge_by_folder(items: list) -> list:
+        """
+        Collapse multiple email-level items into one item per folder_name
+        (MBL). One MBL can receive many separate emails over time — each
+        with a unique container — so all conv_ids and their saved_files
+        are gathered here, keyed back to the conv_id that produced them,
+        so upload success/failure can be attributed to the right email.
+        """
+        grouped: dict[str, dict] = {}
+        for item in items:
+            key = item["folder_name"]
+            if key not in grouped:
+                grouped[key] = {
+                    "conv_ids":       [item["conv_id"]],
+                    "cat":            item["cat"],
+                    "folder_path":    item["folder_path"],
+                    "folder_name":    key,
+                    "mbl":            item.get("mbl"),
+                    "secondary_ref":  item.get("secondary_ref"),
+                    "file_conv_map":  {f: item["conv_id"] for f in item.get("saved_files") or []},
+                }
+            else:
+                grouped[key]["conv_ids"].append(item["conv_id"])
+                if item.get("secondary_ref"):
+                    grouped[key]["secondary_ref"] = item["secondary_ref"]
+                for f in item.get("saved_files") or []:
+                    grouped[key]["file_conv_map"][f] = item["conv_id"]
+        return list(grouped.values())
+
     def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list, jordex_session=None):
         """Returns the current jordex_page, which may be a fresh Page if
-        search_and_open had to hard-restart the browser mid-batch."""
+        search_and_open had to hard-restart the browser mid-batch.
+
+        Each item is one MBL/folder group (merged across every email that
+        shares it). If the MBL's Jordex search shows only one shipment row,
+        every new file for it goes to that row (old behavior). If it shows
+        MULTIPLE rows (one per container under that MBL), files are
+        uploaded PER CONTAINER — each file's own container_no is searched
+        individually so it lands on the one row it actually belongs to,
+        instead of being broadcast to every row.
+        """
         doc_type, display_name = JORDEX_MAPPING[CAT]
-
-
-        # Deduplicate: track folder_names already uploaded this batch
-        uploaded_folders: set[str] = set()
 
         for item in items:
             if self._stop_evt.is_set(): break
             query = item.get("mbl") or item.get("folder_name")
             if not query: continue
 
-            folder_name = item.get("folder_name") or query
-            if folder_name in uploaded_folders:
-                log.info(
-                    f"[{SERVICE_KEY}] Skipping duplicate folder '{folder_name}' "
-                    f"(conv_id={item['conv_id'][:20]}…) — already uploaded this batch"
-                )
-                tracker.update_status(CAT, item["conv_id"], "uploaded")
-                continue
+            folder_name    = item.get("folder_name") or query
+            conv_ids       = item["conv_ids"]
+            file_conv_map  = item.get("file_conv_map") or {}
 
-            if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name, mbl=item.get("mbl"),
-                                              exclude_conv_id=item["conv_id"]):
-                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email")
-                tracker.update_status(CAT, item["conv_id"], "uploaded")
-                uploaded_folders.add(folder_name)
+            # Only touch files this MBL hasn't already gotten to Jordex —
+            # driven by tracker.json (persists across batches/days), not a
+            # one-shot "already uploaded once" flag, so a folder that keeps
+            # receiving new containers over time is never wholesale skipped.
+            local_files = set(file_conv_map.keys()) or {
+                os.path.basename(p) for p in glob.glob(os.path.join(item["folder_path"], "*"))
+            }
+            already_uploaded = tracker.get_uploaded_files(CAT, folder_name)
+            new_files = local_files - already_uploaded
+
+            if not new_files:
+                log.info(f"[{SERVICE_KEY}] '{folder_name}' — no new files, all already uploaded")
+                for cid in conv_ids:
+                    tracker.update_status(CAT, cid, "uploaded")
                 continue
 
             query = normalize_oi_reference(query)
@@ -289,7 +358,7 @@ class CustomerDocsService:
                 outlook_page=outlook_page,
                 primary_ref=query,
                 secondary_ref=item.get("secondary_ref"),
-                conv_id=item["conv_id"],
+                conv_id=conv_ids[0],
                 tracker=tracker,
                 cat=CAT,
                 service_key=SERVICE_KEY,
@@ -299,89 +368,123 @@ class CustomerDocsService:
             if not success:
                 continue
 
-            row_index = 0
-            uploaded  = False
-            carrier_fields_empty = False
+            full_file_map = build_customer_docs_file_map(item["folder_path"])
+            file_map = {f: v for f, v in full_file_map.items() if f in new_files}
+            if not file_map:
+                for cid in conv_ids:
+                    tracker.update_status(CAT, cid, "uploaded")
+                continue
 
-            # If this shipment has at least one HBL AND at least one MBL among
-            # its docs, verify after upload that Jordex's Carrier tab actually
-            # shows both B/L numbers — catches cases where the docs attached
-            # fine but the shipment record itself wasn't populated correctly.
-            hbl_count, mbl_count = self._count_bl_types(item["folder_path"])
-            check_carrier_tab = hbl_count >= 1 and mbl_count >= 1
+            log.info(f"[{SERVICE_KEY}] '{folder_name}': Jordex shows {rows_found} row(s) for this MBL — "
+                     f"{len(file_map)} new file(s) to place")
 
-            # Only iterate multiple rows if the search reference is a reliable
-            # OI number or SCAC-prefixed BL (e.g. "OI2617257", "HLCU...").
-            # If the search fell back to a short/partial secondary_ref
-            # (e.g. "1406"), uploading to all rows would broadcast the document
-            # to random shipments that don't belong to this email.
-            import re as _re
-            _ref_is_reliable = bool(
-                _re.match(r'^OI\d{4,}', used_ref, _re.IGNORECASE) or
-                (_re.match(r'^[A-Z]{4}', used_ref) and len(used_ref) >= 10)
-            )
-            _max_rows = 10 if _ref_is_reliable else 1
-            if not _ref_is_reliable:
-                log.info(
-                    f"[{SERVICE_KEY}] Ref '{used_ref}' is not a reliable OI/BL — "
-                    f"uploading to row 0 only (preventing broadcast to unrelated shipments)"
-                )
-
+            uploaded_files: set[str] = set()
             try:
-                while row_index < _max_rows:
-                    success, rows_found, jordex_page = search_and_open(
-                        jordex_page, used_ref, row_index=row_index, session=jordex_session
+                if rows_found <= 1:
+                    # Single shipment row for this MBL — all new files go here.
+                    hbl_count, mbl_count = self._count_bl_types(item["folder_path"])
+                    check_carrier_tab = hbl_count >= 1 and mbl_count >= 1
+
+                    success, _, jordex_page = search_and_open(
+                        jordex_page, used_ref, row_index=0, session=jordex_session
                     )
-                    if not success: break
-                    cust_file_map = build_customer_docs_file_map(item["folder_path"])
-                    row_ok = upload_attachments(
-                        jordex_page, item["folder_path"], doc_type, display_name,
-                        file_map=cust_file_map,
-                    )
-                    if row_ok and check_carrier_tab:
-                        if self._check_carrier_bl_fields(jordex_page):
-                            carrier_fields_empty = True
+                    if success:
+                        row_ok = upload_attachments(
+                            jordex_page, item["folder_path"], doc_type, display_name, file_map=file_map,
+                        )
+                        if row_ok and check_carrier_tab and self._check_carrier_bl_fields(jordex_page):
                             log.warning(
-                                f"[{SERVICE_KEY}] Carrier tab BL field(s) empty for "
-                                f"'{folder_name}' (row {row_index}) despite "
-                                f"{hbl_count} HBL + {mbl_count} MBL doc(s) uploaded"
+                                f"[{SERVICE_KEY}] Carrier tab BL field(s) empty for '{folder_name}' "
+                                f"despite {hbl_count} HBL + {mbl_count} MBL doc(s) uploaded"
                             )
-                    go_back(jordex_page)
-                    if row_ok:
-                        uploaded = True
-                        self._uploaded += 1
-                    else:
-                        log.warning(
-                            f"[{SERVICE_KEY}] Upload not confirmed for row {row_index} "
-                            f"(query={query}) — will retry next run"
-                        )
-                    row_index += 1
-                    if rows_found <= row_index: break
-            except Exception as e:
-                log.error(f"[{SERVICE_KEY}] Error during upload loop for {query}: {e}", exc_info=True)
-            finally:
-                if uploaded and carrier_fields_empty:
-                    # Docs are attached (don't re-upload next run), but the
-                    # shipment's Carrier tab wasn't populated — needs a human.
-                    tracker.update_status(CAT, item["conv_id"], "carrier_fields_empty")
-                    uploaded_folders.add(folder_name)
-                    try:
-                        mark_as_unread(outlook_page, item["conv_id"])
-                        log.info(
-                            f"[{SERVICE_KEY}] Marked '{query}' unread — Carrier tab "
-                            f"BL field(s) empty, needs manual review"
-                        )
-                    except Exception as e:
-                        log.warning(f"[{SERVICE_KEY}] Could not mark unread for {query}: {e}")
-                elif uploaded:
-                    tracker.update_status(CAT, item["conv_id"], "uploaded")
-                    uploaded_folders.add(folder_name)
+                        go_back(jordex_page)
+                        if row_ok:
+                            uploaded_files = set(file_map.keys())
+                            self._uploaded += 1
+                        else:
+                            log.warning(f"[{SERVICE_KEY}] Upload not confirmed for '{folder_name}' — will retry next run")
                 else:
-                    log.warning(f"[{SERVICE_KEY}] Could not open/upload shipment for {query}")
-                    try:
-                        mark_as_unread(outlook_page, item["conv_id"])
-                        log.info(f"[{SERVICE_KEY}] Marked '{query}' unread for retry next run")
-                    except Exception as e:
-                        log.warning(f"[{SERVICE_KEY}] Could not mark unread for {query}: {e}")
+                    # Multiple containers under one MBL — search + upload
+                    # each file against ITS OWN container number.
+                    container_map = get_container_no_map(item["folder_path"])
+                    uploaded_files, jordex_page = self._upload_per_container(
+                        jordex_page, item, used_ref, file_map, container_map, jordex_session
+                    )
+            except Exception as e:
+                log.error(f"[{SERVICE_KEY}] Error during upload for {query}: {e}", exc_info=True)
+
+            failed_files = set(file_map.keys()) - uploaded_files
+            done_conv_ids   = {file_conv_map[f] for f in uploaded_files if f in file_conv_map}
+            failed_conv_ids = {file_conv_map[f] for f in failed_files if f in file_conv_map} - done_conv_ids
+            # conv_ids with no file mapping (e.g. legacy items) fall back to
+            # the group-level outcome, matching prior single-item behavior.
+            unmapped_conv_ids = set(conv_ids) - done_conv_ids - failed_conv_ids
+            if unmapped_conv_ids:
+                (done_conv_ids if uploaded_files else failed_conv_ids).update(unmapped_conv_ids)
+
+            for cid in done_conv_ids:
+                tracker.update_status(CAT, cid, "uploaded")
+            for cid in failed_conv_ids:
+                log.warning(f"[{SERVICE_KEY}] Could not upload file(s) for conv_id={cid[:20]}… ({folder_name})")
+                try:
+                    mark_as_unread(outlook_page, cid)
+                except Exception as e:
+                    log.warning(f"[{SERVICE_KEY}] Could not mark unread for {cid}: {e}")
 
         return jordex_page
+
+    def _upload_per_container(self, jordex_page, item, mbl_ref, file_map, container_map, jordex_session):
+        """
+        Upload each file individually, searching Jordex by ITS OWN container
+        number so it lands on the specific row that container belongs to —
+        instead of broadcasting every file to every row under the MBL.
+        Files with no extractable container_no fall back to a single upload
+        against the primary MBL's first row (not broadcast to every row).
+        Returns (uploaded_filenames: set[str], jordex_page).
+        """
+        doc_type, display_name = JORDEX_MAPPING[CAT]
+        uploaded_files: set[str] = set()
+
+        for filename in file_map:
+            container_no = container_map.get(filename)
+            if not container_no:
+                continue
+            success, rows_found, jordex_page = search_and_open(
+                jordex_page, container_no, row_index=0, session=jordex_session
+            )
+            if not success:
+                log.warning(
+                    f"[{SERVICE_KEY}] Container '{container_no}' (file '{filename}') "
+                    f"not found in Jordex — skipping this file, will retry next run"
+                )
+                continue
+            single_map = {filename: file_map[filename]}
+            row_ok = upload_attachments(
+                jordex_page, item["folder_path"], doc_type, display_name, file_map=single_map,
+            )
+            go_back(jordex_page)
+            if row_ok:
+                uploaded_files.add(filename)
+                self._uploaded += 1
+            else:
+                log.warning(f"[{SERVICE_KEY}] Upload not confirmed for '{filename}' (container {container_no})")
+
+        # Files with no container_no (e.g. debit notes, invoices) apply to
+        # the shipment as a whole — upload once against the primary MBL's
+        # first row rather than broadcasting to every container row.
+        leftover = {f: v for f, v in file_map.items() if f not in uploaded_files and not container_map.get(f)}
+        if leftover:
+            success, _, jordex_page = search_and_open(
+                jordex_page, mbl_ref, row_index=0, session=jordex_session
+            )
+            if success:
+                row_ok = upload_attachments(
+                    jordex_page, item["folder_path"], doc_type, display_name, file_map=leftover,
+                )
+                go_back(jordex_page)
+                if row_ok:
+                    uploaded_files.update(leftover.keys())
+                else:
+                    log.warning(f"[{SERVICE_KEY}] Upload not confirmed for {list(leftover.keys())} (no container_no)")
+
+        return uploaded_files, jordex_page

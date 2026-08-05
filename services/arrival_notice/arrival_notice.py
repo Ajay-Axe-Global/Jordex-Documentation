@@ -72,12 +72,14 @@ class ArrivalNoticeService:
         self._processed = 0
         self._uploaded  = 0
         self.last_run   = None
+        self._outlook_stuck = False
 
     # ── Public API (called by routes.py) ───────────────────────────────
 
     def start(self):
         if self.status == "running":
             return {"ok": False, "message": "Already running"}
+        self.error = None
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"svc-{SERVICE_KEY}")
         self._thread.start()
@@ -140,9 +142,27 @@ class ArrivalNoticeService:
                 if items:
                     consecutive_empty = 0
                     jordex_page = self._upload_to_jordex(jordex_page, outlook_page, tracker, items, jordex_session)
-                else:
+
+                # ── Outlook page reported genuinely frozen — restart it
+                # immediately rather than waiting on the slower consecutive-
+                # empty-batches heuristic below. Whatever was downloaded
+                # before the freeze was already uploaded above.
+                if self._outlook_stuck:
+                    log.warning(f"[{SERVICE_KEY}] Outlook page was stuck — hard-restarting Outlook browser")
+                    try:
+                        outlook_page = outlook_session.hard_restart()
+                        consecutive_empty = 0
+                        log.info(f"[{SERVICE_KEY}] Outlook hard restart SUCCEEDED")
+                    except Exception as e:
+                        log.error(f"[{SERVICE_KEY}] Outlook hard restart FAILED: {e}", exc_info=True)
+                        self.error  = f"Outlook hard restart failed: {e}"
+                        self.status = "error"
+                        break
+                    self._outlook_stuck = False
+
+                if not items:
                     consecutive_empty += 1
-    
+
                     # ── After 2 consecutive empty batches, restart sessions ──
                     if consecutive_empty >= 2:
                         restart_count += 1
@@ -220,9 +240,11 @@ class ArrivalNoticeService:
                     navigate_to_folder(page, OUTLOOK_LABEL)
                 except Exception as retry_err:
                     log.error(f"[{SERVICE_KEY}] navigate_to_folder failed after recovery: {retry_err}")
+                    self._outlook_stuck = True
                     return []
             else:
                 log.error(f"[{SERVICE_KEY}] Page recovery failed — skipping batch")
+                self._outlook_stuck = True
                 return []
     
         msgs = collect_unread(page, tracker, CAT, limit=ROUND_ROBIN_BATCH)
@@ -253,8 +275,14 @@ class ArrivalNoticeService:
                 tracker.mark(CAT, cid, subject, "", [], "skipped_multi_attach")
                 continue
     
-            temp_files = download_attachments_to_temp(page)
-    
+            temp_files, page_stuck = download_attachments_to_temp(page)
+            if page_stuck:
+                # Outlook page is genuinely frozen — finish this email (if
+                # anything was already downloaded), then stop the batch.
+                # _run() hard-restarts the Outlook browser afterward.
+                self._outlook_stuck = True
+                log.warning(f"[{SERVICE_KEY}] Outlook page stuck — finishing this email, then stopping batch early")
+
             if not temp_files:
                 # Distinguish "no attachment at all" from "download failed"
                 has_attachments = not should_skip_multi_attachment(page, max_allowed=999)
@@ -264,8 +292,10 @@ class ArrivalNoticeService:
                     mark_as_unread(page, cid)
                 else:
                     status = "no_attachment"
-    
+
                 tracker.mark(CAT, cid, subject, subject_folder_fallback(subject), [], status)
+                if page_stuck:
+                    break
                 continue
     
             # Skip emails with Excel attachments
@@ -273,6 +303,8 @@ class ArrivalNoticeService:
                 log.info(f"[{SERVICE_KEY}] Skipping email with Excel attachment: {subject}")
                 cleanup_temp(temp_files)
                 tracker.mark(CAT, cid, subject, "", [], "skipped_excel")
+                if page_stuck:
+                    break
                 continue
     
             pdf_files = [f for f in temp_files if f.lower().endswith(".pdf")]
@@ -300,6 +332,8 @@ class ArrivalNoticeService:
                             cleanup_temp(temp_files)
                             tracker.mark(CAT, cid, subject, folder_name, [], "uploaded",
                                         mbl=folder_name, carrier_code=extraction.get("carrier_code"))
+                            if page_stuck:
+                                break
                             continue
                     except Exception:
                         pass
@@ -339,7 +373,10 @@ class ArrivalNoticeService:
                 "secondary_ref":  sec_ref,
                 "extraction":     extraction,
             })
-    
+
+            if page_stuck:
+                break
+
         return processed_items
 
     def _upload_to_jordex(self, jordex_page, outlook_page, tracker, items: list, jordex_session=None):

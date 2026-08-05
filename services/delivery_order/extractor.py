@@ -71,6 +71,14 @@ doc_subtype rules:
 
 MBL: starts with SCAC (HLCU, MAEU, MRKU, MSCU, MEDU, ONEY, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU, HDMU).
 *EXCEPTION*: For Maersk (MAEU), the B/L number is often purely numeric (e.g., "270557106"). If you see "B/L number: [digits]", extract exactly those digits. Do NOT extract the "Request Number" (like "HZJQCNSXZ5K") as the MBL.
+*CRITICAL — Hapag-Lloyd "Customer Release" documents*: the container table has a
+"Bill of Lading" column AND a separate "Shipment" column right next to each
+other, both showing numbers. These are DIFFERENT values:
+  - "Bill of Lading" column (e.g. "HLCUBKK260589377") → this IS the MBL. Use it.
+  - "Shipment" column (e.g. "98353204") → this is an internal shipment/booking
+    number, NOT the MBL. NEVER extract this as the mbl field, even though it
+    sits right next to the Bill of Lading value and can look similar.
+  If you see BOTH columns, the "Bill of Lading" value always wins.
 Container: STRICTLY 4 uppercase letters + 7 digits (e.g. TGBU4744557, HMMU4531833).
 Do NOT extract voyage numbers (e.g. ODUT0019W, 0087W), vessel codes, or booking numbers as containers.
 If the container table is empty or has no data rows → containers = [].

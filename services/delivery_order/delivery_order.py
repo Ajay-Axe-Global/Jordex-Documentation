@@ -61,8 +61,8 @@ TERMINAL_SHORTCODES = {
     "APM 2 TERMINAL MAASVLAKTE":      "APM II",
     "QTERMINALS KRAMER CITY":         "KRAMER CITY",
     "QTERMINALS KRAMER":              "KRAMER CITY",
-    "PSA ANTWERP K913 NOORDZEE":      "PSA ANTWERP K913",
-    "PSA ANTWERP K913":               "PSA ANTWERP K913",
+    "PSA ANTWERP K913 NOORDZEE":      "913",
+    "PSA ANTWERP K913":               "913",
     "ACC 1":                          "ACC TERMINAL",
     "KRAMER HOME":                    "KRAMER HOME",
     "UWT MAASVLAKTE":                 "MAASVLAKTE",
@@ -2043,6 +2043,111 @@ class DeliveryOrderService:
         }""")
         page.wait_for_timeout(300)
 
+    # def _fill_section_reference(self, page: Page, section_nth: int,
+    #                              ref_value: str, label: str):
+    #     """
+    #     Fill the Reference field in a Destination section.
+    #     section_nth: 2 for Pick-up (3.1), 4 for Return (3.3).
+    #     """
+    #     log.info(f"[{SERVICE_KEY}]   {label} Reference: '{ref_value}'")
+ 
+    #     # ── Scroll section into view ─────────────────────────────────
+    #     page.evaluate(f"""() => {{
+    #         const pane = document.querySelector('#pane-destination');
+    #         if (!pane) return;
+    #         const body = pane.querySelector('.routing-tab-panel__body');
+    #         if (!body) return;
+    #         const section = body.children[{section_nth - 1}];
+    #         if (section) section.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+    #     }}""")
+    #     page.wait_for_timeout(500)
+ 
+    #     filled = False
+ 
+    #     # ── Strategy 1: Scoped JS fill within the correct section ────
+    #     try:
+    #         filled = page.evaluate(f"""(refVal) => {{
+    #             const pane = document.querySelector('#pane-destination');
+    #             if (!pane) return false;
+    #             const body = pane.querySelector('.routing-tab-panel__body');
+    #             if (!body) return false;
+    #             const section = body.children[{section_nth - 1}];
+    #             if (!section) return false;
+ 
+    #             const inputs = [...section.querySelectorAll('input[placeholder="Reference"]')]
+    #                 .filter(i => i.offsetParent !== null);
+    #             if (!inputs.length) return false;
+ 
+    #             const inp = inputs[0];
+    #             if (inp.readOnly) return false;
+ 
+    #             inp.focus();
+    #             const setter = Object.getOwnPropertyDescriptor(
+    #                 window.HTMLInputElement.prototype, 'value').set;
+    #             setter.call(inp, '');
+    #             inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+    #             setter.call(inp, refVal);
+    #             inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+    #             inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+    #             inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+    #             return true;
+    #         }}""", ref_value)
+    #     except Exception:
+    #         pass
+ 
+    #     if filled:
+    #         log.info(f"[{SERVICE_KEY}]   {label} Reference filled OK")
+    #         page.wait_for_timeout(300)
+    #         return
+ 
+    #     # ── Strategy 2: Playwright nth (dynamically computed) ────────
+    #     try:
+    #         # Find the global index of the Reference input in our section
+    #         ref_nth = page.evaluate(f"""() => {{
+    #             const pane = document.querySelector('#pane-destination');
+    #             if (!pane) return -1;
+    #             const body = pane.querySelector('.routing-tab-panel__body');
+    #             if (!body) return -1;
+    #             const section = body.children[{section_nth - 1}];
+    #             if (!section) return -1;
+ 
+    #             const allRefs = [...pane.querySelectorAll('input[placeholder="Reference"]')]
+    #                 .filter(i => i.offsetParent !== null);
+    #             const sectionRefs = [...section.querySelectorAll('input[placeholder="Reference"]')]
+    #                 .filter(i => i.offsetParent !== null);
+    #             if (!sectionRefs.length) return -1;
+    #             return allRefs.indexOf(sectionRefs[0]);
+    #         }}""")
+ 
+    #         if ref_nth >= 0:
+    #             ref_input = page.get_by_role("textbox", name="Reference").nth(ref_nth)
+    #             if ref_input.is_visible(timeout=2000):
+    #                 ref_input.click()
+    #                 ref_input.fill("")
+    #                 ref_input.fill(ref_value)
+    #                 page.keyboard.press("Tab")  # trigger blur to commit in Vue
+    #                 page.wait_for_timeout(300)
+    #                 log.info(f"[{SERVICE_KEY}]   {label} Reference filled via nth({ref_nth})")
+    #                 return
+    #     except Exception as e:
+    #         log.warning(f"[{SERVICE_KEY}]   {label} Reference strategy 2 failed: {e}")
+ 
+    #     # ── Strategy 3: Hardcoded nth fallback ───────────────────────
+    #     try:
+    #         fallback_nth = 0 if section_nth == 2 else 2
+    #         ref_input = page.get_by_role("textbox", name="Reference").nth(fallback_nth)
+    #         if ref_input.is_visible(timeout=2000):
+    #             ref_input.click()
+    #             ref_input.fill("")
+    #             ref_input.fill(ref_value)
+    #             page.keyboard.press("Tab")
+    #             page.wait_for_timeout(300)
+    #             log.info(f"[{SERVICE_KEY}]   {label} Reference filled via hardcoded nth({fallback_nth})")
+    #             return
+    #     except Exception:
+    #         pass
+ 
+    #     log.warning(f"[{SERVICE_KEY}]   {label} Reference could not be filled")
     def _fill_section_reference(self, page: Page, section_nth: int,
                                  ref_value: str, label: str):
         """
@@ -2050,104 +2155,126 @@ class DeliveryOrderService:
         section_nth: 2 for Pick-up (3.1), 4 for Return (3.3).
         """
         log.info(f"[{SERVICE_KEY}]   {label} Reference: '{ref_value}'")
- 
-        # ── Scroll section into view ─────────────────────────────────
-        page.evaluate(f"""() => {{
-            const pane = document.querySelector('#pane-destination');
-            if (!pane) return;
-            const body = pane.querySelector('.routing-tab-panel__body');
-            if (!body) return;
-            const section = body.children[{section_nth - 1}];
-            if (section) section.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-        }}""")
-        page.wait_for_timeout(500)
- 
-        filled = False
- 
-        # ── Strategy 1: Scoped JS fill within the correct section ────
+
+        # ── Wait for Vue to settle after terminal address change ─────
+        page.wait_for_timeout(1500)
         try:
-            filled = page.evaluate(f"""(refVal) => {{
+            page.locator(".el-loading-mask").wait_for(state="hidden", timeout=3000)
+        except Exception:
+            pass
+
+        # ── Fill + verify loop (up to 3 attempts) ────────────────────
+        for attempt in range(3):
+            filled = self._do_fill_reference(page, section_nth, ref_value, label, attempt)
+            if not filled:
+                log.warning(f"[{SERVICE_KEY}]   {label} Reference fill attempt {attempt+1} — setter failed")
+                page.wait_for_timeout(1000)
+                continue
+
+            # ── Verify the value actually stuck ──────────────────────
+            page.wait_for_timeout(1000)
+            actual = self._read_reference_value(page, section_nth)
+
+            if actual.strip() == ref_value.strip():
+                log.info(f"[{SERVICE_KEY}]   {label} Reference verified OK (attempt {attempt+1})")
+                return
+            else:
+                log.warning(
+                    f"[{SERVICE_KEY}]   {label} Reference overwritten by Vue! "
+                    f"Expected='{ref_value}', Got='{actual}' (attempt {attempt+1})"
+                )
+                page.wait_for_timeout(1500)
+
+        log.warning(f"[{SERVICE_KEY}]   {label} Reference could not be filled after 3 attempts")
+
+    def _read_reference_value(self, page: Page, section_nth: int) -> str:
+        """Read current value from the Reference input in the given section."""
+        return page.evaluate(f"""() => {{
+            const pane = document.querySelector('#pane-destination');
+            if (!pane) return '';
+            const body = pane.querySelector('.routing-tab-panel__body');
+            if (!body) return '';
+            const section = body.children[{section_nth - 1}];
+            if (!section) return '';
+            const inputs = [...section.querySelectorAll('input[placeholder="Reference"]')]
+                .filter(i => i.offsetParent !== null);
+            return inputs.length ? inputs[0].value : '';
+        }}""") or ""
+
+    def _do_fill_reference(self, page: Page, section_nth: int,
+                            ref_value: str, label: str, attempt: int) -> bool:
+        """Single attempt to fill the reference field."""
+
+        # ── Attempt 0: JS native setter + events ────────────────────
+        if attempt == 0:
+            try:
+                return bool(page.evaluate(f"""(refVal) => {{
+                    const pane = document.querySelector('#pane-destination');
+                    if (!pane) return false;
+                    const body = pane.querySelector('.routing-tab-panel__body');
+                    if (!body) return false;
+                    const section = body.children[{section_nth - 1}];
+                    if (!section) return false;
+                    const inputs = [...section.querySelectorAll('input[placeholder="Reference"]')]
+                        .filter(i => i.offsetParent !== null);
+                    if (!inputs.length) return false;
+                    const inp = inputs[0];
+                    if (inp.readOnly) return false;
+                    inp.focus();
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(inp, '');
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    setter.call(inp, refVal);
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                    return true;
+                }}""", ref_value))
+            except Exception:
+                return False
+
+        # ── Attempt 1+: Vue $emit to set model directly ─────────────
+        try:
+            return bool(page.evaluate(f"""(refVal) => {{
                 const pane = document.querySelector('#pane-destination');
                 if (!pane) return false;
                 const body = pane.querySelector('.routing-tab-panel__body');
                 if (!body) return false;
                 const section = body.children[{section_nth - 1}];
                 if (!section) return false;
- 
                 const inputs = [...section.querySelectorAll('input[placeholder="Reference"]')]
                     .filter(i => i.offsetParent !== null);
                 if (!inputs.length) return false;
- 
                 const inp = inputs[0];
-                if (inp.readOnly) return false;
- 
-                inp.focus();
+
+                // Walk up DOM to find Vue component owning this input
+                let el = inp;
+                while (el && !el.__vue__) el = el.parentElement;
+                if (el && el.__vue__) {{
+                    let vm = el.__vue__;
+                    for (let d = 0; d < 8 && vm; d++) {{
+                        if (typeof vm.$emit === 'function' &&
+                            (vm.value !== undefined || vm.modelValue !== undefined)) {{
+                            vm.$emit('input', refVal);
+                            vm.$emit('change', refVal);
+                            break;
+                        }}
+                        vm = vm.$parent;
+                    }}
+                }}
+
+                // Also set DOM value as backup
                 const setter = Object.getOwnPropertyDescriptor(
                     window.HTMLInputElement.prototype, 'value').set;
-                setter.call(inp, '');
-                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
                 setter.call(inp, refVal);
                 inp.dispatchEvent(new Event('input', {{bubbles: true}}));
                 inp.dispatchEvent(new Event('change', {{bubbles: true}}));
                 inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
                 return true;
-            }}""", ref_value)
+            }}""", ref_value))
         except Exception:
-            pass
- 
-        if filled:
-            log.info(f"[{SERVICE_KEY}]   {label} Reference filled OK")
-            page.wait_for_timeout(300)
-            return
- 
-        # ── Strategy 2: Playwright nth (dynamically computed) ────────
-        try:
-            # Find the global index of the Reference input in our section
-            ref_nth = page.evaluate(f"""() => {{
-                const pane = document.querySelector('#pane-destination');
-                if (!pane) return -1;
-                const body = pane.querySelector('.routing-tab-panel__body');
-                if (!body) return -1;
-                const section = body.children[{section_nth - 1}];
-                if (!section) return -1;
- 
-                const allRefs = [...pane.querySelectorAll('input[placeholder="Reference"]')]
-                    .filter(i => i.offsetParent !== null);
-                const sectionRefs = [...section.querySelectorAll('input[placeholder="Reference"]')]
-                    .filter(i => i.offsetParent !== null);
-                if (!sectionRefs.length) return -1;
-                return allRefs.indexOf(sectionRefs[0]);
-            }}""")
- 
-            if ref_nth >= 0:
-                ref_input = page.get_by_role("textbox", name="Reference").nth(ref_nth)
-                if ref_input.is_visible(timeout=2000):
-                    ref_input.click()
-                    ref_input.fill("")
-                    ref_input.fill(ref_value)
-                    page.keyboard.press("Tab")  # trigger blur to commit in Vue
-                    page.wait_for_timeout(300)
-                    log.info(f"[{SERVICE_KEY}]   {label} Reference filled via nth({ref_nth})")
-                    return
-        except Exception as e:
-            log.warning(f"[{SERVICE_KEY}]   {label} Reference strategy 2 failed: {e}")
- 
-        # ── Strategy 3: Hardcoded nth fallback ───────────────────────
-        try:
-            fallback_nth = 0 if section_nth == 2 else 2
-            ref_input = page.get_by_role("textbox", name="Reference").nth(fallback_nth)
-            if ref_input.is_visible(timeout=2000):
-                ref_input.click()
-                ref_input.fill("")
-                ref_input.fill(ref_value)
-                page.keyboard.press("Tab")
-                page.wait_for_timeout(300)
-                log.info(f"[{SERVICE_KEY}]   {label} Reference filled via hardcoded nth({fallback_nth})")
-                return
-        except Exception:
-            pass
- 
-        log.warning(f"[{SERVICE_KEY}]   {label} Reference could not be filled")
+            return False
 
     def _read_existing_terminal(self, page: Page, section_nth: int) -> str:
         """Read existing terminal name from a Destination section."""

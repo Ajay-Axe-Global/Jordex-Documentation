@@ -274,15 +274,17 @@ This is a Yang Ming release message.
 PICKUP:
 - address = "Discharging terminal" field (e.g. "Rotterdam World Gateway - Port number 8970").
 - reference per container = "Pincode" column in the container table.
-  → If Pincode says "PORTBASE" (case-insensitive) or is empty → use "PCS".
-  → If an actual pincode value exists → use it.
+  → If a value is given → use it exactly as shown.
+  → If empty/missing (including "PORTBASE") → use "PCS".
 
 RETURN:
 - address = "Turn in depot" column in the container table.
   Example: "QTerminals Kramer Rotterdam(RCT)- Missouriweg 17, Port number 7220"
 - reference per container = "Turn in Reference" column.
-  → If a value exists (e.g. "FE12618W") → use it.
-  → If it says "check with eqt@..." or is empty → use "PCS".
+  → If a value is given → use it exactly as shown.
+  → If empty/missing (including "check with eqt@..." or similar contact instructions) → use "PCS".
+
+Same rule applies to BOTH pickup and return, per container: value given → use it, nothing given → "PCS". No other defaults.
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -417,6 +419,10 @@ RETURN:
   The table shows: Facility name, Turn-In Ref, Phone No., Location.
   Example: "NLRTMWG Rotterdam World Gateway Havennummer 8970..."
   Extract the human-readable facility name (e.g. "Rotterdam World Gateway").
+- Also read the container SIZE/TYPE for each container (e.g. "20DC", "40HC", "45HRF") from the
+  "Container Information" table's Size/Type column, and add it to EVERY return reference entry
+  as an extra key "container_type" (e.g. "container_type": "40HC"). Use the code exactly as
+  printed on the document (strip spaces only) — do not guess or normalize it.
 - reference per container = "Turn-In Ref" column in the EQ Return Facility table.
   → If a Turn-In Ref exists and is an actual code → use it.
   → CRITICAL: If the Turn-In Ref says "Contact HMM Netherlands" or similar instructions, use an EMPTY STRING "". Do NOT mistakenly extract numbers from the Facility Name (like "8970") as the reference.
@@ -426,6 +432,21 @@ RETURN:
   → CRITICAL: Do NOT extract numbers from the Facility Name (like "8970") as reference.
   → If Turn-In Ref is empty or missing → reference = "".
   → Do NOT use "PCS" for HMM return references.
+
+FIXED OVERRIDE RULES — these apply REGARDLESS of whatever Turn-In Ref the document shows, and
+take priority over every return-reference rule above. Match on the return facility name AND
+the container's size/type TOGETHER:
+  - Facility is "Rotterdam World Gateway" or "RWG", AND container type is one of:
+    20DC, 20HRF, 2HRF, 4HRF, 40HRF, 40DC, 40HC
+    → reference = "JINF0008EMTX"
+  - Facility is "Rotterdam World Gateway" or "RWG", AND container type is 45DC or 45HRF
+    → reference = "HMMSPECIAL"
+  - Facility is "ECT" or "ECT Delta Terminal", AND container type is 20DC, 20HRF, or 2HRF
+    → reference = "JMII0102E22002"
+  - Facility is "ECT" or "ECT Delta Terminal", AND container type is 40DC, 40HRF, or 4HRF
+    → reference = "JMII0102E4500"
+  If the facility/type combination does not match any of these four rules, fall back to the
+  Turn-In Ref rules above (the document's own value, or "" if none/a contact instruction).
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -999,8 +1020,8 @@ def _apply_safety_net(scac: str, result: dict) -> dict:
         _cosu_clean_return_ref(ret)
 
     elif scac == "YMLU":
-        _pcs_if_empty_or_portbase(pickup)
-        _pcs_if_empty_or_portbase(ret)
+        _ymlu_clean_refs(pickup)
+        _ymlu_clean_refs(ret)
 
     elif scac == "OOLU":
         _pcs_if_empty(pickup)
@@ -1008,7 +1029,7 @@ def _apply_safety_net(scac: str, result: dict) -> dict:
 
     elif scac == "HDMU":
         _pcs_if_empty(pickup)
-        
+        _hdmu_apply_return_ref_rules(ret)
 
     elif scac == "CMDU":
         _cmdu_clean_pickup(pickup)
@@ -1099,6 +1120,29 @@ def _pcs_if_empty_or_portbase(section: dict):
         section["reference"] = "PCS"
 
 
+def _ymlu_clean_refs(section: dict):
+    """
+    Yang Ming (pickup + return, both use this same rule):
+    a real given value passes through untouched; anything empty or not an
+    actual code (PORTBASE, a "check with .../contact ..." instruction, an
+    email address) falls back to "PCS". No other carrier-specific default.
+    """
+    def _clean(val) -> str:
+        v = (val or "").strip()
+        if not v:
+            return "PCS"
+        vu = v.upper()
+        if vu in ("PORTBASE", "NONE", "NULL", "N/A"):
+            return "PCS"
+        if "@" in v or "CHECK WITH" in vu or "CONTACT" in vu:
+            return "PCS"
+        return v
+
+    section["reference"] = _clean(section.get("reference"))
+    for ref in section.get("references", []):
+        ref["reference"] = _clean(ref.get("reference"))
+
+
 def _pcs_if_empty(section: dict):
     for ref in section.get("references", []):
         if not (ref.get("reference") or "").strip():
@@ -1122,6 +1166,50 @@ def _cosu_clean_return_ref(section: dict):
     for ref in section.get("references", []):
         r = ref.get("reference", "")
         ref["reference"] = _clean(r) if r else "PCS"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# HMM (HDMU) — fixed return-reference overrides by facility + container type
+# ─────────────────────────────────────────────────────────────────────
+_HDMU_RWG_STANDARD_TYPES = {"20DC", "20HRF", "2HRF", "4HRF", "40HRF", "40DC", "40HC"}
+_HDMU_RWG_SPECIAL_TYPES  = {"45DC", "45HRF"}
+_HDMU_ECT_SMALL_TYPES    = {"20DC", "20HRF", "2HRF"}
+_HDMU_ECT_LARGE_TYPES    = {"40DC", "40HRF", "4HRF"}
+
+
+def _hdmu_addr_bucket(addr: str) -> str:
+    a = (addr or "").upper()
+    if "ROTTERDAM WORLD GATEWAY" in a or re.search(r'\bRWG\b', a):
+        return "RWG"
+    if re.search(r'\bECT\b', a) or "DELTA TERMINAL" in a:
+        return "ECT"
+    return ""
+
+
+def _hdmu_apply_return_ref_rules(section: dict):
+    """
+    HMM return reference — fixed overrides for specific depot + container-type
+    combinations, regardless of whatever Turn-In Ref the document itself shows.
+    Any container/depot combo NOT covered by these rules keeps whatever the
+    document gave (or "" if nothing was given — HMM never defaults to PCS).
+    """
+    for ref in section.get("references", []):
+        bucket = _hdmu_addr_bucket(ref.get("address"))
+        ctype = (ref.get("container_type") or "").strip().upper().replace(" ", "")
+        if not bucket or not ctype:
+            continue
+
+        if bucket == "RWG":
+            if ctype in _HDMU_RWG_STANDARD_TYPES:
+                ref["reference"] = "JINF0008EMTX"
+            elif ctype in _HDMU_RWG_SPECIAL_TYPES:
+                ref["reference"] = "HMMSPECIAL"
+
+        elif bucket == "ECT":
+            if ctype in _HDMU_ECT_SMALL_TYPES:
+                ref["reference"] = "JMII0102E22002"
+            elif ctype in _HDMU_ECT_LARGE_TYPES:
+                ref["reference"] = "JMII0102E4500"
 
 
 def _oney_clean_pickup(section: dict):

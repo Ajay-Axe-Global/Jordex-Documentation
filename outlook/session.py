@@ -130,11 +130,15 @@ class OutlookSession:
         avoid a fresh MFA prompt. Mirrors JordexSession.hard_restart().
         """
         log.warning(f"[{self.service_key}] Hard restart: closing browser...")
-        try:
-            if self._context:
+        if self._context:
+            try:
+                self._backup_cookies()
+            except Exception as e:
+                log.warning(f"[{self.service_key}] hard_restart: error backing up cookies: {e}")
+            try:
                 self._context.close()
-        except Exception as e:
-            log.warning(f"[{self.service_key}] hard_restart: error closing context: {e}")
+            except Exception as e:
+                log.warning(f"[{self.service_key}] hard_restart: error closing context: {e}")
         self._context = None
         self._page    = None
 
@@ -348,10 +352,15 @@ class OutlookSession:
         try:
             with open(self._cookie_file) as f:
                 cookies = json.load(f)
-            valid = [c for c in cookies
-                     if any(d in c.get("domain", "") for d in ["microsoft", "outlook", "office", "live"])]
+            now = time.time()
+            valid = [
+                c for c in cookies
+                if any(d in c.get("domain", "") for d in ["microsoft", "outlook", "office", "live"])
+                and (c.get("expires", -1) == -1 or c.get("expires", 0) > now)
+            ]
             if valid:
                 self._context.add_cookies(valid)
+                log.info(f"[{self.service_key}] Restored {len(valid)} cookie(s) from backup")
         except Exception as e:
             log.warning(f"[{self.service_key}] Cookie restore: {e}")
 

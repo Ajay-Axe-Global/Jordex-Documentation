@@ -51,6 +51,7 @@ TERMINAL_SHORTCODES = {
     "KRAMER DISTRIPARK DEPOTS":       "VOORHEEN DR",
     "KRAMER DISTRIPARK":              "VOORHEEN DR",
     "ECT DELTA TERMINAL BV / DDE":    "DDE",
+    "E.C.T. Delta Terminal DDE" :       "DDE",
     "ECT DELTA TERMINAL BV":          "DDE",
     "ECT DELTA TERMINAL":             "ECT (DELTA)",
     "UWT BUNSCHOTENWEG":              "UWT DEPOTS 2",
@@ -65,7 +66,7 @@ TERMINAL_SHORTCODES = {
     "PSA ANTWERP K913":               "913",
     "ACC 1":                          "ACC TERMINAL",
     "KRAMER HOME":                    "KRAMER HOME",
-    "UWT MAASVLAKTE":                 "MAASVLAKTE",
+    "UWT MAASVLAKTE":                 "UWT MAASVLAKTE",
     "KRAMER TERMINAL":                "RCT / KRAMER",
     "NOORDZEE TERMINAL":              "913",
     "PSA ANTWERP K913":               "913",
@@ -82,6 +83,9 @@ TERMINAL_SHORTCODES = {
     "DR Depot Antwerpen"               :"DR Depots B.V.B.A",
     "PSA MPET Quay 1742":               "Deurganck Terminal Quays",
     "PSA MPET 1742":                  "Deurganck Terminal Quays",
+    "KDD KRAMER":                       "voorheen",
+    "KDD KRAMER MALAKKASTRAA":                       "voorheen",
+    "CTVrede Amsterdam":                    "VREDE"
 }
 
 # Pre-sorted longest key first so "ECT DELTA TERMINAL BV / DDE" matches before "ECT DELTA TERMINAL"
@@ -458,6 +462,25 @@ class DeliveryOrderService:
             ext = group["extraction"]
             if ext:
                 ext["subject"] = subject
+                # ── Cross-email merge ──────────────────────────────────
+                # The same shipment's containers can arrive across SEPARATE
+                # emails (e.g. released/cleared at different times), each
+                # attaching only that container's own DO. Without this,
+                # save_result() below would just overwrite whatever an
+                # earlier email already saved for this folder_name, silently
+                # dropping the containers/refs it had captured. Load any
+                # existing result.json and fold this email's extraction into
+                # it — same merge already used for multiple PDFs in one
+                # email — so containers accumulate across emails too.
+                existing_path = os.path.join(final_dir, "result.json")
+                if os.path.exists(existing_path):
+                    try:
+                        with open(existing_path) as f:
+                            existing_ext = json.load(f)
+                        ext = self._merge_extraction(existing_ext, ext)
+                        ext["subject"] = subject
+                    except Exception as e:
+                        log.warning(f"[{SERVICE_KEY}] Could not merge with existing result.json for '{folder_name}': {e}")
                 save_result(ext, final_dir)
                 mbl_val = ext.get("mbl") or ext.get("reference")
             else:
@@ -540,8 +563,9 @@ class DeliveryOrderService:
             cut = len(name)
 
         name = name[:cut].strip().upper()
-        # Normalize: B.V. → BV, extra spaces
-        name = name.replace("B.V.", "BV").replace("B.V", "BV")
+        # Normalize: strip all periods so abbreviations like "E.C.T." match
+        # the plain "ECT" table keys (also collapses "B.V." → "BV")
+        name = name.replace(".", "")
         name = re.sub(r'\s+', ' ', name).strip()
 
         for key in _SHORTCODE_KEYS_SORTED:
@@ -585,22 +609,39 @@ class DeliveryOrderService:
                 continue
  
             folder_name = item.get("folder_name") or query
-            if folder_name in uploaded_folders:
+
+            # ── Per-container aware dedup ────────────────────────────────
+            # A shipment's folder_name is shared by ALL its containers, but
+            # each container's DO can arrive in its OWN separate email. The
+            # three checks below used to treat "this folder was already
+            # uploaded" as a blanket signal to skip the item entirely —
+            # which silently dropped later emails carrying a DIFFERENT
+            # container's files under the same folder_name. Only skip when
+            # every file THIS item would upload is already recorded as
+            # uploaded for this folder_name; if it's carrying any file not
+            # seen before, let it through to search/upload.
+            item_basenames = {os.path.basename(f) for f in (item.get("files") or [])}
+            already_uploaded_basenames = {
+                os.path.basename(f) for f in tracker.get_uploaded_files(CAT, folder_name)
+            }
+            has_new_files = bool(item_basenames - already_uploaded_basenames)
+
+            if folder_name in uploaded_folders and not has_new_files:
                 log.info(
                     f"[{SERVICE_KEY}] Skipping duplicate folder '{folder_name}' "
-                    f"(conv_id={item.get('conv_id', '')[:20]}…) — already uploaded this batch"
+                    f"(conv_id={item.get('conv_id', '')[:20]}…) — already uploaded this batch, no new files"
                 )
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 continue
 
             previously_uploaded = tracker.data.get(CAT, {}).get(item.get("conv_id"), {}).get("uploaded_folders", [])
-            if folder_name in previously_uploaded:
-                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded in a previous run")
+            if folder_name in previously_uploaded and not has_new_files:
+                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded in a previous run, no new files")
                 continue
 
             if tracker.is_uploaded_elsewhere(CAT, folder_name=folder_name, mbl=item.get("mbl"),
-                                              exclude_conv_id=item.get("conv_id")):
-                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email")
+                                              exclude_conv_id=item.get("conv_id")) and not has_new_files:
+                log.info(f"[{SERVICE_KEY}] Skipping '{folder_name}' — already uploaded to Jordex under a different email, no new files")
                 tracker.update_status(CAT, item.get("conv_id"), "uploaded")
                 uploaded_folders.add(folder_name)
                 continue
@@ -1292,25 +1333,11 @@ class DeliveryOrderService:
           "... EUROPAWEG 875 ..."     → "EUROPAWEG"
           "... MAASVLAKTEWEG 951 ..." → "MAASVLAKTEWEG"
         """
-        # Pattern: word with 6+ alpha chars followed by a number within a few words
-        matches = re.findall(
-            r'\b([A-Za-z]{6,})\s+(\d{1,5})\b',
-            doc_address.upper()
-        )
- 
-        # Filter out noise words that look like streets but aren't
-        noise = {
-            "NETHERLANDS", "ROTTERDAM", "ANTWERPEN", "AMSTERDAM",
-            "BELGIUM", "GERMANY", "HAVENNUMMER", "TERMINAL",
-            "TERMINALS", "CONTAINER", "CONTAINERS",
-        }
- 
-        for word, _num in matches:
-            if word not in noise:
-                return word
- 
-        # Fallback: just find the longest word that looks like a street
-        # (words ending in common Dutch/German street suffixes)
+        # Prefer words ending in a recognized Dutch/German street suffix —
+        # this is unambiguous and checked FIRST, before the generic
+        # "word + number" pattern below, which is prone to false positives
+        # from non-address text (e.g. "Reference Number 12345",
+        # "Booking Number 456") sitting elsewhere in the same address blob.
         street_suffixes = ("WEG", "STRAAT", "LAAN", "KADE", "PLEIN", "GRACHT",
                            "SINGEL", "DIJK", "STEEG", "PAD", "BAAN", "DREEF",
                            "ALLEE", "STRASSE", "ROAD", "STREET", "AVENUE")
@@ -1319,6 +1346,25 @@ class DeliveryOrderService:
             for suffix in street_suffixes:
                 if w.endswith(suffix):
                     return w
+
+        # Fallback: word (6+ alpha chars) followed by a number within a few words
+        matches = re.findall(
+            r'\b([A-Za-z]{6,})\s+(\d{1,5})\b',
+            doc_address.upper()
+        )
+
+        # Filter out noise words that look like streets but aren't
+        noise = {
+            "NETHERLANDS", "ROTTERDAM", "ANTWERPEN", "AMSTERDAM",
+            "BELGIUM", "GERMANY", "HAVENNUMMER", "TERMINAL",
+            "TERMINALS", "CONTAINER", "CONTAINERS",
+            "NUMBER", "REFERENCE", "BOOKING", "RELEASE", "PINCODE",
+            "INVOICE", "PHONE", "MOBILE", "CONTACT", "SHIPMENT",
+        }
+
+        for word, _num in matches:
+            if word not in noise:
+                return word
  
         return ""
  

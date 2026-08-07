@@ -203,11 +203,39 @@ class CustomerDocsService:
 
             cleanup_temp(temp_files)
 
+            # ── Detect multi-MBL emails (one email, N PDFs, each has its own MBL) ──
+            # When every classified PDF has a DIFFERENT reference_number we must
+            # do one Jordex search PER PDF, not one search for the whole folder.
+            # Build a per_file_upload list: [{file, mbl, container_no}, ...]
+            per_file_upload = None
+            if cust_results and len(cust_results) > 1:
+                unique_refs = set(
+                    r.get("reference_number") for r in cust_results
+                    if r.get("reference_number")
+                )
+                if len(unique_refs) > 1:
+                    # Multi-MBL: group files by their individual reference_number
+                    per_file_upload = []
+                    for r in cust_results:
+                        ref = r.get("reference_number")
+                        src = r.get("source_file")
+                        cnt = r.get("container_no")
+                        if ref and src:
+                            per_file_upload.append({
+                                "file":        src,
+                                "mbl":         ref,
+                                "container_no": cnt,
+                            })
+                    log.info(
+                        f"[{SERVICE_KEY}] Multi-MBL email: {len(per_file_upload)} PDFs with "
+                        f"{len(unique_refs)} unique MBLs — will search Jordex individually"
+                    )
+
             # secondary_ref: whichever of container_no / reference_number was NOT
             # already used as the primary (folder_name), so the fallback search
             # actually tries a different value instead of repeating the primary.
             sec_ref = None
-            if cust_results:
+            if cust_results and not per_file_upload:
                 for r in cust_results:
                     primary = r.get("folder_name")
                     for candidate in (r.get("container_no"), r.get("reference_number")):
@@ -216,18 +244,19 @@ class CustomerDocsService:
                             break
                     if sec_ref:
                         break
-            
+
             tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded", secondary_ref=sec_ref)
             self._processed += 1
-            
+
             processed_items.append({
-                "conv_id":       cid,
-                "cat":           CAT,
-                "folder_path":   final_dir,
-                "folder_name":   folder_name,
-                "mbl":           None,
-                "secondary_ref": sec_ref,
-                "saved_files":   saved_files,
+                "conv_id":        cid,
+                "cat":            CAT,
+                "folder_path":    final_dir,
+                "folder_name":    folder_name,
+                "mbl":            None,
+                "secondary_ref":  sec_ref,
+                "saved_files":    saved_files,
+                "per_file_upload": per_file_upload,  # None = normal, list = multi-MBL
             })
 
             if page_stuck:
@@ -291,9 +320,27 @@ class CustomerDocsService:
         with a unique container — so all conv_ids and their saved_files
         are gathered here, keyed back to the conv_id that produced them,
         so upload success/failure can be attributed to the right email.
+
+        Multi-MBL items (per_file_upload is set) are passed through as-is
+        because each PDF already has its own MBL — they must NOT be merged
+        with other items by folder_name.
         """
         grouped: dict[str, dict] = {}
+        passthrough: list = []
         for item in items:
+            # Multi-MBL items skip grouping — upload logic handles them file by file
+            if item.get("per_file_upload"):
+                passthrough.append({
+                    "conv_ids":        [item["conv_id"]],
+                    "cat":             item["cat"],
+                    "folder_path":     item["folder_path"],
+                    "folder_name":     item["folder_name"],
+                    "mbl":             item.get("mbl"),
+                    "secondary_ref":   item.get("secondary_ref"),
+                    "file_conv_map":   {f: item["conv_id"] for f in item.get("saved_files") or []},
+                    "per_file_upload": item["per_file_upload"],
+                })
+                continue
             key = item["folder_name"]
             if key not in grouped:
                 grouped[key] = {
@@ -311,7 +358,7 @@ class CustomerDocsService:
                     grouped[key]["secondary_ref"] = item["secondary_ref"]
                 for f in item.get("saved_files") or []:
                     grouped[key]["file_conv_map"][f] = item["conv_id"]
-        return list(grouped.values())
+        return passthrough + list(grouped.values())
 
     def _upload_to_jordex(self, jordex_page, outlook_page, tracker: Tracker, items: list, jordex_session=None):
         """Returns the current jordex_page, which may be a fresh Page if
@@ -324,11 +371,82 @@ class CustomerDocsService:
         uploaded PER CONTAINER — each file's own container_no is searched
         individually so it lands on the one row it actually belongs to,
         instead of being broadcast to every row.
+
+        MULTI-MBL emails: if the item has a 'per_file_upload' list, each
+        PDF is searched + uploaded against its OWN unique MBL number — one
+        Jordex search per file, not one search that receives all files.
         """
         doc_type, display_name = JORDEX_MAPPING[CAT]
 
         for item in items:
             if self._stop_evt.is_set(): break
+
+            # ── Multi-MBL path: each file has its own unique MBL number ─────
+            per_file_upload = item.get("per_file_upload")
+            if per_file_upload:
+                conv_ids = item["conv_ids"]
+                full_file_map = build_customer_docs_file_map(item["folder_path"])
+                uploaded_files: set[str] = set()
+
+                for entry in per_file_upload:
+                    if self._stop_evt.is_set():
+                        break
+                    filename    = entry["file"]
+                    mbl_ref     = normalize_oi_reference(entry["mbl"])
+                    container_no = entry.get("container_no")
+
+                    if filename not in full_file_map:
+                        log.warning(f"[{SERVICE_KEY}] Multi-MBL: no file_map entry for '{filename}' — skipping")
+                        continue
+
+                    # Search Jordex using this file's own MBL (or container fallback)
+                    success, used_ref, rows_found, jordex_page = search_jordex_with_fallback(
+                        jordex_page=jordex_page,
+                        outlook_page=outlook_page,
+                        primary_ref=mbl_ref,
+                        secondary_ref=container_no,
+                        conv_id=conv_ids[0],
+                        tracker=tracker,
+                        cat=CAT,
+                        service_key=SERVICE_KEY,
+                        search_fn=search_and_open,
+                        jordex_session=jordex_session,
+                    )
+                    if not success:
+                        log.warning(f"[{SERVICE_KEY}] Multi-MBL: could not find '{mbl_ref}' in Jordex — skipping '{filename}'")
+                        continue
+
+                    success, _, jordex_page = search_and_open(
+                        jordex_page, used_ref, row_index=0, session=jordex_session
+                    )
+                    if not success:
+                        continue
+
+                    single_map = {filename: full_file_map[filename]}
+                    row_ok = upload_attachments(
+                        jordex_page, item["folder_path"], doc_type, display_name, file_map=single_map,
+                    )
+                    go_back(jordex_page)
+                    if row_ok:
+                        uploaded_files.add(filename)
+                        self._uploaded += 1
+                        log.info(f"[{SERVICE_KEY}] Multi-MBL: uploaded '{filename}' → '{mbl_ref}'")
+                    else:
+                        log.warning(f"[{SERVICE_KEY}] Multi-MBL: upload not confirmed for '{filename}' ({mbl_ref})")
+
+                # Mark the whole email done if all files succeeded
+                if uploaded_files:
+                    for cid in conv_ids:
+                        tracker.update_status(CAT, cid, "uploaded")
+                else:
+                    for cid in conv_ids:
+                        try:
+                            mark_as_unread(outlook_page, cid)
+                        except Exception:
+                            pass
+                continue  # done with this item — skip normal single-MBL logic below
+
+            # ── Normal path (single MBL per email / same MBL across files) ───
             query = item.get("mbl") or item.get("folder_name")
             if not query: continue
 

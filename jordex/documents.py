@@ -531,12 +531,13 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
         # ── LAYER 2: Hash-based check ──
         # For files that get renamed (e.g. Invoice carrier, AN, DO)
         # Download existing, compare SHA-256 → same = skip, different = upload
-        if actual_name and actual_name.lower() in existing_hashes:
-            local_hash = get_file_hash(pdf_path)
-            if local_hash in existing_hashes[actual_name.lower()]:
-                log.info(f"  '{filename}' is IDENTICAL to existing '{actual_name}' (uploaded today) — skipping.")
+        local_hash = get_file_hash(pdf_path)
+        if actual_name:
+            name_lower = actual_name.lower()
+            if name_lower in existing_hashes and local_hash in existing_hashes[name_lower]:
+                log.info(f"  '{filename}' is IDENTICAL to existing '{actual_name}' (uploaded today or earlier in batch) — skipping.")
                 continue
-            else:
+            elif name_lower in existing_hashes:
                 log.info(f"  '{filename}' hash differs from existing '{actual_name}' — uploading as new file.")
 
         log.info(f"  Uploading '{filename}' as type='{actual_type}' name='{actual_name}'...")
@@ -737,6 +738,10 @@ def upload_attachments(page, folder_path, document_type, display_name=None, file
                             log.info(f"  OK Uploaded (dialog closed after wait): '{filename}' as '{actual_name}'")
                 except Exception:
                     pass
+
+            if upload_confirmed:
+                if actual_name:
+                    existing_hashes.setdefault(actual_name.lower(), set()).add(local_hash)
 
             # ── Check for error toast ────────────────────────────────
             if not upload_confirmed:

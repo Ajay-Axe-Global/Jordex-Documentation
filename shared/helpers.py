@@ -1007,7 +1007,7 @@ def search_jordex_with_fallback(
 # ══════════════════════════════════════════════════════════════════════
 
 KNOWN_SCAC_PREFIXES = {
-    "HLCU", "MAEU", "MRKU", "MSCU", "MEDU", "ONEY", "YMLU", "EGLV",
+    "HLCU", "MAEU", "MRKU", "MSCU", "MEDU", "ONEY", "YMJA", "YMLU", "EGLV",
     "COSU", "OOLU", "ZIMU", "CMDU", "HDMU", "PCIU", "WHLC", "SUDU",
     "COEU", "PNKG", "ANNU", "APLU", "CHNJ", "SMLM", "SNKO",
 }
@@ -1024,7 +1024,7 @@ CARRIER_NAME_TO_SCAC = {
     "OOCL":                 "OOLU",
     "EVERGREEN":            "EGLV",
     "ZIM":                  "ZIMU",
-    "YANG MING":            "YMLU",
+    "YANG MING":            "YMJA",
     "HMM":                  "HDMU",
     "HYUNDAI":              "HDMU",
     "COSCO":                "COSU",
@@ -1051,7 +1051,7 @@ def resolve_carrier_code(carrier_name: str, carrier_code: str) -> str | None:
 # Known carrier B/L prefixes that are NOT the SCAC but DO indicate
 # the carrier identity is already embedded in the reference number.
 CARRIER_BL_PREFIXES = {
-    "YM":   "YMLU",   # Yang Ming: YMJAN..., YMLUW...
+    "YM":   "YMJA",   # Yang Ming: YMJAN..., YMLUW...
     "ONE":  "ONEY",   # ONE: ONEY already caught, but ONE prefix too
     "HD":   "HDMU",   # HMM/Hyundai: HDMU caught, but HDJS... etc
     "CM":   "CMDU",   # CMA CGM: CMDU caught, but CMAJ... etc

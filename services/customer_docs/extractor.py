@@ -30,7 +30,7 @@ log = logging.getLogger("customer_docs")
 # ══════════════════════════════════════════════════════════════════════
 
 _KNOWN_SCAC_PREFIXES = {
-    "HLCU", "MAEU", "MRKU", "MSCU", "MEDU", "ONEY", "YMLU", "EGLV",
+    "HLCU", "MAEU", "MRKU", "MSCU", "MEDU", "ONEY", "YMJA", "YMLU", "EGLV",
     "COSU", "OOLU", "ZIMU", "CMDU", "HDMU", "PCIU", "WHLC", "SUDU",
     "COEU",
 }
@@ -48,7 +48,7 @@ _CARRIER_TO_SCAC = {
     "ZIM":                  "ZIMU",
     "ONE":                  "ONEY",
     "OCEAN NETWORK EXPRESS":"ONEY",
-    "YANG MING":            "YMLU",
+    "YANG MING":            "YMJA",
     "HMM":                  "HDMU",
     "HYUNDAI":              "HDMU",
     "COSCO":                "COSU",
@@ -295,7 +295,7 @@ PRIORITY 0 — Prefer carrier-identifiable references over internal IDs:
   number", "Case number", "Job number", "Customer reference number",
   "Reference", "Booking number"). When more than one is present, PREFER
   the value that starts with a known 4-letter ocean-carrier SCAC code
-  (MAEU, HLCU, MSCU, MEDU, ONEY, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU,
+  (MAEU, HLCU, MSCU, MEDU, ONEY, YMJA, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU,
   HDMU, PCIU, WHLC, SUDU) or matches an OI pattern — these are the values
   Jordex can actually be searched by. A plain internal order/job/case
   number issued by a customs broker, surveyor, or agent (not the carrier)

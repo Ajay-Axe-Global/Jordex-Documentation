@@ -20,7 +20,7 @@ CARRIER_SCAC = {
     "pil": "PCIU",
     "fps": "FPS", "famous pacific": "FPS", "famous pacific shipping": "FPS",
 }
-KNOWN_SCAC = set(CARRIER_SCAC.values()).union({"MEDU", "MRKU", "SUDU"})
+KNOWN_SCAC = set(CARRIER_SCAC.values()).union({"MEDU", "MRKU", "SUDU", "YMLU"})
 CONTAINER_RE = re.compile(r'\b([A-Z]{4})\s*(\d{7})\b')
 
 # ── Address normalization map ────────────────────────────────────────
@@ -69,7 +69,7 @@ doc_subtype rules:
 - "other": anything else — including Terms and Conditions pages,
   general instructions, cover letters, or documents with no container/shipment data.
 
-MBL: starts with SCAC (HLCU, MAEU, MRKU, MSCU, MEDU, ONEY, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU, HDMU).
+MBL: starts with SCAC (HLCU, MAEU, MRKU, MSCU, MEDU, ONEY, YMJA, YMLU, EGLV, COSU, OOLU, ZIMU, CMDU, HDMU).
 *EXCEPTION*: For Maersk (MAEU), the B/L number is often purely numeric (e.g., "270557106"). If you see "B/L number: [digits]", extract exactly those digits. Do NOT extract the "Request Number" (like "HZJQCNSXZ5K") as the MBL.
 *CRITICAL — Hapag-Lloyd "Customer Release" documents*: the container table has a
 "Bill of Lading" column AND a separate "Shipment" column right next to each
@@ -79,6 +79,15 @@ other, both showing numbers. These are DIFFERENT values:
     number, NOT the MBL. NEVER extract this as the mbl field, even though it
     sits right next to the Bill of Lading value and can look similar.
   If you see BOTH columns, the "Bill of Lading" value always wins.
+*CRITICAL — CMA CGM "Release Notification" documents*: the top-left info block has TWO
+different reference numbers stacked directly on top of each other:
+  - "Release Notification NR" (e.g. "DORTM01460890") → an INTERNAL notification number.
+    NEVER extract this as the mbl field, even though it's the first/topmost value.
+  - "B/L - NO" (e.g. "AKD0358445") → this IS the MBL. Always use this one.
+  CMA CGM B/L numbers frequently do NOT start with "CMDU" — they can be a plain
+  booking-style code like "AKD0358445". Extract the "B/L - NO" value exactly as
+  printed even if it does not start with a SCAC prefix; do not substitute the
+  Release Notification NR just because the B/L doesn't look like a SCAC code.
 Container: STRICTLY 4 uppercase letters + 7 digits (e.g. TGBU4744557, HMMU4531833).
 Do NOT extract voyage numbers (e.g. ODUT0019W, 0087W), vessel codes, or booking numbers as containers.
 If the container table is empty or has no data rows → containers = [].
@@ -266,9 +275,9 @@ CARRIER_PROMPTS["FPS"] = """Return ONLY: {"pickup": null, "return": null, "flag"
 This is an FPS document. No pickup/return extraction needed. Upload only."""
 
 # ─────────────────────────────────────────────────────────────────────
-# 5. YANG MING (YMLU) — "release message"
+# 5. YANG MING (YMJA) — "release message"
 # ─────────────────────────────────────────────────────────────────────
-CARRIER_PROMPTS["YMLU"] = _OUTPUT_SCHEMA + """
+CARRIER_PROMPTS["YMJA"] = _OUTPUT_SCHEMA + """
 This is a Yang Ming release message.
 
 PICKUP:
@@ -300,6 +309,11 @@ PICKUP:
   → If a pincode value exists → use it.
   → If blank or no PIN field → use "PCS".
  
+- Also read the container SIZE/TYPE for each container (e.g. "20GP", "40HQ", "45HQ")
+  from the container table's SIZE/TYPE column, and add it to EVERY pickup AND return
+  reference entry as an extra key "container_type" (e.g. "container_type": "20GP").
+  Use the code exactly as printed on the document — do not guess or normalize it.
+
 RETURN:
 - address = ALWAYS the "EMPTY RETURN LOCATION" section value (middle, below
   container table) — for EVERY container, no exceptions. REMARKS never
@@ -324,7 +338,7 @@ RETURN:
   Spacing/punctuation around "=", "-", ":" varies between documents — treat
   these as equivalent, all meaning the same thing:
     "20GP + 20RF = UWT DEPOT 2 - REFERENCE :?CONTAINER NUMBER"
-    "40GP = EUROMAX"
+    "40GP + 40HQ = EUROMAX"
     "40HQ = RCT Kramer Delta - CONTAINER NUMBER"
     "40HQ=RCT Kramer Delta-CONTAINER NUMBER"
     "45HQ = UWT MAASVLAKTE ? REFERENCE: CONTAINER NUMBER"
@@ -332,45 +346,71 @@ RETURN:
   HOW TO READ EACH LINE (for REFERENCE ONLY):
   1. Match the container's SIZE/TYPE (from the table: 20GP, 40GP, 40HQ, etc.)
      to a REMARKS line.
-  2. CHECK THE DEPOT NAME MATCHES "EMPTY RETURN LOCATION" before doing
-     anything else. Compare the depot named in the matched REMARKS line to
-     the "EMPTY RETURN LOCATION" text as PLAIN TEXT — do NOT guess at
-     real-world abbreviations, aliases, or "these are actually the same
-     port" reasoning. Different depot/terminal names (even ones that sound
-     similar, e.g. "RCT Kramer Delta" vs "Rotterdam Container Terminal")
-     are DIFFERENT facilities unless the name in EMPTY RETURN LOCATION
-     substantially appears in the REMARKS depot name (or vice versa).
-     a) If the names substantially match → continue to step 3 to decide
-        the reference value.
-     b) If the REMARKS depot name is a DIFFERENT, unrelated name than
-        "EMPTY RETURN LOCATION" (e.g. remarks says "EUROMAX" or "RCT
-        Kramer Delta" but EMPTY RETURN LOCATION says "Rotterdam Container
-        Terminal") → reference = "" (empty). Do NOT apply the REMARKS
-        reference rule when the depot doesn't match — the remarks table
-        can be generic/boilerplate that doesn't apply to this specific
-        shipment's actual return location.
-  3. Only once step 2 confirms a match, check if the matched line contains
-     the phrase "CONTAINER NUMBER" anywhere after the "=" — ignore spacing,
-     hyphens, "?", or "REFERENCE:" around it, they're just formatting
-     noise. Do a loose text search for "CONTAINER NUMBER" in that line,
-     not an exact-punctuation match.
-     a) If "CONTAINER NUMBER" appears anywhere in the matched line
-        → reference = the container's ACTUAL container number
-          (e.g. container FCIU9722468 → reference = "FCIU9722468")
-     b) If the matched line has a depot name only, with no "CONTAINER
-        NUMBER" wording at all
-        → reference = "" (empty)
-  4. If no REMARKS line matches this container's SIZE/TYPE at all
+  2. Look at what follows "=" on that line and split into ONE OF TWO CASES:
+
+     CASE A — BARE VALUE (no "REFERENCE" and no "CONTAINER NUMBER" wording
+     anywhere on the line, just a short word/code after "="):
+       Example: "40GP + 40HQ = EUROMAX"
+       There is no depot name to verify here — this is NOT an address to
+       compare against anything. The word itself ("EUROMAX") IS the
+       reference value. Use it exactly as printed, UNCONDITIONALLY —
+       do NOT compare it to "EMPTY RETURN LOCATION", do NOT reject it for
+       "not matching" the return address. It always applies when the
+       container's SIZE/TYPE matches this line.
+         → reference = "EUROMAX" (or whatever the bare word/code is)
+
+     CASE B — DEPOT NAME + EXPLICIT INSTRUCTION ("REFERENCE" and/or
+     "CONTAINER NUMBER" wording present after the depot name):
+       Examples: "20GP = UWT DEPOT 2-REFERENCE:?CONTAINER NUMBER",
+                 "45HQ = UWT MAASVLAKTE ? REFERENCE: CONTAINER NUMBER"
+       Here the text before "REFERENCE"/"CONTAINER NUMBER" IS a real depot
+       name that DOES need verifying against "EMPTY RETURN LOCATION" —
+       but THINK about it, don't do a rigid literal substring check. Real
+       depot names get written differently in different places on the same
+       document: one might include the street name, the other might put a
+       qualifier in parentheses, word order can differ, etc. Identify the
+       KEY IDENTIFYING WORDS of the REMARKS depot name (the operator code
+       and any depot/unit number — e.g. "UWT" and "DEPOT 2" out of "UWT
+       DEPOT 2"; "RCT" and "KRAMER" out of "RCT Kramer Delta"), then check
+       whether those SAME key words all appear somewhere in the EMPTY
+       RETURN LOCATION text too, in any order, even if other words (a
+       street name, a parenthetical, punctuation) sit between them.
+         Example — MATCH: REMARKS says "20GP = UWT DEPOT 2 - CONTAINER
+         NUMBER" and EMPTY RETURN LOCATION says "UWT Bunschotenweg (Depot
+         2)". Key words "UWT" and "DEPOT 2" both appear in the EMPTY
+         RETURN LOCATION text — the street name "Bunschotenweg" sitting
+         between them does not break the match. SAME facility.
+       a) If the key identifying words overlap (match) → reference = the
+          container's ACTUAL container number (e.g. container FCIU9722468
+          → reference = "FCIU9722468") if the line said "CONTAINER
+          NUMBER"; if instead it names some other explicit code after
+          "REFERENCE:", use that code.
+       b) If the REMARKS depot name shares NO key identifying words with
+          "EMPTY RETURN LOCATION" (e.g. remarks says "RCT Kramer Delta"
+          but EMPTY RETURN LOCATION says "Rotterdam Container Terminal" —
+          nothing overlaps) → reference = "" (empty). Do NOT apply the
+          REMARKS reference rule when the depot genuinely doesn't match —
+          the remarks table can be generic/boilerplate that doesn't apply
+          to this specific shipment's actual return location.
+  3. If no REMARKS line's SIZE/TYPE matches this container at all
      → reference = ""
 
   CRITICAL: "CONTAINER NUMBER" is a LITERAL instruction meaning
-  "use the actual container number as the reference value".
-  It is NOT a placeholder for you to ignore, and it is NEVER copied
-  literally as the string "CONTAINER NUMBER" — always substitute the real
-  container number.
+  "use the actual container number as the reference value" — but this
+  instruction ONLY exists within a Case B (depot name) line. It is NEVER
+  copied literally as the string "CONTAINER NUMBER" — always substitute
+  the real container number. Do not confuse Case A's bare code value
+  (e.g. "EUROMAX") with a Case B depot name — Case A never gets compared
+  against the return address, Case B always does.
 
-  Example — MATCH — container TGBU4744557 (40HQ), EMPTY RETURN LOCATION =
-  "Rotterdam Container Terminal, Missouriweg 17", remarks line
+  Example — CASE A: container TCKU1234567 (40HQ), remarks line
+  "40GP + 40HQ = EUROMAX" (bare code, no REFERENCE/CONTAINER NUMBER
+  wording) — the return address doesn't matter at all here, even if it
+  says "CTVrede Amsterdam":
+    → return.references[].reference (this container's entry) = "EUROMAX"
+
+  Example — CASE B MATCH — container TGBU4744557 (40HQ), EMPTY RETURN
+  LOCATION = "Rotterdam Container Terminal, Missouriweg 17", remarks line
   "40HQ = Rotterdam Container Terminal - CONTAINER NUMBER" (same name
   appears in both):
     → return.address = "Rotterdam Container Terminal, Missouriweg 17"
@@ -378,8 +418,8 @@ RETURN:
         "Rotterdam Container Terminal, Missouriweg 17"  (same, unchanged)
     → return.references[].reference (this container's entry) = "TGBU4744557"
 
-  Example — NO MATCH — container CSGU7150657 (40HQ), EMPTY RETURN LOCATION
-  = "Rotterdam Container Terminal, Missouriweg 17", remarks line
+  Example — CASE B NO MATCH — container CSGU7150657 (40HQ), EMPTY RETURN
+  LOCATION = "Rotterdam Container Terminal, Missouriweg 17", remarks line
   "40HQ = RCT Kramer Delta - CONTAINER NUMBER" ("RCT Kramer Delta" is a
   different, unrelated depot name — do NOT assume it means the same
   terminal):
@@ -410,8 +450,9 @@ PICKUP:
 - address = "Cargo Release Facility" field.
   Example: "Rotterdam World Gateway, Havennummer 8970 Amoeweg 50, 3199 KD MAASVLAKTE ROTTERDAM"
 - reference per container = "PIN No." column in the "Container Information" table.
-  → If it says "Secure Chain" or is empty → use "PCS".
-  → If an actual PIN value exists → use it.
+  → CRITICAL: If the PIN No. column literally says "Secure Chain", you MUST output "PCS". NEVER extract the string "Secure Chain" as the reference.
+  → If it is empty or says "Portbase" → use "PCS".
+  → If an actual alphanumeric PIN value exists → use it.
   CAREFUL: Do NOT confuse PIN with the package count or weight numbers.
 
 RETURN:
@@ -476,12 +517,60 @@ RETURN — THIS TABLE CAN HAVE MULTIPLE ROWS WITH DIFFERENT ADDRESSES:
     Row 1: "KRAMER DELTA CMA CGM" → TEMU5177226, SEGU1192041 → "CMA STOCK"
     Row 2: "UNITED WAALHAVEN TERMINAL (UWT DEPOT 7)" → TRHU3267601 → "CMA STOCK 28"
 - You MUST match each container to its SPECIFIC row to get the correct address AND ref.
+
+  HOW TO PARSE THIS TABLE WHEN AN ADDRESS BLOCK SPANS MULTIPLE LINES —
+  this is the layout that trips up extraction, so read carefully:
+  Each depot in the EMPTY RETURN ADDRESS column is a BLOCK of several
+  stacked lines: company NAME first (e.g. "KRAMER DISTRIPARK DEPOTS"),
+  then street + number, then optionally "Havennummer ####", then
+  city/postal code. A block ONLY starts at a new company NAME line — a
+  bare street name, a bare "Havennummer ####" line, or a bare postal
+  code / city line (e.g. "3089" or "3199 LZ") sitting by itself is NEVER
+  the start of a new block, it is a continuation of the block whose NAME
+  most recently appeared above it, even if it's several lines further
+  down.
+  The CONTAINERS column runs in parallel down the same vertical space,
+  but its rows do NOT line up 1-to-1 with the address block's own lines
+  — a block with a 1-line address can have MANY container rows next to
+  it, and the block's trailing detail line (e.g. its postal code) can
+  print BELOW all of those container rows, purely because of how the
+  PDF/table renders vertical space, not because a new depot started.
+  Rule: every container number belongs to whichever company NAME block
+  is the CLOSEST one ABOVE it in the EMPTY RETURN ADDRESS column — keep
+  assigning containers to that same NAME/block until you hit the NEXT
+  company NAME line, no matter how many container rows or trailing
+  address-detail lines (postal code, city, blank rows) appear in between.
+  Worked example matching this exact layout:
+    "KRAMER DISTRIPARK DEPOTS / Malakkastraat 51 / Havennummer 8564 /
+     MAASVLAKTE / 3199 LK"   → paired (same row) with CMAU3666510
+    "KRAMER HOME / REEWEG 25" → then THREE container rows follow
+     (TLLU4290809, SELU4144898, TCNU3912506) with no new NAME line
+     between them, and only afterward a lone trailing line "3089" —
+     ALL THREE containers still belong to "KRAMER HOME", and "3089" is
+     KRAMER HOME's postal code, not a new/unnamed depot.
+    "UWT MAASVLAKTE / AFRIKAWEG 11 / 3199 LZ" → paired with TCKU7261326.
+  So the correct mapping is: CMAU3666510 → KRAMER DISTRIPARK DEPOTS;
+  TLLU4290809, SELU4144898, TCNU3912506 → KRAMER HOME (all three, not
+  split across two depots); TCKU7261326 → UWT MAASVLAKTE.
+  Do NOT invent a 4th/unnamed depot from a stray postal-code-only line.
+  Do NOT shift a container to the NEXT NAME block just because a detail
+  line from the CURRENT block happens to print near/after that container
+  row — always go by "closest company NAME line above," not by literal
+  same-row visual alignment.
+
 - In the references array, each container MUST have:
     - "address": the depot from ITS specific row (not a shared address)
-    - "reference": the Turn-In-Ref from ITS specific row
+    - "reference": the Turn-In-Ref from ITS specific row, exactly as printed next
+      to it — if a container's own row has no Turn-In-Ref printed, write "" for
+      it. Do NOT guess or copy a nearby value yourself; leave it genuinely blank.
+      CRITICAL: NEVER extract the carrier name (e.g. "CMA CGM") or contact details
+      from the right side of the page as a reference when the Turn-In-Ref column is empty.
+      (A blank here does not necessarily mean "no reference exists" — the table
+      sometimes prints one Turn-In-Ref once for a whole batch of containers due
+      to a merged cell or page break, rather than repeating it on every row.
+      That reconciliation is handled afterward from the raw blanks you report,
+      so just transcribe exactly what's printed on each specific row.)
 - The top-level return.address should be the FIRST depot (or leave empty if multiple).
-  → If a Turn-In-Ref value exists → use it exactly.
-  → If blank for a specific container → "".
   → If ALL containers have blank Turn-In-Ref → set flag = "forward_to_client".
 
   CRITICAL — GENERAL RULE for reading a Turn-In-Ref cell: take ONLY the
@@ -703,7 +792,7 @@ def _detect_carrier_from_text(text: str) -> tuple[str, str]:
         ("MAERSK", "maersk", "MAEU"),
         ("MEDITERRANEAN SHIPPING", "msc", "MSCU"),
         ("OCEAN NETWORK EXPRESS", "one", "ONEY"),
-        ("YANG MING", "yang ming", "YMLU"),
+        ("YANG MING", "yang ming", "YMJA"),
         ("EVERGREEN", "evergreen", "EGLV"),
         ("COSCO", "cosco", "COSU"),
         ("OOCL", "oocl", "OOLU"),
@@ -1019,13 +1108,13 @@ def _apply_safety_net(scac: str, result: dict) -> dict:
         _pcs_if_empty(pickup)
         _cosu_clean_return_ref(ret)
 
-    elif scac == "YMLU":
+    elif scac == "YMJA":
         _ymlu_clean_refs(pickup)
         _ymlu_clean_refs(ret)
 
     elif scac == "OOLU":
         _pcs_if_empty(pickup)
-        # Return refs handled by prompt (REMARKS-based)
+        _oolu_apply_return_ref_rules(ret, result.get("_pdf_path", ""))
 
     elif scac == "HDMU":
         _pcs_if_empty(pickup)
@@ -1033,6 +1122,8 @@ def _apply_safety_net(scac: str, result: dict) -> dict:
 
     elif scac == "CMDU":
         _cmdu_clean_pickup(pickup)
+        _cmdu_fill_return_refs(ret)
+        _cmdu_reconcile_return_addresses(ret, result)
         if not _has_any_reference(ret):
             _cmdu_scan_return_ref(ret, result)
 
@@ -1212,6 +1303,133 @@ def _hdmu_apply_return_ref_rules(section: dict):
                 ref["reference"] = "JMII0102E4500"
 
 
+# ─────────────────────────────────────────────────────────────────────
+# OOCL (OOLU) — deterministic REMARKS-table return-reference resolver
+# ─────────────────────────────────────────────────────────────────────
+# Matching depot names between the REMARKS table and EMPTY RETURN LOCATION
+# is a fuzzy-text-reasoning task the model does inconsistently (e.g. it can
+# miss "UWT DEPOT 2" matching "UWT Bunschotenweg (Depot 2)" even when told
+# to reason about it). Doing the parsing + matching deterministically in
+# code removes that inconsistency — the model is only asked to transcribe
+# raw facts (address, container_type), never to judge whether two depot
+# names refer to the same facility.
+_OOLU_NOISE_WORDS = {"BV", "TERMINAL", "TERMINALS", "THE"}
+
+_OOLU_REMARKS_LINE_RE = re.compile(
+    r'^\s*(\d{2}[A-Z]{1,3}(?:\s*[+,]\s*\d{2}[A-Z]{1,3})*)\s*=\s*(.+?)\s*$',
+    re.MULTILINE
+)
+
+_OOLU_CONTAINER_ROW_RE = re.compile(
+    r'\b([A-Z]{4}\d{7})\b[^\n]{0,60}?\b(\d{2}[A-Z]{1,3})\b'
+)
+
+
+def _oolu_key_tokens(name: str) -> set:
+    words = re.findall(r'[A-Z0-9]+', (name or "").upper())
+    return {w for w in words if w not in _OOLU_NOISE_WORDS}
+
+
+def _oolu_parse_remarks(raw_text: str) -> list:
+    """
+    Parse OOCL REMARKS lines into (container_types, rule) tuples, where
+    rule is one of two shapes depending on what follows "=":
+
+      ("code", value)   — a BARE value/code line with no "REFERENCE" or
+                           "CONTAINER NUMBER" wording at all, e.g.
+                           "40GP + 40HQ = EUROMAX". There is no depot name
+                           to verify here — `value` ("EUROMAX") IS the
+                           reference, used as-is, unconditionally. No
+                           comparison against the actual return address.
+
+      ("depot", name)   — a depot NAME followed by an explicit reference
+                           instruction, e.g. "20GP = UWT DEPOT 2-REFERENCE:
+                           ?CONTAINER NUMBER". This DOES need verification:
+                           `name` must be compared against the container's
+                           actual return address — match -> use the
+                           container number, mismatch -> "".
+    """
+    m = re.search(r'REMARKS\s*(.*)', raw_text, re.IGNORECASE | re.DOTALL)
+    section = m.group(1) if m else raw_text
+    rules = []
+    for lm in _OOLU_REMARKS_LINE_RE.finditer(section.upper()):
+        types_part, rest = lm.group(1), lm.group(2)
+        types = [t.strip() for t in re.split(r'[+,]', types_part) if t.strip()]
+        if not types:
+            continue
+
+        if "REFERENCE" in rest or "CONTAINER NUMBER" in rest:
+            depot = re.split(r'(?:[-–?:]\s*)?REFERENCE|CONTAINER NUMBER', rest, maxsplit=1)[0]
+            depot = depot.strip(" -–:?")
+            if depot:
+                rules.append((types, ("depot", depot)))
+        else:
+            value = rest.strip(" -–:?")
+            if value:
+                rules.append((types, ("code", value)))
+    return rules
+
+
+def _oolu_scan_container_types(raw_text: str) -> dict:
+    """Best-effort container_no -> size/type map from the container table,
+    used only when Gemini didn't fill container_type itself."""
+    result = {}
+    for m in _OOLU_CONTAINER_ROW_RE.finditer(raw_text.upper()):
+        cno, ctype = m.group(1), m.group(2)
+        result.setdefault(cno, ctype)
+    return result
+
+
+def _oolu_apply_return_ref_rules(section: dict, pdf_path: str):
+    """
+    Deterministically resolve OOLU return references from the REMARKS
+    table instead of relying on the model's fuzzy depot-name matching.
+    For each container, find the REMARKS line whose container type
+    matches, then apply its rule:
+      - ("code", value)  -> reference = value, unconditionally (no depot
+        to verify — see _oolu_parse_remarks).
+      - ("depot", name)  -> compare name's key words against this
+        container's actual return address: match -> container number,
+        mismatch -> "" (empty).
+    If no REMARKS line matches this container's type at all -> leave
+    whatever Gemini already produced untouched.
+    """
+    if not pdf_path:
+        return
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            raw = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception as e:
+        log.warning("OOLU REMARKS scan failed to read PDF: %s", e)
+        return
+
+    rules = _oolu_parse_remarks(raw)
+    if not rules:
+        return
+    type_by_container = _oolu_scan_container_types(raw)
+
+    for ref in section.get("references", []):
+        cno = (ref.get("container_no") or "").strip().upper()
+        ctype = re.sub(r'\s+', '', (ref.get("container_type") or "").upper())
+        if not ctype:
+            ctype = type_by_container.get(cno, "")
+        if not ctype:
+            continue
+
+        addr_tokens = _oolu_key_tokens(ref.get("address") or section.get("address") or "")
+        for types, rule in rules:
+            if ctype not in types:
+                continue
+            kind, value = rule
+            if kind == "code":
+                ref["reference"] = value
+            else:
+                depot_tokens = _oolu_key_tokens(value)
+                ref["reference"] = cno if (depot_tokens and depot_tokens <= addr_tokens) else ""
+            break
+
+
 def _oney_clean_pickup(section: dict):
     def _is_sri(val):
         return bool(re.match(r'^[A-Z]{2}\d+$', val.strip().upper()))
@@ -1265,6 +1483,112 @@ def _cmdu_clean_pickup(section: dict):
             ref["reference"] = "PCS"
 
 
+def _cmdu_fill_return_refs(section: dict):
+    """
+    CMA CGM's EMPTY RETURN ADDRESS table sometimes prints one Turn-In-Ref
+    value once for a whole batch of containers (a merged cell, or a table
+    that continues onto a second page) rather than repeating it on every
+    row. Gemini is told to transcribe exactly what's printed per row
+    (leaving genuinely blank rows blank) — this reconciles those blanks
+    afterward, deterministically, using the container list's own order:
+
+      1. Forward pass: carry the last non-blank reference down through any
+         run of blank rows that follows it (works across any number of
+         consecutive blanks and across depot-block boundaries).
+      2. Backward pass: any blank(s) at the very START of the list with no
+         reference before them at all borrow the nearest reference that
+         comes AFTER them instead.
+      3. If no reference exists anywhere in the whole list, both passes
+         leave it untouched — stays "" (empty), which is correct: there is
+         genuinely nothing to reconcile.
+    """
+    refs = section.get("references", [])
+    if len(refs) < 2:
+        return
+
+    last_seen = None
+    for ref in refs:
+        val = (ref.get("reference") or "").strip()
+        if val:
+            last_seen = val
+        elif last_seen:
+            ref["reference"] = last_seen
+
+    next_seen = None
+    for ref in reversed(refs):
+        val = (ref.get("reference") or "").strip()
+        if val:
+            next_seen = val
+        elif next_seen:
+            ref["reference"] = next_seen
+
+
+def _cmdu_reconcile_return_addresses(ret_section: dict, result: dict):
+    """
+    CMA CGM's EMPTY RETURN ADDRESS table stacks multiple depot blocks
+    (name, street, haven number, postal/city) vertically, with container
+    rows interleaved and NOT aligned 1:1 with each block's own detail
+    lines — see the worked example in CARRIER_PROMPTS["CMDU"]. Reading
+    this from a rendered image, Gemini can swap a container onto the
+    wrong depot.
+
+    pdfplumber's text extraction reconstructs the document's real
+    top-to-bottom reading order per line, which turns out to reliably
+    pair each container with its depot: a depot NAME line never has a
+    digit (e.g. "KRAMER HOME"), while a street/haven/postal continuation
+    line always does (house number, haven number, postal code). So on
+    every line that contains a container number, the text before it
+    starts a NEW depot only when that prefix has no digits — otherwise
+    the container still belongs to whichever depot name most recently
+    started. This is deterministic and wins over Gemini's guess, same
+    pattern as _cmdu_scan_return_ref/_cmdu_scan_bl_number.
+    """
+    pdf_path = result.get("_pdf_path", "")
+    if not pdf_path:
+        return
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as _pdf:
+            lines = []
+            for p in _pdf.pages:
+                lines.extend((p.extract_text() or "").split("\n"))
+    except Exception as e:
+        log.warning("CMDU return-address scan failed: %s", e)
+        return
+
+    start = None
+    for i, line in enumerate(lines):
+        if "EMPTY RETURN ADDRESS" in line.upper():
+            start = i + 1
+            break
+    if start is None:
+        return
+
+    mapping = {}
+    current_depot = None
+    for line in lines[start:]:
+        m = CONTAINER_RE.search(line)
+        if not m:
+            continue
+        prefix = line[:m.start()].strip()
+        if prefix and not re.search(r'\d', prefix):
+            current_depot = prefix
+        if current_depot:
+            mapping[f"{m.group(1)}{m.group(2)}"] = current_depot
+
+    if not mapping:
+        return
+
+    for ref in ret_section.get("references", []):
+        cno = ref.get("container_no", "")
+        if cno in mapping:
+            ref["address"] = normalize_address(mapping[cno])
+
+    # First depot encountered in TABLE order (not containers[] order),
+    # matching the prompt's "top-level address = the FIRST depot" rule.
+    ret_section["address"] = normalize_address(next(iter(mapping.values())))
+
+
 def _cmdu_scan_return_ref(ret_section: dict, result: dict):
     pdf_path = result.get("_pdf_path", "")
     if not pdf_path:
@@ -1287,6 +1611,30 @@ def _cmdu_scan_return_ref(ret_section: dict, result: dict):
     except Exception as e:
         log.warning("CMDU safety-net scan failed: %s", e)
         result["flag"] = result.get("flag") or "forward_to_client"
+
+
+_CMDU_BL_NO_RE = re.compile(r'B\s*/?\s*L\s*-?\s*NO\.?\s*:?\s*([A-Z0-9]{6,15})', re.IGNORECASE)
+
+
+def _cmdu_scan_bl_number(pdf_path: str) -> str:
+    """
+    CMA CGM "Release Notification" documents print BOTH a "Release
+    Notification NR" (internal notification number) and the actual
+    "B/L - NO" stacked directly on top of each other at the top of page 1.
+    Gemini can grab the wrong one, especially since the real B/L often
+    doesn't start with the CMDU SCAC prefix. A plain text-label scan for
+    "B/L - NO" is unambiguous and is the source of truth when it matches.
+    """
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            raw = " ".join(p.extract_text() or "" for p in pdf.pages)
+        m = _CMDU_BL_NO_RE.search(raw)
+        if m:
+            return re.sub(r'[^A-Z0-9]', '', m.group(1).upper())
+    except Exception as e:
+        log.warning("CMDU B/L-NO scan failed: %s", e)
+    return ""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1363,6 +1711,17 @@ def extract_delivery_order(pdf_path: str, gemini_model) -> dict:
     result["scac"] = scac
     result["containers"] = containers
     result["doc_subtype"] = doc_subtype or "delivery_order"
+
+    # ── CMA CGM deterministic B/L override ────────────────────────
+    # "Release Notification" docs stack "Release Notification NR" directly
+    # above "B/L - NO" — Gemini can grab the wrong one. A plain text-label
+    # scan for "B/L - NO" is unambiguous, so it wins over whatever Call 1
+    # returned whenever it finds a match.
+    if scac == "CMDU":
+        scanned_bl = _cmdu_scan_bl_number(pdf_path)
+        if scanned_bl and scanned_bl != re.sub(r'[^A-Z0-9]', '', (mbl or "").upper()):
+            log.info("  CMDU B/L-NO scan override: Call1 mbl='%s' → '%s'", mbl, scanned_bl)
+            mbl = scanned_bl
 
     if mbl:
         validated = _validate_mbl(re.sub(r'\s+', '', mbl).upper(), carrier_name, logo_present)

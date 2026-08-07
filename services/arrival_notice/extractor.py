@@ -82,7 +82,7 @@ RULES FOR carrier_name and carrier_code:
    - OOCL → OOLU
    - Evergreen → EGLV
    - ZIM → ZIMU
-   - Yang Ming → YMLU
+   - Yang Ming → YMJA
    - HMM / Hyundai → HDMU
    - COSCO → COSU
    - Panda Logistics → PNKG
@@ -97,9 +97,9 @@ RULES FOR carrier_name and carrier_code:
     2. If the document shows "ZIMU 3157970 - 20FT" → extract "ZIMU3157970" (remove space, strip size suffix).
     3. NEVER return just the numeric part. Always include the 4-letter prefix.
 
-    RULES FOR FPS / Famous Pacific Shipping:
-    1. If you see "FPS" logo or "Famous Pacific Shipping" → carrier_code = "FPS", carrier_name = "FPS".
-    2. FPS is the NVOCC carrier on the BL — do NOT use the vessel operator (MSC, ZIM, etc.) as carrier.
+    RULES FOR FPS / FCS (Famous Pacific Shipping / Shanghai F S Container Line):
+    1. If you see "FPS" logo, "Famous Pacific Shipping", "FCS" logo, or "SHANGHAI F S CONTAINER LINE" → carrier_code = "FPS", carrier_name = "FPS".
+    2. FPS/FCS is the NVOCC carrier on the BL — do NOT use the vessel operator (MSC, ZIM, etc.) as carrier.
     3. The BL is under "Bill of Lading" field (e.g. "231164").
 
 """
@@ -374,10 +374,10 @@ def extract_arrival_notice(pdf_path: str, gemini_model, subject: str = None) -> 
             result["carrier_name"], result["carrier_code"]
         )
 
-        # FPS carrier code fix — resolve_carrier_code may not map it
+        # FPS/FCS carrier code fix — resolve_carrier_code may not map it
         if not result["carrier_code"]:
             carrier_lower = (result.get("carrier_name") or "").lower()
-            if "fps" in carrier_lower or "famous pacific" in carrier_lower:
+            if "fps" in carrier_lower or "famous pacific" in carrier_lower or "fcs" in carrier_lower or "shanghai f" in carrier_lower:
                 result["carrier_code"] = "FPS"
                 log.info("  AN carrier_code resolved to FPS from name")
 

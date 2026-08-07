@@ -360,6 +360,17 @@ class ArrivalNoticeService:
             mbl_val = extraction.get("reference") if extraction else None
             sec_ref = extraction.get("container_no") if extraction else None
             carrier_code = extraction.get("carrier_code") if extraction else None
+
+            if extraction and extraction.get("is_fcs"):
+                log.info(f"[{SERVICE_KEY}] FCS/FPS document detected — marking unread and skipping Jordex completely")
+                tracker.mark(CAT, cid, subject, folder_name, saved_files, "Skipped",
+                             mbl=mbl_val, secondary_ref=sec_ref, carrier_code=carrier_code)
+                mark_as_unread(page, cid)
+                self._processed += 1
+                if page_stuck:
+                    break
+                continue
+
             tracker.mark(CAT, cid, subject, folder_name, saved_files, "downloaded",
                         mbl=mbl_val, secondary_ref=sec_ref, carrier_code=carrier_code)
             self._processed += 1

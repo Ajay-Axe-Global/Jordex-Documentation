@@ -32,13 +32,13 @@ Return ONLY a valid JSON object (no markdown, no backticks, no extra text):
 }
 
 RULES FOR references:
-1. PRIORITY 1 (HIGHEST) — OI or OE Number. Look for fields labeled "Your-Reference", "Our Ref", "Reference", or anywhere for a string starting with "OI" or "OE" followed by 5+ digits (e.g., OI2615762). If found, this is the ONLY entry in references.
-2. PRIORITY 2 — Hapag-Lloyd "SWB-NO." / "REFERENCES: SHIPPER (MTD)" block. This block can list TWO OR THREE separate MTD reference numbers (e.g. HLCUNG12606TDDM2, HLCUNG12606AUVB6, HLCUNG12606TDDL1) — one invoice can cover multiple shipments. If this block is present, return EVERY reference listed in it as its own separate array entry. Do NOT pick just one and do NOT merge them together.
-3. PRIORITY 3 — B/L Number / Bill of Lading No. Only if NO OI/OE number and NO SWB-NO/REFERENCES block exists. Usually has carrier prefix + digits. Single entry.
+1. PRIORITY 1 (HIGHEST, ALWAYS WINS) — OI or OE Number. Look closely for fields labeled "Your-Reference", "Our Ref", "Reference", "YOUR REF.", or anywhere for a string starting with "OI" or "OE" followed by 5+ digits (e.g., OI2615762, OE2625140). If ANY OI/OE number appears ANYWHERE on the document — including repeated under a "REFERENCES:" block next to labels like CUSTOMER / FOB FORWARDER (MTD) / SHIPPER (MTD) — then references MUST contain ONLY that OI/OE number (deduplicated, one entry even if it's repeated many times under different labels). In this case COMPLETELY IGNORE and DO NOT extract the B/L-NO, any MTD number, or any container number from the document — they are irrelevant once an OI/OE number exists. Do not combine an OI/OE number with a B/L/MTD/container number in the same references array under any circumstance.
+2. PRIORITY 2 — Only when NO OI/OE number exists anywhere on the document: Hapag-Lloyd "SWB-NO." / "REFERENCES: SHIPPER (MTD)" block. When the values under this block are genuine carrier MTD-style references (not OI/OE), it can list TWO OR THREE separate MTD reference numbers (e.g. HLCUNG12606TDDM2, HLCUNG12606AUVB6, HLCUNG12606TDDL1) — one invoice can cover multiple shipments. If this block is present, return EVERY distinct reference listed in it as its own separate array entry. Do NOT pick just one and do NOT merge them together.
+3. PRIORITY 3 — B/L Number / Bill of Lading No. Only if NO OI/OE number and NO SWB-NO/REFERENCES block exists. Look for fields labeled "B/L No.", "Bill of Lading", etc. Usually has carrier prefix + digits. Single entry. EXTREMELY IMPORTANT: NEVER extract a "Case Id" (e.g., NCPW26239000) or "Approval Code" as a B/L number!
 4. PRIORITY 4 — Container Number. Exactly 4 uppercase letters + 7 digits. Single entry.
 5. If the document is from CMA CGM and the B/L number is exactly 10 letters/digits (e.g., VLN0150979), prepend 'CMDU'.
 6. Extract exactly as printed, removing spaces. Each reference must be PURE ALPHANUMERIC — never include "/", "-", spaces, or any other punctuation inside a single reference. If you see what looks like two different codes near each other (e.g. a shipment code next to an unrelated numeric code), they are almost always two DIFFERENT fields, not one reference — do not concatenate them into a single string. If you are not confident a piece of text is a real shipment/B/L/container reference, leave it out of the array rather than guessing.
-7. Do NOT extract short internal carrier references (like '23461314'), charge/line-item codes, dates, or amounts as a reference, EXCEPT for Hapag-Lloyd SHIPMENT numbers which go to secondary_ref, not references.
+7. Do NOT extract short internal carrier references (like '23461314'), charge/line-item codes, dates, Case IDs, or amounts as a reference, EXCEPT for Hapag-Lloyd SHIPMENT numbers which go to secondary_ref, not references.
 8. If nothing on the document qualifies as a reference, return an empty array — do not invent one.
 
 RULES FOR secondary_ref:
@@ -111,6 +111,29 @@ def _keyword_fallback(pdf_path: str) -> dict:
             invoice_no = inv_match.group(1).strip()
 
     return {"reference": reference, "invoice_no": invoice_no}
+
+
+def _enforce_oi_oe_priority(references: list) -> list:
+    """
+    Code-level guardrail (not just a prompt instruction) — OI/OE is always
+    PRIORITY 1 and must be the ONLY reference used when present. Some
+    Hapag-Lloyd invoices repeat the SAME OE number under several stakeholder
+    labels in the "REFERENCES:" block (CUSTOMER, FOB FORWARDER (MTD),
+    SHIPPER (MTD)) right next to an unrelated B/L-NO — Gemini can end up
+    returning both the OE number AND the B/L number together despite the
+    prompt saying not to. If any OI/OE-shaped reference is present, drop
+    every non-OI/OE reference and dedupe the OI/OE ones down to one entry
+    each, so a B/L/MTD/container number never rides along with an OE ref
+    into a Jordex search or upload.
+    """
+    oi_oe = [r for r in references if re.fullmatch(r'(OI|OE)\d{4,}', r)]
+    if not oi_oe:
+        return references
+    deduped = list(dict.fromkeys(oi_oe))
+    dropped = [r for r in references if r not in deduped]
+    if dropped:
+        log.info(f"  OI/OE present — dropping non-OI/OE reference(s) {dropped}, keeping {deduped}")
+    return deduped
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -200,6 +223,8 @@ def extract_invoice_carrier(pdf_path: str, gemini_model=None) -> dict:
                         log.info("  Invoice Prepended SCAC %s: %s → %s", resolved_scac, old_r, r)
 
                 references.append(r)
+
+            references = _enforce_oi_oe_priority(references)
 
             if secondary_ref:
                 secondary_ref = re.sub(r'\s+', '', secondary_ref)
